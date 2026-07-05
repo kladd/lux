@@ -216,6 +216,16 @@ mod tests {
     }
 
     #[test]
+    fn bs_and_del_both_decode_as_backspace() {
+        // No binding distinguishes Ctrl-H from Backspace anymore
+        // (REQ-WINDOW-017 resizes on shifted letters); both bytes pass
+        // through as Backspace, matching termwiz's own collapsing.
+        let mut d = InputDecoder::default();
+        assert_eq!(keys(&mut d, b"\x08")[0].code, CtKeyCode::Backspace);
+        assert_eq!(keys(&mut d, b"\x7f")[0].code, CtKeyCode::Backspace);
+    }
+
+    #[test]
     fn lf_decodes_as_ctrl_j_not_enter() {
         let mut d = InputDecoder::default();
         // Ctrl-J arrives as LF; it must stay distinct from Enter (CR) so

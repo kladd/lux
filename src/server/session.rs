@@ -638,9 +638,12 @@ impl Session {
     /// it active.
     fn new_tab(&mut self) {
         let win = self.windows.get_mut(&self.focus).expect("focused window exists");
+        // REQ-TAB-021: the new shell starts in the working directory of
+        // the tab that was active until now.
+        let cwd = win.active_tab().working_dir();
         // REQ-TAB-004/005: the tab gets its own shell and engine sized to
         // the window's content rectangle.
-        let Ok(tab) = Tab::spawn(win.content_rect(), self.tx.clone()) else {
+        let Ok(tab) = Tab::spawn(win.content_rect(), cwd, self.tx.clone()) else {
             return;
         };
         win.tabs.push(tab);
@@ -851,9 +854,10 @@ impl Session {
             }
             let active = win.active;
             let bar = win.tab_bar_rect();
-            // Badge spans track render_tab_bar's layout: " i:name", the
+            // Badge spans track render_tab_bar's layout: the two-cell
+            // rule lead-in (REQ-UI-030), then per badge " i:name", the
             // agent text when present, and the trailing separator space.
-            let mut next_x = bar.x;
+            let mut next_x = bar.x.saturating_add(2).min(bar.right());
             let tabs = win
                 .tabs
                 .iter()
@@ -930,7 +934,6 @@ impl Session {
     /// Draw purely from `self.view` and engine state into a buffer; no
     /// geometry math or state mutation here (REQ-TAB-010).
     fn render_to_buffer(&self, buf: &mut Buffer) {
-        let focused_rect = self.windows[&self.focus].rect;
         // REQ-WINDOW-011: each window confined to its own rectangle;
         // the active tab's content below the tab bar (REQ-TAB-002/012).
         for win in self.windows.values() {
@@ -945,10 +948,10 @@ impl Session {
         {
             render_selection(sel, win.content_rect(), buf);
         }
-        // REQ-WINDOW-012/013: separators between windows; the ones
-        // touching the focused window are highlighted to mark focus.
+        // REQ-WINDOW-012: separators between side-by-side windows,
+        // uniformly dim (REQ-UI-025).
         for sep in &self.view.separators {
-            render_separator(sep, focused_rect, buf);
+            render_separator(sep, buf);
         }
         // REQ-UI-013/014: the session status line on the reserved bottom
         // row; absent while the command line renders there instead
@@ -1020,10 +1023,12 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
     }
 }
 
-/// Draw one window's tab bar: an indicator per tab (REQ-TAB-013), the
-/// active one visually distinct (REQ-TAB-014), the remainder left blank
-/// (REQ-UI-018) — the blank row below (REQ-UI-024) marks the boundary
-/// with content.
+/// Draw one window's tab bar: a two-cell rule lead-in (REQ-UI-030), an
+/// indicator per tab (REQ-TAB-013, the active one visually distinct per
+/// REQ-TAB-014), and the remainder ruled. The rule is uniformly thin,
+/// its brightness marking window focus (REQ-UI-028/029, REQ-WINDOW-013);
+/// the bar doubles as the boundary with a stacked window above
+/// (REQ-UI-027).
 fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: Duration) {
     let bar = chrome.tab_bar;
     if bar.height == 0 || bar.width == 0 {
@@ -1042,6 +1047,14 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         *x += 1;
         true
     };
+    // REQ-UI-028/029: one thin rule weight; brightness signals focus.
+    let rule = Style::default().fg(if focused { Color::White } else { Color::DarkGray });
+    // REQ-UI-030: two cells of rule anchor the bar's left edge.
+    for _ in 0..2 {
+        if !put(&mut x, '─', rule) {
+            return;
+        }
+    }
     for (i, badge) in chrome.tabs.iter().enumerate() {
         // REQ-UI-008/009: active is bright, inactive dimmed, no
         // background fill — neutral shades only, matching the
@@ -1081,10 +1094,17 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
             return;
         }
     }
-    // REQ-UI-018: the bar's unused width stays blank.
+    // REQ-UI-028/029: the unused width, same thin rule.
     let indicators_end = x;
+    while x < bar.right() {
+        if let Some(dst) = buf.cell_mut(Position::new(x, bar.y)) {
+            dst.set_symbol("─");
+            dst.set_style(rule);
+        }
+        x += 1;
+    }
     // REQ-SCROLL-013: mark a scrolled tab so a frozen view isn't mistaken
-    // for the live tail. Drawn in the bar's blank remainder, right-aligned.
+    // for the live tail. Drawn over the rule, right-aligned.
     if chrome.scroll {
         let label = " scroll ";
         let len = label.len() as u16;
@@ -1212,31 +1232,15 @@ fn render_ex_chrome(chrome: &ExChrome, buf: &mut Buffer) {
     }
 }
 
-fn render_separator(sep: &Separator, focused: Rect, buf: &mut Buffer) {
-    let (symbol, adjacent) = match sep.kind {
-        SplitKind::SideBySide => (
-            "│",
-            (focused.right() == sep.rect.x || focused.x == sep.rect.right())
-                && focused.y < sep.rect.bottom()
-                && sep.rect.y < focused.bottom(),
-        ),
-        SplitKind::Stacked => (
-            "─",
-            (focused.bottom() == sep.rect.y || focused.y == sep.rect.bottom())
-                && focused.x < sep.rect.right()
-                && sep.rect.x < focused.right(),
-        ),
-    };
-    // REQ-UI-025: focus reads from brightness alone, no hue.
-    let style = if adjacent {
-        Style::default().fg(Color::White)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+/// REQ-WINDOW-012: the vertical separator between side-by-side windows —
+/// the only separator kind left (REQ-UI-027). Always dimmed (REQ-UI-025);
+/// the tab bar's rule brightness alone marks focus (REQ-UI-028/029).
+fn render_separator(sep: &Separator, buf: &mut Buffer) {
+    let style = Style::default().fg(Color::DarkGray);
     for y in sep.rect.top()..sep.rect.bottom() {
         for x in sep.rect.left()..sep.rect.right() {
             if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
-                dst.set_symbol(symbol);
+                dst.set_symbol("│");
                 dst.set_style(style);
             }
         }

@@ -75,13 +75,10 @@ pub struct KeyMatch {
 
 impl KeyMatch {
     pub fn from_event(key: KeyEvent) -> Self {
-        let ctrl = key.modifiers.contains(CtMods::CONTROL);
-        // Legacy encodings send Ctrl-h as Ctrl-Backspace.
-        let code = match key.code {
-            CtKeyCode::Backspace if ctrl => CtKeyCode::Char('h'),
-            code => code,
-        };
-        Self { code, ctrl }
+        Self {
+            code: key.code,
+            ctrl: key.modifiers.contains(CtMods::CONTROL),
+        }
     }
 }
 
@@ -107,9 +104,6 @@ impl Default for KeyTable {
         fn plain(c: char) -> KeyMatch {
             KeyMatch { code: CtKeyCode::Char(c), ctrl: false }
         }
-        fn ctrl(c: char) -> KeyMatch {
-            KeyMatch { code: CtKeyCode::Char(c), ctrl: true }
-        }
         let mut bindings = vec![
             (plain('%'), Command::SplitSideBySide),
             (plain('"'), Command::SplitStacked),
@@ -125,10 +119,12 @@ impl Default for KeyTable {
             (plain('j'), Command::FocusDir(Dir::Down)),
             (plain('k'), Command::FocusDir(Dir::Up)),
             (plain('l'), Command::FocusDir(Dir::Right)),
-            (ctrl('h'), Command::ResizeDir(Dir::Left)),
-            (ctrl('j'), Command::ResizeDir(Dir::Down)),
-            (ctrl('k'), Command::ResizeDir(Dir::Up)),
-            (ctrl('l'), Command::ResizeDir(Dir::Right)),
+            // REQ-WINDOW-017: shifted h/j/k/l resize toward the same
+            // directions the unshifted keys focus.
+            (plain('H'), Command::ResizeDir(Dir::Left)),
+            (plain('J'), Command::ResizeDir(Dir::Down)),
+            (plain('K'), Command::ResizeDir(Dir::Up)),
+            (plain('L'), Command::ResizeDir(Dir::Right)),
         ];
         // REQ-TAB-019: prefix+0-9 selects the tab at that index.
         for d in 0..=9 {
@@ -164,20 +160,20 @@ mod tests {
     }
 
     #[test]
-    fn plain_and_ctrl_hjkl_are_distinct() {
+    fn lower_and_upper_hjkl_are_distinct() {
+        // REQ-KEY-004 focuses on h; REQ-WINDOW-017 resizes on H.
         let table = KeyTable::default();
         assert_eq!(
             table.lookup(key(CtKeyCode::Char('h'), KeyModifiers::NONE)),
             Some(Command::FocusDir(Dir::Left))
         );
         assert_eq!(
-            table.lookup(key(CtKeyCode::Char('h'), KeyModifiers::CONTROL)),
+            table.lookup(key(CtKeyCode::Char('H'), KeyModifiers::SHIFT)),
             Some(Command::ResizeDir(Dir::Left))
         );
-        assert_eq!(
-            table.lookup(key(CtKeyCode::Backspace, KeyModifiers::CONTROL)),
-            Some(Command::ResizeDir(Dir::Left))
-        );
+        // No Ctrl chords remain in the default table.
+        assert_eq!(table.lookup(key(CtKeyCode::Char('h'), KeyModifiers::CONTROL)), None);
+        assert_eq!(table.lookup(key(CtKeyCode::Backspace, KeyModifiers::CONTROL)), None);
     }
 
     #[test]

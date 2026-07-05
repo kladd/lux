@@ -37,14 +37,18 @@ pub struct Split {
     pub second: Box<Node>,
 }
 
+/// A vertical separator between side-by-side windows (REQ-WINDOW-012).
+/// Stacked windows abut directly — the lower window's tab bar is the
+/// boundary (REQ-UI-027) — so no horizontal separators exist.
 pub struct Separator {
     pub rect: Rect,
-    pub kind: SplitKind,
 }
 
-/// Split `area` into (first, second, separator) rectangles. When the area is
-/// too small to hold two windows and a separator, `first` gets everything
-/// and the other two rects are zero-sized.
+/// Split `area` into (first, second, separator) rectangles. Only
+/// side-by-side splits have a separator column (REQ-WINDOW-012); stacked
+/// splits partition the area completely (REQ-UI-027). When the area is
+/// too small to hold two windows, `first` gets everything and the other
+/// rects are zero-sized.
 pub fn split_areas(kind: SplitKind, ratio: f64, area: Rect) -> (Rect, Rect, Rect) {
     match kind {
         SplitKind::SideBySide => {
@@ -60,16 +64,16 @@ pub fn split_areas(kind: SplitKind, ratio: f64, area: Rect) -> (Rect, Rect, Rect
             (first, second, sep)
         }
         SplitKind::Stacked => {
-            if area.height < 3 {
+            if area.height < 2 {
                 let empty = Rect::new(area.x, area.bottom(), 0, 0);
                 return (area, empty, empty);
             }
-            let avail = area.height - 1;
+            let avail = area.height;
             let first_h = (f64::from(avail) * ratio).round().clamp(1.0, f64::from(avail - 1)) as u16;
             let first = Rect { height: first_h, ..area };
-            let sep = Rect { y: area.y + first_h, height: 1, ..area };
-            let second = Rect { y: sep.y + 1, height: avail - first_h, ..area };
-            (first, second, sep)
+            let second = Rect { y: area.y + first_h, height: avail - first_h, ..area };
+            let empty = Rect::new(area.x, area.y + first_h, 0, 0);
+            (first, second, empty)
         }
     }
 }
@@ -89,7 +93,7 @@ fn walk(node: &Node, area: Rect, rects: &mut Vec<(WindowId, Rect)>, seps: &mut V
         Node::Split(s) => {
             let (first, second, sep) = split_areas(s.kind, s.ratio, area);
             if sep.width > 0 && sep.height > 0 {
-                seps.push(Separator { rect: sep, kind: s.kind });
+                seps.push(Separator { rect: sep });
             }
             walk(&s.first, first, rects, seps);
             walk(&s.second, second, rects, seps);
@@ -184,7 +188,8 @@ pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -
     }
     let avail = match s.kind {
         SplitKind::SideBySide => area.width.saturating_sub(1),
-        SplitKind::Stacked => area.height.saturating_sub(1),
+        // REQ-UI-027: stacked windows abut, no separator row.
+        SplitKind::Stacked => area.height,
     };
     if avail < 2 {
         return true;
@@ -254,6 +259,11 @@ mod tests {
         assert_eq!(second.height, 24);
         assert_eq!(sep.x, first.right());
         assert_eq!(second.x, sep.right());
+        // REQ-UI-027: stacked windows abut with no separator row.
+        let (first, second, sep) = split_areas(SplitKind::Stacked, 0.5, area());
+        assert_eq!(first.height + second.height, 24);
+        assert_eq!(second.y, first.bottom());
+        assert_eq!(sep.area(), 0);
     }
 
     #[test]
@@ -277,7 +287,8 @@ mod tests {
         split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
         let (rects, seps) = compute(&tree, area());
         assert_eq!(rects.len(), 3);
-        assert_eq!(seps.len(), 2);
+        // Only the side-by-side split has a separator (REQ-UI-027).
+        assert_eq!(seps.len(), 1);
         let cells: u32 = rects.iter().map(|(_, r)| r.area() as u32).sum::<u32>()
             + seps.iter().map(|s| s.rect.area() as u32).sum::<u32>();
         assert_eq!(cells, area().area() as u32);

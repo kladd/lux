@@ -49,7 +49,7 @@ impl Window {
     /// (REQ-TAB-003), with the tab's shell and engine sized to the content
     /// rectangle below the tab bar row (REQ-WINDOW-009/010, REQ-TAB-005).
     pub fn new(id: WindowId, rect: Rect, tx: Sender<ServerEvent>) -> anyhow::Result<Self> {
-        let tab = Tab::spawn(content_rect(rect), tx)?;
+        let tab = Tab::spawn(content_rect(rect), None, tx)?;
         Ok(Self {
             id,
             rect,
@@ -97,12 +97,11 @@ impl Window {
 }
 
 fn content_rect(rect: Rect) -> Rect {
-    // Two chrome rows: the tab bar (REQ-TAB-011) and the blank separator
-    // row below it (REQ-UI-024).
-    let chrome = rect.height.min(2);
+    // One chrome row: the tab bar (REQ-TAB-011), which also serves as
+    // the boundary with a stacked window above (REQ-UI-027).
     Rect {
-        y: rect.y + chrome,
-        height: rect.height - chrome,
+        y: rect.y + rect.height.min(1),
+        height: rect.height.saturating_sub(1),
         ..rect
     }
 }
@@ -156,7 +155,13 @@ pub struct Tab {
 impl Tab {
     /// Spawn a PTY running $SHELL sized to `rect` with an engine to match
     /// (REQ-TAB-004/005) and a reader thread feeding `tx` (REQ-PANE-005).
-    pub fn spawn(rect: Rect, tx: Sender<ServerEvent>) -> anyhow::Result<Self> {
+    /// `cwd` sets the shell's working directory (REQ-TAB-021); `None`
+    /// leaves the server's own.
+    pub fn spawn(
+        rect: Rect,
+        cwd: Option<std::path::PathBuf>,
+        tx: Sender<ServerEvent>,
+    ) -> anyhow::Result<Self> {
         let id = NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pty = native_pty_system();
         let pair = pty.openpty(pty_size(rect)).context("open PTY")?;
@@ -164,6 +169,9 @@ impl Tab {
         let mut cmd = CommandBuilder::new(&shell);
         // The engine speaks xterm's protocol regardless of the host terminal.
         cmd.env("TERM", "xterm-256color");
+        if let Some(dir) = cwd {
+            cmd.cwd(dir);
+        }
         let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         drop(pair.slave);
 
@@ -265,6 +273,13 @@ impl Tab {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         Some(Foreground { comm: comm.trim().to_string(), arg0 })
+    }
+
+    /// The foreground process's working directory (REQ-TAB-021), via the
+    /// same /proc inspection `foreground` uses.
+    pub fn working_dir(&self) -> Option<std::path::PathBuf> {
+        let pid = self.master.process_group_leader()?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
     }
 
     /// Commit a pending idle debounce whose window has elapsed with no
