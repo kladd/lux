@@ -83,6 +83,16 @@ impl Window {
         }
     }
 
+    /// The additional row reserved below the tab bar (REQ-UI-010), drawn
+    /// as a horizontal rule (REQ-UI-011).
+    pub fn tab_rule_rect(&self) -> Rect {
+        Rect {
+            y: self.rect.y + self.rect.height.min(1),
+            height: self.rect.height.saturating_sub(1).min(1),
+            ..self.rect
+        }
+    }
+
     /// Bring every tab's PTY and engine in sync with the window's current
     /// rectangle (REQ-WINDOW-018/019 across all of this window's tabs, so
     /// no tab is stale when it later becomes active).

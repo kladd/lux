@@ -990,6 +990,17 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         }
         x += 1;
     }
+    // REQ-UI-010/011: the reserved row below the bar, ruled edge to edge
+    // so it reads as chrome rather than a blank content line.
+    let gap = chrome.tab_rule;
+    if gap.height > 0 {
+        for gx in gap.x..gap.right() {
+            if let Some(dst) = buf.cell_mut(Position::new(gx, gap.y)) {
+                dst.set_symbol("─");
+                dst.set_style(rule);
+            }
+        }
+    }
     // REQ-SCROLL-013: mark a scrolled tab so a frozen view isn't mistaken
     // for the live tail. Drawn over the rule, right-aligned.
     if chrome.scroll {
