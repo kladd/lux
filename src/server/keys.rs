@@ -90,8 +90,9 @@ impl Default for KeyTable {
     /// REQ-KEY-003 (and REQ-CONFIG-003): the hardcoded defaults, covering
     /// every prefix sequence defined by REQ-WINDOW-005/006 (splits),
     /// REQ-WINDOW-016 (focus cycle), REQ-WINDOW-017 (resize),
-    /// REQ-TAB-006/007 (tabs), REQ-KEY-004 (directional focus),
-    /// REQ-KEY-006 (detach stub), and REQ-EX-001 (ex command line).
+    /// REQ-TAB-006/007/018 (tabs), REQ-KEY-004 (directional focus),
+    /// REQ-KEY-006 (detach stub), REQ-SESSION-015 (session switcher), and
+    /// REQ-EX-001 (ex command line).
     fn default() -> Self {
         fn plain(c: char) -> KeyMatch {
             KeyMatch { code: CtKeyCode::Char(c), ctrl: false }
@@ -106,8 +107,10 @@ impl Default for KeyTable {
                 (plain('"'), Command::SplitStacked),
                 (plain('c'), Command::NewTab),
                 (plain('n'), Command::NextTab),
+                (plain('p'), Command::PrevTab),
                 (plain('o'), Command::FocusNext),
                 (plain('d'), Command::Detach),
+                (plain('s'), Command::Switcher),
                 (plain(':'), Command::OpenEx),
                 (plain('['), Command::ScrollMode),
                 (plain('h'), Command::FocusDir(Dir::Left)),
@@ -182,6 +185,20 @@ mod tests {
         assert_eq!(
             table.lookup(key(CtKeyCode::Char(':'), KeyModifiers::SHIFT)),
             Some(Command::OpenEx)
+        );
+    }
+
+    #[test]
+    fn prev_tab_and_switcher_are_bound_by_default() {
+        // REQ-KEY-003 via REQ-TAB-018 and REQ-SESSION-015.
+        let table = KeyTable::default();
+        assert_eq!(
+            table.lookup(key(CtKeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(Command::PrevTab)
+        );
+        assert_eq!(
+            table.lookup(key(CtKeyCode::Char('s'), KeyModifiers::NONE)),
+            Some(Command::Switcher)
         );
     }
 
