@@ -1,0 +1,20 @@
+[package]
+name = "lux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+# For OSC 52 clipboard payloads (REQ-SCROLL-016).
+base64 = "0.22"
+ratatui = "0.29"
+# Command line editing per REQ-EX-018; 0.7 tracks ratatui 0.29.
+tui-textarea = "0.7"
+# preserve_order: REQ-CONFIG-008 resolves duplicate key sequences to the
+# last entry defined in the file, which requires file-order iteration.
+toml = { version = "0.8", features = ["preserve_order"] }
+# wezterm crates pinned to a single commit (REQ-SPIKE-001); termwiz must be
+# the same rev because its types appear in wezterm-term's public API.
+portable-pty = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }
+termwiz = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }
+wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }
