@@ -97,15 +97,45 @@ impl Window {
 }
 
 fn content_rect(rect: Rect) -> Rect {
+    // Two chrome rows: the tab bar (REQ-TAB-011) and the ruled gap below
+    // it (REQ-UI-010).
+    let chrome = rect.height.min(2);
     Rect {
-        y: rect.y + rect.height.min(1),
-        height: rect.height.saturating_sub(1),
+        y: rect.y + chrome,
+        height: rect.height - chrome,
         ..rect
+    }
+}
+
+/// A tab's foreground process command name, from both /proc sources:
+/// `comm` is the kernel's command name; argv[0]'s basename covers the
+/// same name when comm is truncated or wrapped.
+struct Foreground {
+    comm: String,
+    arg0: String,
+}
+
+impl Foreground {
+    /// REQ-AGENT-002: the foreground command name must be `claude`,
+    /// under either reading.
+    fn is_claude(&self) -> bool {
+        self.comm == "claude" || self.arg0 == "claude"
+    }
+
+    /// The tab's display name (REQ-UI-002): argv[0]'s basename, matching
+    /// tmux's `pane_current_command` source on Linux
+    /// (`~/src/tmux/osdep-linux.c` reads `/proc/<pgrp>/cmdline`), with
+    /// comm covering processes that rewrite their argv.
+    fn display_name(&self) -> &str {
+        if self.arg0.is_empty() { &self.comm } else { &self.arg0 }
     }
 }
 
 pub struct Tab {
     pub id: TabId,
+    /// Display name derived from the PTY's foreground process command
+    /// name, re-derived as that process changes (REQ-UI-002/003).
+    pub name: String,
     pub engine: Engine,
     /// Last rectangle the tab's PTY and engine were sized to.
     pub rect: Rect,
@@ -166,8 +196,17 @@ impl Tab {
             Box::new(writer),
         );
 
+        // Until the first foreground read, the name is the spawned
+        // shell's, matching tmux's fallback to the pane's shell
+        // (`~/src/tmux/names.c` default_window_name).
+        let name = std::path::Path::new(&shell)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| shell.clone());
+
         Ok(Self {
             id,
+            name,
             engine,
             rect,
             drawn_seqno: 0,
@@ -178,39 +217,47 @@ impl Tab {
         })
     }
 
-    /// Re-identify the tab and re-evaluate detection after new PTY output
-    /// (REQ-AGENT-002/010). Returns whether the displayed agent state
-    /// (including the symbol appearing or disappearing) changed.
-    pub fn refresh_agent(&mut self) -> bool {
-        if !self.foreground_is_claude() {
-            // REQ-AGENT-016/017: not Claude Code — no symbol, drop any
-            // stale state.
-            return self.agent.take().is_some();
+    /// Re-identify the tab after new PTY output: re-derive its display
+    /// name from the foreground command (REQ-UI-002/003, tmux's
+    /// automatic-rename) and re-evaluate agent detection
+    /// (REQ-AGENT-002/010). Returns whether the displayed name or agent
+    /// state (including the status text appearing or disappearing)
+    /// changed.
+    pub fn refresh_identity(&mut self) -> bool {
+        let fg = self.foreground();
+        let renamed = match fg.as_ref().map(Foreground::display_name) {
+            Some(name) if !name.is_empty() && name != self.name => {
+                self.name = name.to_string();
+                true
+            }
+            // No readable foreground process (e.g. mid-exec): keep the
+            // current name rather than flickering through a fallback.
+            _ => false,
+        };
+        if !fg.is_some_and(|fg| fg.is_claude()) {
+            // REQ-AGENT-016/017: not Claude Code — no status text, drop
+            // any stale state.
+            return self.agent.take().is_some() || renamed;
         }
         let snapshot = agent::Snapshot::capture(&self.engine);
         let raw = agent::evaluate(&snapshot);
         let appeared = self.agent.is_none();
         let tracker = self.agent.get_or_insert_default();
         let changed = tracker.observe(raw, std::time::Instant::now());
-        appeared || changed
+        appeared || changed || renamed
     }
 
-    /// REQ-AGENT-002: the PTY's foreground process command name must be
-    /// `claude`. `/proc/<pid>/comm` is the kernel's command name; argv[0]'s
-    /// basename covers the same name when comm is truncated or wrapped.
-    fn foreground_is_claude(&self) -> bool {
-        let Some(pid) = self.master.process_group_leader() else {
-            return false;
-        };
+    /// The PTY foreground process group leader's identity, from /proc.
+    fn foreground(&self) -> Option<Foreground> {
+        let pid = self.master.process_group_leader()?;
         let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-        if comm.trim() == "claude" {
-            return true;
-        }
         let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         let arg0 = cmdline.split(|b| *b == 0).next().unwrap_or(b"");
-        std::path::Path::new(&String::from_utf8_lossy(arg0).into_owned())
+        let arg0 = std::path::Path::new(&String::from_utf8_lossy(arg0).into_owned())
             .file_name()
-            .is_some_and(|name| name == "claude")
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Some(Foreground { comm: comm.trim().to_string(), arg0 })
     }
 
     /// Commit a pending idle debounce whose window has elapsed with no
@@ -301,5 +348,31 @@ fn term_size(rect: Rect) -> TerminalSize {
         pixel_width: 0,
         pixel_height: 0,
         dpi: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fg(comm: &str, arg0: &str) -> Foreground {
+        Foreground { comm: comm.into(), arg0: arg0.into() }
+    }
+
+    #[test]
+    fn display_name_prefers_argv0_basename() {
+        // REQ-UI-002 via tmux's pane_current_command: argv[0] first,
+        // comm when argv is rewritten/unreadable.
+        assert_eq!(fg("vim", "vim").display_name(), "vim");
+        assert_eq!(fg("node", "claude").display_name(), "claude");
+        assert_eq!(fg("bash", "").display_name(), "bash");
+    }
+
+    #[test]
+    fn claude_is_identified_under_either_reading() {
+        // REQ-AGENT-002: comm or argv[0] basename.
+        assert!(fg("claude", "node").is_claude());
+        assert!(fg("node", "claude").is_claude());
+        assert!(!fg("node", "node").is_claude());
     }
 }

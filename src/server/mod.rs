@@ -6,6 +6,7 @@
 //! `crate::protocol` (REQ-SESSION-001).
 
 pub mod agent;
+pub mod anim;
 pub mod config;
 pub mod ex;
 pub mod input;
@@ -129,10 +130,12 @@ pub fn run() -> i32 {
         tx,
     };
     loop {
-        // While an idle debounce is pending (REQ-AGENT-011), wake on a
-        // short timer so it can commit even if the agent goes quiet;
-        // otherwise block until something happens.
-        let event = if server.has_pending_idle() {
+        // While an idle debounce is pending (REQ-AGENT-011) or an
+        // attached client is showing an animated status text
+        // (REQ-UI-005/006), wake on a short timer so the debounce can
+        // commit and the animation advances; otherwise block until
+        // something happens.
+        let event = if server.needs_timed_tick() {
             match rx.recv_timeout(std::time::Duration::from_millis(60)) {
                 Ok(event) => Some(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -216,6 +219,22 @@ struct Server {
 impl Server {
     fn has_pending_idle(&self) -> bool {
         self.sessions.values().any(|s| s.has_pending_idle())
+    }
+
+    /// Whether the event loop should wake on a timer rather than block:
+    /// an idle debounce is waiting to commit (REQ-AGENT-011), or a
+    /// session some client is viewing — attached or as a live switcher
+    /// preview (REQ-SESSION-016) — has an animated status text to advance
+    /// (REQ-UI-005/006).
+    fn needs_timed_tick(&self) -> bool {
+        self.has_pending_idle()
+            || self.clients.values().any(|c| {
+                if c.switcher.is_some() {
+                    self.sessions.values().any(|s| s.has_animation())
+                } else {
+                    self.sessions.get(&c.attached).is_some_and(|s| s.has_animation())
+                }
+            })
     }
 
     /// Commit any idle debounces whose window elapsed (REQ-AGENT-011).

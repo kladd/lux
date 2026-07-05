@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -26,6 +27,8 @@ use termwiz::surface::CursorVisibility;
 use tui_textarea::TextArea;
 
 use crate::server::ServerEvent;
+use crate::server::agent;
+use crate::server::anim::{self, Anim};
 use crate::server::ex::{self, ExCommand};
 use crate::server::keys::{Command, KeyTable};
 use crate::server::layout::{self, Dir, Node, Separator, SplitKind, WindowId};
@@ -124,12 +127,13 @@ fn wz_button(button: CtMouseButton) -> wezterm_term::MouseButton {
     }
 }
 
-/// One tab's indicator in the bar: whether it's the active tab, plus its
-/// agent symbol and color when the tab runs Claude Code
-/// (REQ-AGENT-014/015/016).
+/// One tab's indicator in the bar: whether it's the active tab, its
+/// display name (REQ-UI-002), plus its bracketed status text when the tab
+/// runs Claude Code (REQ-AGENT-014/015/016).
 struct TabBadge {
     active: bool,
-    agent: Option<(char, Color)>,
+    name: String,
+    agent: Option<agent::Visual>,
 }
 
 /// Per-frame chrome geometry for one window, computed into state before
@@ -137,6 +141,8 @@ struct TabBadge {
 struct Chrome {
     window: WindowId,
     tab_bar: Rect,
+    /// The ruled row below the tab bar (REQ-UI-010/011).
+    tab_rule: Rect,
     tabs: Vec<TabBadge>,
     /// Whether the active tab is in scroll mode (REQ-SCROLL-013).
     scroll: bool,
@@ -159,6 +165,8 @@ struct View {
     separators: Vec<Separator>,
     chrome: Vec<Chrome>,
     ex: Option<ExChrome>,
+    /// The animation clock this frame renders at (REQ-UI-005/006).
+    elapsed: Duration,
 }
 
 pub struct Session {
@@ -217,12 +225,13 @@ impl Session {
     }
 
     /// REQ-PANE-005: advance the owning engine with PTY output, whether or
-    /// not that tab is currently visible, then re-evaluate agent detection
-    /// against the new content (REQ-AGENT-010).
+    /// not that tab is currently visible, then re-derive the tab's name
+    /// (REQ-UI-003) and re-evaluate agent detection against the new
+    /// content (REQ-AGENT-010).
     pub fn pty_output(&mut self, id: TabId, bytes: &[u8]) {
         if let Some(tab) = self.find_tab_mut(id) {
             tab.engine.advance_bytes(bytes);
-            if tab.refresh_agent() {
+            if tab.refresh_identity() {
                 self.force_redraw = true;
             }
         }
@@ -703,10 +712,22 @@ impl Session {
 
     pub fn needs_redraw(&self) -> bool {
         self.force_redraw
+            || self.has_animation()
             || self.windows.values().any(|w| {
                 let tab = w.active_tab();
                 tab.engine.current_seqno() != tab.drawn_seqno
             })
+    }
+
+    /// Any badge in a tab bar currently animated (REQ-UI-005/006)? While
+    /// one is on screen, the server redraws on its timer tick so the
+    /// animation advances without waiting on PTY output.
+    pub fn has_animation(&self) -> bool {
+        self.windows.values().any(|w| {
+            w.tabs
+                .iter()
+                .any(|t| t.agent.as_ref().is_some_and(|a| a.visual().anim != Anim::None))
+        })
     }
 
     /// One frame to an attached client's terminal: compute geometry into
@@ -767,12 +788,14 @@ impl Session {
             chrome.push(Chrome {
                 window: id,
                 tab_bar: win.tab_bar_rect(),
+                tab_rule: win.tab_rule_rect(),
                 tabs: win
                     .tabs
                     .iter()
                     .enumerate()
                     .map(|(i, tab)| TabBadge {
                         active: i == active,
+                        name: tab.name.clone(),
                         agent: tab.agent.as_ref().map(|t| t.visual()),
                     })
                     .collect(),
@@ -783,6 +806,7 @@ impl Session {
             separators,
             chrome,
             ex: self.compute_ex_chrome(),
+            elapsed: anim::elapsed(),
         };
     }
 
@@ -821,7 +845,7 @@ impl Session {
             render_tab(win.active_tab(), buf);
         }
         for chrome in &self.view.chrome {
-            render_tab_bar(chrome, self.focus, buf);
+            render_tab_bar(chrome, self.focus, buf, self.view.elapsed);
         }
         // REQ-SCROLL-017: highlight the selected text.
         if let Some(sel) = &self.selection
@@ -901,7 +925,7 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
 /// Draw one window's tab bar: an indicator per tab (REQ-TAB-013), the
 /// active one visually distinct (REQ-TAB-014), the remainder ruled to keep
 /// the bar readable as chrome rather than content.
-fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer) {
+fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: Duration) {
     let bar = chrome.tab_bar;
     if bar.height == 0 || bar.width == 0 {
         return;
@@ -920,23 +944,38 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer) {
         true
     };
     for (i, badge) in chrome.tabs.iter().enumerate() {
+        // REQ-UI-008/009: active is bright, inactive dimmed, neither
+        // with a background fill.
         let style = if badge.active {
             let color = if focused { Color::Green } else { Color::Gray };
-            Style::default().fg(color).add_modifier(Modifier::REVERSED)
+            Style::default().fg(color)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        for ch in format!(" {}", i + 1).chars() {
+        // REQ-UI-001/004: `<index>:<name>`, indexed from 0.
+        for ch in format!(" {}:{}", i, badge.name).chars() {
             if !put(&mut x, ch, style) {
                 return;
             }
         }
-        // REQ-AGENT-014/015/016: the agent symbol, in its state's color,
-        // only for tabs identified as running Claude Code.
-        if let Some((symbol, color)) = badge.agent
-            && !put(&mut x, symbol, style.fg(color))
-        {
-            return;
+        // REQ-AGENT-014/015/016: the bracketed status text, in its
+        // state's color, only for tabs identified as running Claude Code;
+        // working shimmers and blocked breathes (REQ-UI-005/006/007).
+        if let Some(visual) = &badge.agent {
+            if !put(&mut x, ' ', style) {
+                return;
+            }
+            let len = visual.text.chars().count();
+            for (j, ch) in visual.text.chars().enumerate() {
+                let color = match visual.anim {
+                    Anim::None => visual.color,
+                    Anim::Shimmer => anim::shimmer(visual.color, j, len, elapsed),
+                    Anim::Breathe => anim::breathe(visual.color, elapsed),
+                };
+                if !put(&mut x, ch, style.fg(color)) {
+                    return;
+                }
+            }
         }
         if !put(&mut x, ' ', style) {
             return;

@@ -12,6 +12,8 @@ use ratatui::style::Color;
 use regex::Regex;
 use wezterm_term::{Progress, Terminal as Engine};
 
+use crate::server::anim::Anim;
+
 /// REQ-AGENT-011: how long a working/blocked → idle result must hold
 /// before the displayed state updates.
 pub const IDLE_DEBOUNCE: Duration = Duration::from_millis(400);
@@ -256,16 +258,27 @@ impl Tracker {
         self.seen = true;
     }
 
-    /// REQ-AGENT-014/015: one symbol and color per visual state — done is
-    /// idle-but-unseen, idle is idle-and-seen.
-    pub fn visual(&self) -> (char, Color) {
-        match (self.displayed, self.seen) {
-            (AgentState::Working, _) => ('●', Color::Yellow),
-            (AgentState::Blocked, _) => ('!', Color::Red),
-            (AgentState::Idle, false) => ('✓', Color::Green),
-            (AgentState::Idle, true) => ('○', Color::DarkGray),
-        }
+    /// REQ-AGENT-014/015: bracketed status text and color per visual
+    /// state — done is idle-but-unseen, idle is idle-and-seen. Working
+    /// shimmers and blocked breathes (REQ-UI-005/006); idle and done stay
+    /// still (REQ-UI-007).
+    pub fn visual(&self) -> Visual {
+        let (text, color, anim) = match (self.displayed, self.seen) {
+            (AgentState::Working, _) => ("[working]", Color::Yellow, Anim::Shimmer),
+            (AgentState::Blocked, _) => ("[blocked]", Color::Red, Anim::Breathe),
+            (AgentState::Idle, false) => ("[done]", Color::Green, Anim::None),
+            (AgentState::Idle, true) => ("[idle]", Color::DarkGray, Anim::None),
+        };
+        Visual { text, color, anim }
     }
+}
+
+/// A tab's bracketed status text as the tab bar draws it
+/// (REQ-AGENT-014/015, REQ-UI-005/006/007).
+pub struct Visual {
+    pub text: &'static str,
+    pub color: Color,
+    pub anim: Anim,
 }
 
 #[cfg(test)]
@@ -345,14 +358,14 @@ mod tests {
         // REQ-AGENT-012: evidence moves back to working → cancelled.
         assert!(!t.observe(AgentState::Working, t0 + Duration::from_millis(100)));
         assert!(!t.pending());
-        assert_eq!(t.visual().0, '●');
+        assert_eq!(t.visual().text, "[working]");
         // REQ-AGENT-011: idle held past the debounce commits...
         assert!(!t.observe(AgentState::Idle, t0 + Duration::from_millis(200)));
         assert!(t.observe(AgentState::Idle, t0 + Duration::from_millis(200) + IDLE_DEBOUNCE));
         // ...and lands as done (unseen) until marked seen (REQ-AGENT-020).
-        assert_eq!(t.visual().0, '✓');
+        assert_eq!(t.visual().text, "[done]");
         t.mark_seen();
-        assert_eq!(t.visual().0, '○');
+        assert_eq!(t.visual().text, "[idle]");
     }
 
     #[test]
@@ -363,6 +376,6 @@ mod tests {
         t.observe(AgentState::Idle, t0);
         assert!(!t.tick(t0 + Duration::from_millis(100)));
         assert!(t.tick(t0 + IDLE_DEBOUNCE));
-        assert_eq!(t.visual().0, '✓');
+        assert_eq!(t.visual().text, "[done]");
     }
 }
