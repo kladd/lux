@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+# System clipboard read/write (REQ-SCROLL-016/023); image-data support
+# isn't needed, text only.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # For OSC 52 clipboard payloads (REQ-SCROLL-016).
 base64 = "0.22"
 ratatui = "0.29"

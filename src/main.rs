@@ -183,7 +183,7 @@ fn wz_button(button: CtMouseButton) -> wezterm_term::MouseButton {
 /// REQ-SCROLL-016: OSC 52 asks the host terminal to place the text on the
 /// system clipboard; it works locally and over SSH without a display
 /// server connection.
-fn copy_to_system_clipboard(text: &str) {
+fn osc52_copy(text: &str) {
     use base64::Engine as _;
     use std::io::Write as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
@@ -236,6 +236,11 @@ struct App {
     keys: KeyTable,
     /// The current drag selection, if any (REQ-SCROLL-014).
     selection: Option<Selection>,
+    /// Native system clipboard handle; `None` when the environment has no
+    /// clipboard (e.g. an SSH session without a display server). Held for
+    /// the app's lifetime because X11 clipboard contents only survive
+    /// while the offering handle lives.
+    clipboard: Option<arboard::Clipboard>,
     view: View,
     area: Rect,
     next_window_id: WindowId,
@@ -258,6 +263,7 @@ impl App {
             ex: None,
             keys,
             selection: None,
+            clipboard: arboard::Clipboard::new().ok(),
             view: View::default(),
             area,
             next_window_id: 1,
@@ -387,8 +393,15 @@ impl App {
                         self.selection = Some(Selection { window: id, start: cell, end: cell });
                         self.force_redraw = true;
                     }
-                    // REQ-SCROLL-015: yank + paste.
-                    CtMouseButton::Right => self.yank_selection(),
+                    // REQ-SCROLL-015: with a selection, right-click yanks;
+                    // REQ-SCROLL-023: without one, it pastes.
+                    CtMouseButton::Right => {
+                        if self.selection.is_some() {
+                            self.yank_selection();
+                        } else {
+                            self.paste_clipboard();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -450,13 +463,32 @@ impl App {
         self.windows.values().find(|w| w.rect.contains(pos)).map(|w| w.id)
     }
 
-    /// REQ-SCROLL-015/016: copy the selected text to the system clipboard
-    /// and write it to the focused window's active tab's PTY.
+    /// REQ-SCROLL-015: yank the selected text and clear the selection;
+    /// yanking never writes to a PTY.
     fn yank_selection(&mut self) {
-        let Some(text) = self.selection_text() else { return };
+        let text = self.selection_text();
         self.selection = None;
         self.force_redraw = true;
-        copy_to_system_clipboard(&text);
+        // REQ-SCROLL-016: yanked text goes to the system clipboard — the
+        // native handle, plus OSC 52 so the host terminal (or an outer
+        // multiplexer/SSH hop) can mirror it.
+        if let Some(text) = text {
+            if let Some(clipboard) = &mut self.clipboard {
+                let _ = clipboard.set_text(text.clone());
+            }
+            osc52_copy(&text);
+        }
+    }
+
+    /// REQ-SCROLL-023: write the system clipboard's current text content
+    /// to the focused window's active tab's PTY.
+    fn paste_clipboard(&mut self) {
+        let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
         if let Some(win) = self.windows.get_mut(&self.focus) {
             // send_paste honors the program's bracketed paste mode.
             let _ = win.active_tab_mut().engine.send_paste(&text);
