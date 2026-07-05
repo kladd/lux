@@ -519,11 +519,22 @@ impl Server {
         let count = self.sessions.len();
         let Some(client) = self.clients.get_mut(&conn) else { return };
         let Some(highlight) = client.switcher else { return };
+        let ctrl = key.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
         match key.code {
-            CtKeyCode::Up | CtKeyCode::Char('k') => {
+            // REQ-SESSION-034: `k`, Up, or Ctrl-p (tmux's `choose-tree`
+            // binding) moves the highlight up, wrapping to the last.
+            CtKeyCode::Up | CtKeyCode::Char('k') if !ctrl => {
                 client.switcher = Some(highlight.checked_sub(1).unwrap_or(count.saturating_sub(1)));
             }
-            CtKeyCode::Down | CtKeyCode::Char('j') => {
+            CtKeyCode::Char('p') if ctrl => {
+                client.switcher = Some(highlight.checked_sub(1).unwrap_or(count.saturating_sub(1)));
+            }
+            // REQ-SESSION-035: `j`, Down, or Ctrl-n (tmux's `choose-tree`
+            // binding) moves the highlight down, wrapping to the first.
+            CtKeyCode::Down | CtKeyCode::Char('j') if !ctrl => {
+                client.switcher = Some(if count == 0 { 0 } else { (highlight + 1) % count });
+            }
+            CtKeyCode::Char('n') if ctrl => {
                 client.switcher = Some(if count == 0 { 0 } else { (highlight + 1) % count });
             }
             // REQ-SESSION-018: back out without changing attachment.
