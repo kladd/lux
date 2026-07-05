@@ -12,7 +12,9 @@ pub enum Command {
     SplitStacked,
     NewTab,
     NextTab,
-    FocusNext,
+    /// Terminate every non-focused window's child processes
+    /// (REQ-WINDOW-016, vim's `<C-w>o` "only").
+    OnlyWindow,
     FocusDir(Dir),
     ResizeDir(Dir),
     /// Previous tab, wrapping (REQ-TAB-018).
@@ -27,18 +29,26 @@ pub enum Command {
     /// Enter scroll mode for the focused window's active tab
     /// (REQ-SCROLL-003).
     ScrollMode,
+    /// Make the focused window's tab at this index active (REQ-TAB-019).
+    SelectTab(usize),
 }
 
 /// The config-file name for each command (REQ-CONFIG-006), or `None` for a
 /// name no table command carries (REQ-CONFIG-007).
 pub fn command_by_name(name: &str) -> Option<Command> {
+    // REQ-TAB-019: one name per digit, `select-tab-0` … `select-tab-9`.
+    if let Some(rest) = name.strip_prefix("select-tab-")
+        && let &[d @ b'0'..=b'9'] = rest.as_bytes()
+    {
+        return Some(Command::SelectTab((d - b'0') as usize));
+    }
     Some(match name {
         "split-side-by-side" => Command::SplitSideBySide,
         "split-stacked" => Command::SplitStacked,
         "new-tab" => Command::NewTab,
         "next-tab" => Command::NextTab,
         "previous-tab" => Command::PrevTab,
-        "focus-next" => Command::FocusNext,
+        "only-window" => Command::OnlyWindow,
         "detach" => Command::Detach,
         "session-switcher" => Command::Switcher,
         "open-ex" => Command::OpenEx,
@@ -89,8 +99,8 @@ pub struct KeyTable {
 impl Default for KeyTable {
     /// REQ-KEY-003 (and REQ-CONFIG-003): the hardcoded defaults, covering
     /// every prefix sequence defined by REQ-WINDOW-005/006 (splits),
-    /// REQ-WINDOW-016 (focus cycle), REQ-WINDOW-017 (resize),
-    /// REQ-TAB-006/007/018 (tabs), REQ-KEY-004 (directional focus),
+    /// REQ-WINDOW-016 (only-window), REQ-WINDOW-017 (resize),
+    /// REQ-TAB-006/007/018/019 (tabs), REQ-KEY-004 (directional focus),
     /// REQ-KEY-006 (detach stub), REQ-SESSION-015 (session switcher), and
     /// REQ-EX-001 (ex command line).
     fn default() -> Self {
@@ -100,29 +110,32 @@ impl Default for KeyTable {
         fn ctrl(c: char) -> KeyMatch {
             KeyMatch { code: CtKeyCode::Char(c), ctrl: true }
         }
-        Self {
-            prefix: DEFAULT_PREFIX,
-            bindings: vec![
-                (plain('%'), Command::SplitSideBySide),
-                (plain('"'), Command::SplitStacked),
-                (plain('c'), Command::NewTab),
-                (plain('n'), Command::NextTab),
-                (plain('p'), Command::PrevTab),
-                (plain('o'), Command::FocusNext),
-                (plain('d'), Command::Detach),
-                (plain('s'), Command::Switcher),
-                (plain(':'), Command::OpenEx),
-                (plain('['), Command::ScrollMode),
-                (plain('h'), Command::FocusDir(Dir::Left)),
-                (plain('j'), Command::FocusDir(Dir::Down)),
-                (plain('k'), Command::FocusDir(Dir::Up)),
-                (plain('l'), Command::FocusDir(Dir::Right)),
-                (ctrl('h'), Command::ResizeDir(Dir::Left)),
-                (ctrl('j'), Command::ResizeDir(Dir::Down)),
-                (ctrl('k'), Command::ResizeDir(Dir::Up)),
-                (ctrl('l'), Command::ResizeDir(Dir::Right)),
-            ],
+        let mut bindings = vec![
+            (plain('%'), Command::SplitSideBySide),
+            (plain('"'), Command::SplitStacked),
+            (plain('c'), Command::NewTab),
+            (plain('n'), Command::NextTab),
+            (plain('p'), Command::PrevTab),
+            (plain('o'), Command::OnlyWindow),
+            (plain('d'), Command::Detach),
+            (plain('s'), Command::Switcher),
+            (plain(':'), Command::OpenEx),
+            (plain('['), Command::ScrollMode),
+            (plain('h'), Command::FocusDir(Dir::Left)),
+            (plain('j'), Command::FocusDir(Dir::Down)),
+            (plain('k'), Command::FocusDir(Dir::Up)),
+            (plain('l'), Command::FocusDir(Dir::Right)),
+            (ctrl('h'), Command::ResizeDir(Dir::Left)),
+            (ctrl('j'), Command::ResizeDir(Dir::Down)),
+            (ctrl('k'), Command::ResizeDir(Dir::Up)),
+            (ctrl('l'), Command::ResizeDir(Dir::Right)),
+        ];
+        // REQ-TAB-019: prefix+0-9 selects the tab at that index.
+        for d in 0..=9 {
+            let c = char::from_digit(d, 10).expect("single digit");
+            bindings.push((plain(c), Command::SelectTab(d as usize)));
         }
+        Self { prefix: DEFAULT_PREFIX, bindings }
     }
 }
 
@@ -200,6 +213,29 @@ mod tests {
             table.lookup(key(CtKeyCode::Char('s'), KeyModifiers::NONE)),
             Some(Command::Switcher)
         );
+    }
+
+    #[test]
+    fn digits_select_tabs_by_index() {
+        // REQ-TAB-019: every digit is bound to direct tab selection.
+        let table = KeyTable::default();
+        for d in 0..=9u32 {
+            let c = char::from_digit(d, 10).unwrap();
+            assert_eq!(
+                table.lookup(key(CtKeyCode::Char(c), KeyModifiers::NONE)),
+                Some(Command::SelectTab(d as usize))
+            );
+        }
+        assert_eq!(table.lookup(key(CtKeyCode::Char('3'), KeyModifiers::CONTROL)), None);
+    }
+
+    #[test]
+    fn select_tab_names_resolve_single_digits_only() {
+        assert_eq!(command_by_name("select-tab-0"), Some(Command::SelectTab(0)));
+        assert_eq!(command_by_name("select-tab-9"), Some(Command::SelectTab(9)));
+        assert_eq!(command_by_name("select-tab-10"), None);
+        assert_eq!(command_by_name("select-tab-"), None);
+        assert_eq!(command_by_name("select-tab-x"), None);
     }
 
     #[test]

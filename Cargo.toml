@@ -10,13 +10,16 @@ anyhow = "1"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 # For OSC 52 clipboard payloads (REQ-SCROLL-016).
 base64 = "0.22"
+# Local wall-clock for the session status line (REQ-UI-014).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ratatui = "0.29"
 # Detection rule matchers (REQ-AGENT-008).
 regex = "1"
 # Unix plumbing for the server/client split: winsize ioctl on passed fds
 # (REQ-SESSION-032), setsid for daemonize (REQ-SESSION-004), poll for
-# interruptible client-input reads.
-rustix = { version = "0.38", features = ["termios", "process", "event"] }
+# interruptible client-input reads, uname for the status-line hostname
+# (REQ-UI-026).
+rustix = { version = "0.38", features = ["termios", "process", "event", "system"] }
 # SCM_RIGHTS fd passing over the attach socket (REQ-SESSION-029).
 sendfd = "0.4"
 # SIGWINCH relay in the client (REQ-SESSION-031).

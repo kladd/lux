@@ -142,9 +142,12 @@ pub fn run() -> i32 {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
             }
         } else {
-            match rx.recv() {
+            // REQ-UI-015: even fully quiet, wake at the next wall-clock
+            // minute so the session status line's clock advances.
+            match rx.recv_timeout(until_next_minute()) {
                 Ok(event) => Some(event),
-                Err(_) => return 0,
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
             }
         };
         if let Some(event) = event {
@@ -157,6 +160,15 @@ pub fn run() -> i32 {
         server.tick_agents();
         server.render_all();
     }
+}
+
+/// Time until the next wall-clock minute boundary (REQ-UI-015). Sub-second
+/// truncation lands the wake just past the boundary, never before it.
+fn until_next_minute() -> std::time::Duration {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    std::time::Duration::from_secs(60 - secs % 60)
 }
 
 /// Per-connection thread: read the handshake (with any passed fds), then

@@ -83,16 +83,6 @@ impl Window {
         }
     }
 
-    /// The additional row reserved below the tab bar (REQ-UI-010), drawn
-    /// as a horizontal rule (REQ-UI-011).
-    pub fn tab_rule_rect(&self) -> Rect {
-        Rect {
-            y: self.rect.y + self.rect.height.min(1),
-            height: self.rect.height.saturating_sub(1).min(1),
-            ..self.rect
-        }
-    }
-
     /// Bring every tab's PTY and engine in sync with the window's current
     /// rectangle (REQ-WINDOW-018/019 across all of this window's tabs, so
     /// no tab is stale when it later becomes active).
@@ -107,8 +97,8 @@ impl Window {
 }
 
 fn content_rect(rect: Rect) -> Rect {
-    // Two chrome rows: the tab bar (REQ-TAB-011) and the ruled gap below
-    // it (REQ-UI-010).
+    // Two chrome rows: the tab bar (REQ-TAB-011) and the blank separator
+    // row below it (REQ-UI-024).
     let chrome = rect.height.min(2);
     Rect {
         y: rect.y + chrome,
@@ -225,6 +215,13 @@ impl Tab {
             master: pair.master,
             child,
         })
+    }
+
+    /// Terminate the tab's child process (REQ-WINDOW-016); the tab's
+    /// removal follows the ordinary exit path once its PTY closes
+    /// (REQ-WINDOW-020, REQ-TAB-015/016).
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
     }
 
     /// Re-identify the tab after new PTY output: re-derive its display

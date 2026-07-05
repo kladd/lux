@@ -134,6 +134,9 @@ struct TabBadge {
     active: bool,
     name: String,
     agent: Option<agent::Visual>,
+    /// The x-extent this badge occupies in the bar, for click hit-tests
+    /// (REQ-SCROLL-024); mirrors render_tab_bar's layout.
+    span: std::ops::Range<u16>,
 }
 
 /// Per-frame chrome geometry for one window, computed into state before
@@ -141,11 +144,28 @@ struct TabBadge {
 struct Chrome {
     window: WindowId,
     tab_bar: Rect,
-    /// The ruled row below the tab bar (REQ-UI-010/011).
-    tab_rule: Rect,
     tabs: Vec<TabBadge>,
     /// Whether the active tab is in scroll mode (REQ-SCROLL-013).
     scroll: bool,
+}
+
+/// REQ-UI-022: the session status line's neutral background — xterm-256
+/// grey 235 (#262626), distinct from the default background without a
+/// hue.
+const CHROME_BG: Color = Color::Indexed(235);
+
+/// REQ-UI-026: the local hostname, fixed for the server's lifetime.
+static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    rustix::system::uname().nodename().to_string_lossy().into_owned()
+});
+
+/// Per-frame session status line chrome (REQ-UI-012/013/014/026), absent
+/// while the command line owns the bottom row (REQ-UI-016/017).
+struct StatusChrome {
+    row: Rect,
+    name: String,
+    host: String,
+    clock: String,
 }
 
 /// Per-frame command line geometry, present while it's open (REQ-EX-002).
@@ -164,6 +184,7 @@ struct ExChrome {
 struct View {
     separators: Vec<Separator>,
     chrome: Vec<Chrome>,
+    status: Option<StatusChrome>,
     ex: Option<ExChrome>,
     /// The animation clock this frame renders at (REQ-UI-005/006).
     elapsed: Duration,
@@ -187,6 +208,8 @@ pub struct Session {
     selection: Option<Selection>,
     view: View,
     area: Rect,
+    /// The clock text as of the last computed view (REQ-UI-014/015).
+    clock: String,
     next_window_id: WindowId,
     force_redraw: bool,
     tx: Sender<ServerEvent>,
@@ -199,8 +222,9 @@ impl Session {
         keys: Arc<KeyTable>,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
-        // REQ-PANE-001: the initial window's shell, sized to the viewport.
-        let first = Window::new(0, area, tx.clone())?;
+        // REQ-PANE-001: the initial window's shell, sized to the viewport
+        // minus the session status row (REQ-UI-012).
+        let first = Window::new(0, tree_area(area), tx.clone())?;
         let mut windows = HashMap::new();
         windows.insert(first.id, first);
         Ok(Self {
@@ -214,6 +238,7 @@ impl Session {
             selection: None,
             view: View::default(),
             area,
+            clock: String::new(),
             next_window_id: 1,
             force_redraw: true,
             tx,
@@ -362,6 +387,15 @@ impl Session {
                     self.focus = id;
                     self.force_redraw = true;
                 }
+                // REQ-SCROLL-024: a left click on a tab's indicator makes
+                // that tab active. The bar is lux chrome, so the click
+                // never reaches a mouse-grabbed program.
+                if button == CtMouseButton::Left
+                    && let Some(index) = self.tab_badge_at(id, pos)
+                {
+                    self.select_tab(index);
+                    return None;
+                }
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
@@ -497,7 +531,9 @@ impl Session {
             Command::NextTab => self.cycle_tab(1),
             // REQ-TAB-018: previous tab, wrapping.
             Command::PrevTab => self.cycle_tab(-1),
-            Command::FocusNext => self.focus_next(),
+            // REQ-TAB-019: direct selection by displayed index.
+            Command::SelectTab(index) => self.select_tab(index),
+            Command::OnlyWindow => self.only_window(),
             Command::FocusDir(dir) => self.focus_dir(dir),
             Command::ResizeDir(dir) => self.resize_focused(dir),
             // REQ-SESSION-012: real detach, dispatched server-side
@@ -625,6 +661,30 @@ impl Session {
         self.force_redraw = true;
     }
 
+    /// REQ-TAB-019: make the focused window's tab at `index` active; an
+    /// out-of-range index is discarded silently (REQ-TAB-020).
+    fn select_tab(&mut self, index: usize) {
+        let win = self.windows.get_mut(&self.focus).expect("focused window exists");
+        if index >= win.tabs.len() || index == win.active {
+            return;
+        }
+        win.active = index;
+        self.drop_selection_in(self.focus);
+        // REQ-TAB-008: show the switch without waiting on PTY output.
+        self.force_redraw = true;
+    }
+
+    /// The index of the tab badge at `pos` in window `id`'s tab bar, from
+    /// the last computed view's geometry (REQ-SCROLL-024).
+    fn tab_badge_at(&self, id: WindowId, pos: Position) -> Option<usize> {
+        let chrome = self.view.chrome.iter().find(|c| c.window == id)?;
+        let bar = chrome.tab_bar;
+        if bar.height == 0 || pos.y != bar.y {
+            return None;
+        }
+        chrome.tabs.iter().position(|b| b.span.contains(&pos.x))
+    }
+
     /// A selection describes cells of the window's currently visible tab;
     /// drop it when that content is replaced or the window goes away.
     fn drop_selection_in(&mut self, window: WindowId) {
@@ -645,19 +705,22 @@ impl Session {
         }
     }
 
-    /// REQ-WINDOW-016: cycle focus through the tree's in-order leaves.
-    fn focus_next(&mut self) {
-        let ids = layout::leaves(&self.tree);
-        if let Some(pos) = ids.iter().position(|id| *id == self.focus) {
-            self.focus = ids[(pos + 1) % ids.len()];
-            self.force_redraw = true;
+    /// REQ-WINDOW-016: vim's "only" — terminate every other window's
+    /// child processes; the resulting exit events collapse the tree
+    /// through the ordinary removal path (REQ-WINDOW-020).
+    fn only_window(&mut self) {
+        let focus = self.focus;
+        for (_, win) in self.windows.iter_mut().filter(|(id, _)| **id != focus) {
+            for tab in &mut win.tabs {
+                tab.kill();
+            }
         }
     }
 
     /// REQ-WINDOW-017: move the boundary between the focused window and
     /// its adjacent sibling one cell in `dir`.
     fn resize_focused(&mut self, dir: Dir) {
-        if layout::resize_toward(&mut self.tree, self.area, self.focus, dir) {
+        if layout::resize_toward(&mut self.tree, tree_area(self.area), self.focus, dir) {
             self.force_redraw = true;
         }
     }
@@ -712,6 +775,8 @@ impl Session {
 
     pub fn needs_redraw(&self) -> bool {
         self.force_redraw
+            // REQ-UI-015: the status line's clock rolled over a minute.
+            || self.clock != clock_now()
             || self.has_animation()
             || self.windows.values().any(|w| {
                 let tab = w.active_tab();
@@ -771,7 +836,7 @@ impl Session {
     /// reconciling every window's tabs with their rectangles
     /// (REQ-WINDOW-018/019, REQ-TAB-010/011).
     fn compute_view(&mut self) {
-        let (rects, separators) = layout::compute(&self.tree, self.area);
+        let (rects, separators) = layout::compute(&self.tree, tree_area(self.area));
         let mut chrome = Vec::with_capacity(rects.len());
         for (id, rect) in rects {
             let Some(win) = self.windows.get_mut(&id) else { continue };
@@ -785,27 +850,54 @@ impl Session {
                 tracker.mark_seen();
             }
             let active = win.active;
-            chrome.push(Chrome {
-                window: id,
-                tab_bar: win.tab_bar_rect(),
-                tab_rule: win.tab_rule_rect(),
-                tabs: win
-                    .tabs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, tab)| TabBadge {
+            let bar = win.tab_bar_rect();
+            // Badge spans track render_tab_bar's layout: " i:name", the
+            // agent text when present, and the trailing separator space.
+            let mut next_x = bar.x;
+            let tabs = win
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, tab)| {
+                    let agent = tab.agent.as_ref().map(|t| t.visual());
+                    let mut width = format!(" {}:{}", i, tab.name).chars().count() as u16;
+                    if let Some(visual) = &agent {
+                        width += 1 + visual.text.chars().count() as u16;
+                    }
+                    width += 1;
+                    let start = next_x;
+                    next_x = next_x.saturating_add(width).min(bar.right());
+                    TabBadge {
                         active: i == active,
                         name: tab.name.clone(),
-                        agent: tab.agent.as_ref().map(|t| t.visual()),
-                    })
-                    .collect(),
+                        agent,
+                        span: start..next_x,
+                    }
+                })
+                .collect();
+            chrome.push(Chrome {
+                window: id,
+                tab_bar: bar,
+                tabs,
                 scroll: win.active_tab().scroll_mode(),
             });
         }
+        self.clock = clock_now();
+        let ex = self.compute_ex_chrome();
+        // REQ-UI-012/013/014: the reserved bottom row, unless the command
+        // line owns it this frame (REQ-UI-016/017).
+        let status = (ex.is_none() && self.area.height > 0 && self.area.width > 0)
+            .then(|| StatusChrome {
+                row: Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1),
+                name: self.name.clone(),
+                host: HOSTNAME.clone(),
+                clock: self.clock.clone(),
+            });
         self.view = View {
             separators,
             chrome,
-            ex: self.compute_ex_chrome(),
+            status,
+            ex,
             elapsed: anim::elapsed(),
         };
     }
@@ -857,6 +949,12 @@ impl Session {
         // touching the focused window are highlighted to mark focus.
         for sep in &self.view.separators {
             render_separator(sep, focused_rect, buf);
+        }
+        // REQ-UI-013/014: the session status line on the reserved bottom
+        // row; absent while the command line renders there instead
+        // (REQ-UI-016/017).
+        if let Some(status) = &self.view.status {
+            render_status(status, buf);
         }
         if let Some(chrome) = &self.view.ex {
             render_ex_chrome(chrome, buf);
@@ -923,8 +1021,9 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
 }
 
 /// Draw one window's tab bar: an indicator per tab (REQ-TAB-013), the
-/// active one visually distinct (REQ-TAB-014), the remainder ruled to keep
-/// the bar readable as chrome rather than content.
+/// active one visually distinct (REQ-TAB-014), the remainder left blank
+/// (REQ-UI-018) — the blank row below (REQ-UI-024) marks the boundary
+/// with content.
 fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: Duration) {
     let bar = chrome.tab_bar;
     if bar.height == 0 || bar.width == 0 {
@@ -944,10 +1043,11 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         true
     };
     for (i, badge) in chrome.tabs.iter().enumerate() {
-        // REQ-UI-008/009: active is bright, inactive dimmed, neither
-        // with a background fill.
+        // REQ-UI-008/009: active is bright, inactive dimmed, no
+        // background fill — neutral shades only, matching the
+        // brightness-only chrome convention (REQ-UI-025).
         let style = if badge.active {
-            let color = if focused { Color::Green } else { Color::Gray };
+            let color = if focused { Color::White } else { Color::Gray };
             Style::default().fg(color)
         } else {
             Style::default().fg(Color::DarkGray)
@@ -981,28 +1081,10 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
             return;
         }
     }
+    // REQ-UI-018: the bar's unused width stays blank.
     let indicators_end = x;
-    let rule = Style::default().fg(Color::DarkGray);
-    while x < bar.right() {
-        if let Some(dst) = buf.cell_mut(Position::new(x, bar.y)) {
-            dst.set_symbol("─");
-            dst.set_style(rule);
-        }
-        x += 1;
-    }
-    // REQ-UI-010/011: the reserved row below the bar, ruled edge to edge
-    // so it reads as chrome rather than a blank content line.
-    let gap = chrome.tab_rule;
-    if gap.height > 0 {
-        for gx in gap.x..gap.right() {
-            if let Some(dst) = buf.cell_mut(Position::new(gx, gap.y)) {
-                dst.set_symbol("─");
-                dst.set_style(rule);
-            }
-        }
-    }
     // REQ-SCROLL-013: mark a scrolled tab so a frozen view isn't mistaken
-    // for the live tail. Drawn over the rule, right-aligned.
+    // for the live tail. Drawn in the bar's blank remainder, right-aligned.
     if chrome.scroll {
         let label = " scroll ";
         let len = label.len() as u16;
@@ -1014,6 +1096,61 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
                     dst.set_char(ch);
                     dst.set_style(style);
                 }
+            }
+        }
+    }
+}
+
+/// The layout tree's area: the viewport minus the bottom row reserved
+/// for the session status line (REQ-UI-012).
+fn tree_area(area: Rect) -> Rect {
+    Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    }
+}
+
+/// The status line's clock text (REQ-UI-014), `%H:%M` matching tmux's
+/// default status-right.
+fn clock_now() -> String {
+    chrono::Local::now().format("%H:%M").to_string()
+}
+
+/// Draw the session status line: name left (REQ-UI-013), clock right
+/// (REQ-UI-014), on the neutral chrome background (REQ-UI-022).
+fn render_status(status: &StatusChrome, buf: &mut Buffer) {
+    let row = status.row;
+    if row.height == 0 || row.width == 0 {
+        return;
+    }
+    let fill = Style::default().bg(CHROME_BG);
+    for x in row.x..row.right() {
+        if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
+            dst.set_char(' ');
+            dst.set_style(fill);
+        }
+    }
+    let name_style = fill.fg(Color::Green);
+    for (i, ch) in format!(" {}", status.name).chars().enumerate() {
+        let x = row.x + i as u16;
+        if x >= row.right() {
+            break;
+        }
+        if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
+            dst.set_char(ch);
+            dst.set_style(name_style);
+        }
+    }
+    // REQ-UI-026: hostname two spaces left of the clock (REQ-UI-014).
+    let clock_style = fill.fg(Color::Gray);
+    let text = format!("{}  {} ", status.host, status.clock);
+    let len = text.chars().count() as u16;
+    if row.width >= len {
+        let start = row.right() - len;
+        for (i, ch) in text.chars().enumerate() {
+            if let Some(dst) = buf.cell_mut(Position::new(start + i as u16, row.y)) {
+                dst.set_char(ch);
+                dst.set_style(clock_style);
             }
         }
     }
@@ -1090,8 +1227,9 @@ fn render_separator(sep: &Separator, focused: Rect, buf: &mut Buffer) {
                 && sep.rect.x < focused.right(),
         ),
     };
+    // REQ-UI-025: focus reads from brightness alone, no hue.
     let style = if adjacent {
-        Style::default().fg(Color::Green)
+        Style::default().fg(Color::White)
     } else {
         Style::default().fg(Color::DarkGray)
     };

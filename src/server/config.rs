@@ -218,10 +218,10 @@ mod tests {
 
     #[test]
     fn config_binding_displaces_default_on_same_key() {
-        // `n` is next-tab's default; rebinding focus-next to it leaves
-        // next-tab unreachable on that key and focus-next off `o`.
-        let t = table("[keys]\nfocus-next = \"n\"");
-        assert_eq!(find(&t, Command::FocusNext), vec![plain('n')]);
+        // `n` is next-tab's default; rebinding only-window to it leaves
+        // next-tab unreachable on that key and only-window off `o`.
+        let t = table("[keys]\nonly-window = \"n\"");
+        assert_eq!(find(&t, Command::OnlyWindow), vec![plain('n')]);
         assert_eq!(find(&t, Command::NextTab), vec![]);
     }
 

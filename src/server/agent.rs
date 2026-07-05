@@ -131,6 +131,15 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
                 ..Default::default()
             },
         },
+        // Any interactive prompt renders a numbered option list with a ❯
+        // selector regardless of wording — AskUserQuestion, trust
+        // dialogs, permission variants (REQ-AGENT-022).
+        Rule {
+            state: AgentState::Blocked,
+            priority: 890,
+            source: Source::Screen,
+            gate: regex(&["❯\\s*1\\."]),
+        },
         // The CLI animates a Braille spinner into the window title while
         // it runs (the same signal herdr keys off).
         Rule {
@@ -327,6 +336,25 @@ mod tests {
             "none",
         );
         assert_eq!(evaluate(&s), AgentState::Blocked);
+    }
+
+    #[test]
+    fn option_selector_prompt_is_blocked() {
+        // REQ-AGENT-022: freeform prompts (AskUserQuestion, trust
+        // dialogs) share only their selector chrome, not their wording.
+        let s = snap(
+            "Which library should we use?\n❯ 1. serde\n  2. nanoserde\n",
+            "claude",
+            "none",
+        );
+        assert_eq!(evaluate(&s), AgentState::Blocked);
+        // The selector outranks leftover working evidence, like the
+        // phrase rules do.
+        let s = snap("Pick one\n❯ 1. Yes\n(esc to interrupt)\n", "", "none");
+        assert_eq!(evaluate(&s), AgentState::Blocked);
+        // A numbered list without the selector is ordinary output.
+        let s = snap("1. serde\n2. nanoserde\n", "claude", "none");
+        assert_eq!(evaluate(&s), AgentState::Idle);
     }
 
     #[test]
