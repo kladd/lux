@@ -24,29 +24,67 @@ pub struct InputDecoder {
     /// Buttons held as of the previous mouse event, to derive
     /// press/release/drag kinds from termwiz's stateless reports.
     buttons: TwButtons,
+    /// Whether the byte stream is inside a bracketed paste, where LF is
+    /// paste content rather than a Ctrl-J keypress.
+    in_paste: bool,
 }
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 impl Default for InputDecoder {
     fn default() -> Self {
         Self {
             parser: InputParser::new(),
             buttons: TwButtons::NONE,
+            in_paste: false,
         }
     }
 }
 
 impl InputDecoder {
     pub fn decode(&mut self, bytes: &[u8]) -> Vec<DecodedInput> {
+        // termwiz maps LF and CR both to Enter, which would re-encode
+        // Ctrl-J (LF) as CR on the pane pty. Intercept LF outside
+        // bracketed paste so the two stay distinct keys.
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if !self.in_paste && bytes[i..].starts_with(PASTE_START) {
+                self.in_paste = true;
+                i += PASTE_START.len();
+            } else if self.in_paste && bytes[i..].starts_with(PASTE_END) {
+                self.in_paste = false;
+                i += PASTE_END.len();
+            } else if !self.in_paste && bytes[i] == b'\n' {
+                // ESC-prefixed LF is the legacy Alt encoding.
+                let alt = i > start && bytes[i - 1] == 0x1b;
+                let seg_end = if alt { i - 1 } else { i };
+                self.parse_into(&bytes[start..seg_end], &mut out);
+                let mods = if alt { CtMods::CONTROL | CtMods::ALT } else { CtMods::CONTROL };
+                out.push(DecodedInput::Key(KeyEvent::new(CtKeyCode::Char('j'), mods)));
+                start = i + 1;
+                i = start;
+            } else {
+                i += 1;
+            }
+        }
+        self.parse_into(&bytes[start..], &mut out);
+        out
+    }
+
+    fn parse_into(&mut self, bytes: &[u8], out: &mut Vec<DecodedInput>) {
+        if bytes.is_empty() {
+            return;
+        }
         let events = self.parser.parse_as_vec(bytes, false);
-        events
-            .into_iter()
-            .filter_map(|event| match event {
-                InputEvent::Key(key) => convert_key(key).map(DecodedInput::Key),
-                InputEvent::Mouse(mouse) => self.convert_mouse(mouse),
-                InputEvent::Paste(text) => Some(DecodedInput::Paste(text)),
-                _ => None,
-            })
-            .collect()
+        out.extend(events.into_iter().filter_map(|event| match event {
+            InputEvent::Key(key) => convert_key(key).map(DecodedInput::Key),
+            InputEvent::Mouse(mouse) => self.convert_mouse(mouse),
+            InputEvent::Paste(text) => Some(DecodedInput::Paste(text)),
+            _ => None,
+        }));
     }
 
     fn convert_mouse(&mut self, mouse: TwMouseEvent) -> Option<DecodedInput> {
@@ -175,6 +213,50 @@ mod tests {
         // Arrow key CSI.
         let evs = keys(&mut d, b"\x1b[A");
         assert_eq!(evs[0].code, CtKeyCode::Up);
+    }
+
+    #[test]
+    fn lf_decodes_as_ctrl_j_not_enter() {
+        let mut d = InputDecoder::default();
+        // Ctrl-J arrives as LF; it must stay distinct from Enter (CR) so
+        // apps that treat Ctrl-J as newline-insert don't see a submit.
+        let evs = keys(&mut d, b"\n");
+        assert_eq!(evs[0].code, CtKeyCode::Char('j'));
+        assert!(evs[0].modifiers.contains(CtMods::CONTROL));
+        // Surrounding bytes keep their order.
+        let evs = keys(&mut d, b"a\nb");
+        let codes: Vec<_> = evs.iter().map(|e| e.code).collect();
+        assert_eq!(
+            codes,
+            vec![CtKeyCode::Char('a'), CtKeyCode::Char('j'), CtKeyCode::Char('b')]
+        );
+        // Alt-Ctrl-J arrives ESC-prefixed.
+        let evs = keys(&mut d, b"\x1b\n");
+        assert_eq!(evs[0].code, CtKeyCode::Char('j'));
+        assert!(evs[0].modifiers.contains(CtMods::CONTROL | CtMods::ALT));
+    }
+
+    #[test]
+    fn paste_content_keeps_newlines() {
+        let mut d = InputDecoder::default();
+        let evs = d.decode(b"\x1b[200~one\ntwo\x1b[201~");
+        match evs.as_slice() {
+            [DecodedInput::Paste(text)] => assert_eq!(text, "one\ntwo"),
+            _ => panic!("expected a single paste event"),
+        }
+        // Paste spanning multiple reads: the LF in the middle chunk is
+        // still paste content, not a keypress.
+        let mut d = InputDecoder::default();
+        d.decode(b"\x1b[200~one");
+        let evs = d.decode(b"\ntwo");
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                DecodedInput::Key(k) if k.code == CtKeyCode::Char('j')
+            )),
+            "LF inside a paste must not become Ctrl-J"
+        );
+        d.decode(b"\x1b[201~");
     }
 
     #[test]
