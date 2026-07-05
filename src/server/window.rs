@@ -10,14 +10,19 @@ use std::thread;
 
 use anyhow::Context;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use ratatui::crossterm::event::Event as CtEvent;
 use ratatui::layout::Rect;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{Terminal as Engine, TerminalConfiguration, TerminalSize};
 
-use crate::layout::WindowId;
+use crate::server::ServerEvent;
+use crate::server::agent::{self, Tracker};
+use crate::server::layout::WindowId;
 
 pub type TabId = usize;
+
+/// Tab ids are unique across all sessions on the server, so PTY reader
+/// threads can tag events without knowing which session owns them.
+static NEXT_TAB_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Debug)]
 struct LuxConfig;
@@ -26,15 +31,6 @@ impl TerminalConfiguration for LuxConfig {
     fn color_palette(&self) -> ColorPalette {
         ColorPalette::default()
     }
-}
-
-pub enum Event {
-    /// A key press or host terminal resize.
-    Input(CtEvent),
-    /// Output bytes read from a tab's PTY.
-    Output(TabId, Vec<u8>),
-    /// A tab's PTY reached EOF: the child's side is closed.
-    Exited(TabId),
 }
 
 /// A leaf of the layout tree: one rectangle of screen space owning an
@@ -52,8 +48,8 @@ impl Window {
     /// Create a window whose tab list holds exactly one active tab
     /// (REQ-TAB-003), with the tab's shell and engine sized to the content
     /// rectangle below the tab bar row (REQ-WINDOW-009/010, REQ-TAB-005).
-    pub fn new(id: WindowId, rect: Rect, tab_id: TabId, tx: Sender<Event>) -> anyhow::Result<Self> {
-        let tab = Tab::spawn(tab_id, content_rect(rect), tx)?;
+    pub fn new(id: WindowId, rect: Rect, tx: Sender<ServerEvent>) -> anyhow::Result<Self> {
+        let tab = Tab::spawn(content_rect(rect), tx)?;
         Ok(Self {
             id,
             rect,
@@ -120,6 +116,9 @@ pub struct Tab {
     /// Stable indices survive scrollback growth and trimming, so the view
     /// stays anchored to content while output arrives (REQ-SCROLL-010).
     scroll_top: Option<isize>,
+    /// Present while the tab is identified as running Claude Code
+    /// (REQ-AGENT-002/016).
+    pub agent: Option<Tracker>,
     master: Box<dyn MasterPty>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -127,7 +126,8 @@ pub struct Tab {
 impl Tab {
     /// Spawn a PTY running $SHELL sized to `rect` with an engine to match
     /// (REQ-TAB-004/005) and a reader thread feeding `tx` (REQ-PANE-005).
-    pub fn spawn(id: TabId, rect: Rect, tx: Sender<Event>) -> anyhow::Result<Self> {
+    pub fn spawn(rect: Rect, tx: Sender<ServerEvent>) -> anyhow::Result<Self> {
+        let id = NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pty = native_pty_system();
         let pair = pty.openpty(pty_size(rect)).context("open PTY")?;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -147,13 +147,13 @@ impl Tab {
                     // EOF or EIO: child side of the PTY closed.
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if tx.send(Event::Output(id, buf[..n].to_vec())).is_err() {
+                        if tx.send(ServerEvent::PtyOutput(id, buf[..n].to_vec())).is_err() {
                             return;
                         }
                     }
                 }
             }
-            let _ = tx.send(Event::Exited(id));
+            let _ = tx.send(ServerEvent::PtyExited(id));
         });
 
         // The engine writes encoded key input back through `writer` into
@@ -172,9 +172,55 @@ impl Tab {
             rect,
             drawn_seqno: 0,
             scroll_top: None,
+            agent: None,
             master: pair.master,
             child,
         })
+    }
+
+    /// Re-identify the tab and re-evaluate detection after new PTY output
+    /// (REQ-AGENT-002/010). Returns whether the displayed agent state
+    /// (including the symbol appearing or disappearing) changed.
+    pub fn refresh_agent(&mut self) -> bool {
+        if !self.foreground_is_claude() {
+            // REQ-AGENT-016/017: not Claude Code — no symbol, drop any
+            // stale state.
+            return self.agent.take().is_some();
+        }
+        let snapshot = agent::Snapshot::capture(&self.engine);
+        let raw = agent::evaluate(&snapshot);
+        let appeared = self.agent.is_none();
+        let tracker = self.agent.get_or_insert_default();
+        let changed = tracker.observe(raw, std::time::Instant::now());
+        appeared || changed
+    }
+
+    /// REQ-AGENT-002: the PTY's foreground process command name must be
+    /// `claude`. `/proc/<pid>/comm` is the kernel's command name; argv[0]'s
+    /// basename covers the same name when comm is truncated or wrapped.
+    fn foreground_is_claude(&self) -> bool {
+        let Some(pid) = self.master.process_group_leader() else {
+            return false;
+        };
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        if comm.trim() == "claude" {
+            return true;
+        }
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let arg0 = cmdline.split(|b| *b == 0).next().unwrap_or(b"");
+        std::path::Path::new(&String::from_utf8_lossy(arg0).into_owned())
+            .file_name()
+            .is_some_and(|name| name == "claude")
+    }
+
+    /// Commit a pending idle debounce whose window has elapsed with no
+    /// further output (REQ-AGENT-011); returns whether display changed.
+    pub fn tick_agent(&mut self, now: std::time::Instant) -> bool {
+        self.agent.as_mut().is_some_and(|t| t.tick(now))
+    }
+
+    pub fn agent_pending_idle(&self) -> bool {
+        self.agent.as_ref().is_some_and(|t| t.pending())
     }
 
     pub fn scroll_mode(&self) -> bool {

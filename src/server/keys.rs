@@ -4,7 +4,7 @@
 
 use ratatui::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers as CtMods};
 
-use crate::layout::Dir;
+use crate::server::layout::Dir;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
@@ -15,9 +15,13 @@ pub enum Command {
     FocusNext,
     FocusDir(Dir),
     ResizeDir(Dir),
-    /// Recognized but takes no other action until Phase 8's real session
-    /// detach (REQ-KEY-006).
+    /// Previous tab, wrapping (REQ-TAB-018).
+    PrevTab,
+    /// Detach the client from its session (REQ-KEY-006, real as of
+    /// REQ-SESSION-012).
     Detach,
+    /// Open the session switcher (REQ-SESSION-015).
+    Switcher,
     /// Open the ex command line (REQ-EX-001).
     OpenEx,
     /// Enter scroll mode for the focused window's active tab
@@ -33,8 +37,10 @@ pub fn command_by_name(name: &str) -> Option<Command> {
         "split-stacked" => Command::SplitStacked,
         "new-tab" => Command::NewTab,
         "next-tab" => Command::NextTab,
+        "previous-tab" => Command::PrevTab,
         "focus-next" => Command::FocusNext,
         "detach" => Command::Detach,
+        "session-switcher" => Command::Switcher,
         "open-ex" => Command::OpenEx,
         "scroll-mode" => Command::ScrollMode,
         "focus-left" => Command::FocusDir(Dir::Left),

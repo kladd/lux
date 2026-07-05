@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use ratatui::crossterm::event::KeyCode as CtKeyCode;
 
-use crate::keys::{Command, KeyMatch, KeyTable, command_by_name};
+use crate::server::keys::{Command, KeyMatch, KeyTable, command_by_name};
 
 /// REQ-CONFIG-001: `$XDG_CONFIG_HOME/lux/config.toml`, falling back to
 /// `~/.config/lux/config.toml`.
@@ -156,7 +156,7 @@ fn parse_key_spec(spec: &str) -> Option<KeyMatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::Dir;
+    use crate::server::layout::Dir;
 
     fn table(text: &str) -> KeyTable {
         from_toml(text, "test")
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn malformed_toml_yields_defaults() {
         let t = table("prefix = [broken");
-        assert_eq!(t.prefix, crate::keys::DEFAULT_PREFIX);
+        assert_eq!(t.prefix, crate::server::keys::DEFAULT_PREFIX);
         assert_eq!(t.bindings.len(), KeyTable::default().bindings.len());
     }
 
@@ -198,9 +198,9 @@ mod tests {
 
     #[test]
     fn invalid_prefix_keeps_default() {
-        assert_eq!(table("prefix = \"C-\"").prefix, crate::keys::DEFAULT_PREFIX);
-        assert_eq!(table("prefix = \"abc\"").prefix, crate::keys::DEFAULT_PREFIX);
-        assert_eq!(table("prefix = 5").prefix, crate::keys::DEFAULT_PREFIX);
+        assert_eq!(table("prefix = \"C-\"").prefix, crate::server::keys::DEFAULT_PREFIX);
+        assert_eq!(table("prefix = \"abc\"").prefix, crate::server::keys::DEFAULT_PREFIX);
+        assert_eq!(table("prefix = 5").prefix, crate::server::keys::DEFAULT_PREFIX);
     }
 
     #[test]

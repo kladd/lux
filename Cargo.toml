@@ -11,6 +11,16 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # For OSC 52 clipboard payloads (REQ-SCROLL-016).
 base64 = "0.22"
 ratatui = "0.29"
+# Detection rule matchers (REQ-AGENT-008).
+regex = "1"
+# Unix plumbing for the server/client split: winsize ioctl on passed fds
+# (REQ-SESSION-032), setsid for daemonize (REQ-SESSION-004), poll for
+# interruptible client-input reads.
+rustix = { version = "0.38", features = ["termios", "process", "event"] }
+# SCM_RIGHTS fd passing over the attach socket (REQ-SESSION-029).
+sendfd = "0.4"
+# SIGWINCH relay in the client (REQ-SESSION-031).
+signal-hook = "0.3"
 # Command line editing per REQ-EX-018; 0.7 tracks ratatui 0.29.
 tui-textarea = "0.7"
 # preserve_order: REQ-CONFIG-008 resolves duplicate key sequences to the
