@@ -1,8 +1,8 @@
-//! A ratatui backend over a client's passed stdout descriptor
-//! (REQ-SESSION-010/030). CrosstermBackend writes escape sequences to any
+//! A ratatui backend over a client's passed stdout descriptor.
+//! CrosstermBackend writes escape sequences to any
 //! writer, but its `size()` queries the *server process's* stdout — which
 //! is /dev/null once daemonized — so this wrapper tracks the client
-//! terminal's size explicitly (updated via REQ-SESSION-032 resize
+//! terminal's size explicitly (updated via resize
 //! handling).
 //!
 //! Frames are bracketed in DEC 2026 synchronized updates with the cursor
@@ -109,7 +109,7 @@ impl Backend for FdBackend {
 }
 
 /// The client terminal's current dimensions, read from the passed
-/// descriptor itself (REQ-SESSION-032).
+/// descriptor itself.
 pub fn fd_size(fd: &impl std::os::fd::AsFd) -> Size {
     match rustix::termios::tcgetwinsize(fd) {
         Ok(ws) if ws.ws_col > 0 && ws.ws_row > 0 => Size::new(ws.ws_col, ws.ws_row),

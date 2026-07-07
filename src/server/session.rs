@@ -1,14 +1,14 @@
 //! A session: the server-owned unit of state a client attaches to — one
 //! layout tree of windows, each owning its tab list, plus the interaction
 //! modes (prefix, ex command line, scroll mode, selection) that Phases 2-7
-//! built. Sessions keep running whether or not a client is attached
-//! (REQ-SESSION-005), and reproduce the single-process behavior for
-//! whichever client is (REQ-SESSION-010).
+//! built. Sessions keep running whether or not a client is attached,
+//! and reproduce the single-process behavior for
+//! whichever client is.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -30,31 +30,35 @@ use crate::server::ServerEvent;
 use crate::server::agent;
 use crate::server::anim::{self, Anim};
 use crate::server::ex::{self, ExCommand};
-use crate::server::keys::{Command, KeyTable};
+use crate::server::keys::{Command, KeyMatch, KeyTable, KeyTrie};
 use crate::server::layout::{self, Dir, Node, Separator, SplitKind, WindowId};
 use crate::server::term::FdBackend;
 use crate::server::window::{Tab, TabId, Window};
 
-/// Minimum window size a split may produce (REQ-WINDOW-008).
+/// Minimum window size a split may produce.
 const MIN_COLS: u16 = 10;
 const MIN_ROWS: u16 = 3;
+
+/// The resize submap's repeat deadline, matching tmux's default
+/// `repeat-time`; restarted on each repeated resize dispatch.
+const RESIZE_REPEAT: Duration = Duration::from_millis(500);
 
 /// A session-level consequence the server must act on; everything else is
 /// handled inside the session.
 pub enum Effect {
-    /// REQ-SESSION-012: detach the client driving this session.
+    /// Detach the client driving this session.
     Detach,
-    /// REQ-SESSION-015: enter switcher mode for the driving client.
+    /// Enter switcher mode for the driving client.
     OpenSwitcher,
-    /// REQ-SCROLL-016: yanked text for the system clipboard.
+    /// Yanked text for the system clipboard.
     Copy(String),
-    /// REQ-SCROLL-023: paste the system clipboard into this session.
+    /// Paste the system clipboard into this session.
     Paste,
-    /// REQ-SESSION-023: the last window's last tab exited.
+    /// The last window's last tab exited.
     Ended,
 }
 
-/// A drag selection over one window's content (REQ-SCROLL-014), in
+/// A drag selection over one window's content, in
 /// content-relative cell coordinates. Linear: the text flows from `start`
 /// to `end` through intervening full rows.
 struct Selection {
@@ -82,7 +86,7 @@ fn selection_span(row: u16, first: (u16, u16), last: (u16, u16)) -> (u16, u16) {
 }
 
 /// Map an absolute screen position into content-relative cell coordinates,
-/// clamped inside the content rectangle (REQ-SCROLL-019).
+/// clamped inside the content rectangle.
 fn clamp_to_content(pos: Position, content: Rect) -> (u16, u16) {
     if content.width == 0 || content.height == 0 {
         return (0, 0);
@@ -92,10 +96,10 @@ fn clamp_to_content(pos: Position, content: Rect) -> (u16, u16) {
     (x, y)
 }
 
-/// Forward a mouse event to a tab whose program handles the mouse itself
-/// (REQ-SCROLL-020); the engine encodes it per the protocol the program
+/// Forward a mouse event to a tab whose program handles the mouse itself;
+/// the engine encodes it per the protocol the program
 /// requested, and converts wheel ticks to arrow keys on the alternate
-/// screen (REQ-SCROLL-021).
+/// screen.
 fn forward_mouse(tab: &mut Tab, mouse: &CtMouseEvent, content: Rect) {
     use wezterm_term::{MouseButton as WzButton, MouseEventKind as WzKind};
     let (kind, button) = match mouse.kind {
@@ -128,39 +132,39 @@ fn wz_button(button: CtMouseButton) -> wezterm_term::MouseButton {
 }
 
 /// One tab's indicator in the bar: whether it's the active tab, its
-/// display name (REQ-UI-002), plus its bracketed status text when the tab
-/// runs Claude Code (REQ-AGENT-014/015/016).
+/// display name, plus its bracketed status text when the tab
+/// runs Claude Code.
 struct TabBadge {
     active: bool,
     name: String,
     agent: Option<agent::Visual>,
-    /// The x-extent this badge occupies in the bar, for click hit-tests
-    /// (REQ-SCROLL-024); mirrors render_tab_bar's layout.
+    /// The x-extent this badge occupies in the bar, for click hit-tests;
+    /// mirrors render_tab_bar's layout.
     span: std::ops::Range<u16>,
 }
 
 /// Per-frame chrome geometry for one window, computed into state before
-/// drawing (REQ-TAB-010).
+/// drawing.
 struct Chrome {
     window: WindowId,
     tab_bar: Rect,
     tabs: Vec<TabBadge>,
-    /// Whether the active tab is in scroll mode (REQ-SCROLL-013).
+    /// Whether the active tab is in scroll mode.
     scroll: bool,
 }
 
-/// REQ-UI-022: the session status line's neutral background — xterm-256
+/// The session status line's neutral background — xterm-256
 /// grey 235 (#262626), distinct from the default background without a
 /// hue.
 const CHROME_BG: Color = Color::Indexed(235);
 
-/// REQ-UI-026: the local hostname, fixed for the server's lifetime.
+/// The local hostname, fixed for the server's lifetime.
 static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     rustix::system::uname().nodename().to_string_lossy().into_owned()
 });
 
-/// Per-frame session status line chrome (REQ-UI-012/013/014/026), absent
-/// while the command line owns the bottom row (REQ-UI-016/017).
+/// Per-frame session status line chrome, absent
+/// while the command line owns the bottom row.
 struct StatusChrome {
     row: Rect,
     name: String,
@@ -168,47 +172,64 @@ struct StatusChrome {
     clock: String,
 }
 
-/// Per-frame command line geometry, present while it's open (REQ-EX-002).
+/// Per-frame command line geometry, present while it's open.
 struct ExChrome {
     /// The whole bottom row, including the `:` prompt cell.
     line: Rect,
     /// Where the textarea widget renders (after the prompt).
     input: Rect,
-    /// Commands matching the typed text (REQ-EX-006), on the row above.
+    /// Commands matching the typed text, on the row above.
     suggestions: Vec<&'static str>,
     suggestion_row: Option<Rect>,
 }
 
-/// Everything the draw pass reads; recomputed once per frame (REQ-TAB-010).
+/// Per-frame key-hint popup geometry, present while
+/// the prefix is pending.
+struct HintChrome {
+    rect: Rect,
+    /// Width of the key column, so descriptions align across rows.
+    key_width: u16,
+    /// `(keys, description)` per row, from `KeyTable::hints`.
+    rows: Vec<(String, &'static str)>,
+}
+
+/// Everything the draw pass reads; recomputed once per frame.
 #[derive(Default)]
 struct View {
     separators: Vec<Separator>,
     chrome: Vec<Chrome>,
     status: Option<StatusChrome>,
     ex: Option<ExChrome>,
-    /// The animation clock this frame renders at (REQ-UI-005/006).
+    hints: Option<HintChrome>,
+    /// The animation clock this frame renders at.
     elapsed: Duration,
 }
 
 pub struct Session {
-    /// Stable handle for `-s`/`-t`/`ls` and the switcher (REQ-SESSION-007).
+    /// Stable handle for `-s`/`-t`/`ls` and the switcher.
     pub name: String,
     tree: Node,
     windows: HashMap<WindowId, Window>,
-    /// REQ-WINDOW-014: exactly one focused window at any time.
+    /// Exactly one focused window at any time.
     focus: WindowId,
-    /// True after the prefix key, awaiting the command key (REQ-WINDOW-004).
-    prefix_pending: bool,
-    /// The open ex command line, if any (REQ-EX-001).
+    /// The accumulated keys of a pending chord, walking the keybinding
+    /// tree from its root: `Some` while awaiting the next key,
+    /// empty directly after the prefix.
+    /// No timer expires it, except the resize submap's repeat deadline.
+    chord: Option<Vec<KeyMatch>>,
+    /// The resize submap's repeat deadline: armed while the submap is
+    /// held pending after a resize dispatch, so a bare direction key
+    /// resizes again; elapsing closes the submap.
+    resize_repeat: Option<Instant>,
+    /// The open ex command line, if any.
     ex: Option<TextArea<'static>>,
-    /// The server's prefix and bindings (REQ-SESSION-009, config per
-    /// REQ-CONFIG-005/006).
+    /// The server's prefix and bindings (config may override both).
     keys: Arc<KeyTable>,
-    /// The current drag selection, if any (REQ-SCROLL-014).
+    /// The current drag selection, if any.
     selection: Option<Selection>,
     view: View,
     area: Rect,
-    /// The clock text as of the last computed view (REQ-UI-014/015).
+    /// The clock text as of the last computed view.
     clock: String,
     next_window_id: WindowId,
     force_redraw: bool,
@@ -222,8 +243,8 @@ impl Session {
         keys: Arc<KeyTable>,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
-        // REQ-PANE-001: the initial window's shell, sized to the viewport
-        // minus the session status row (REQ-UI-012).
+        // The initial window's shell, sized to the viewport
+        // minus the session status row.
         let first = Window::new(0, tree_area(area), tx.clone())?;
         let mut windows = HashMap::new();
         windows.insert(first.id, first);
@@ -232,7 +253,8 @@ impl Session {
             tree: Node::Leaf(0),
             windows,
             focus: 0,
-            prefix_pending: false,
+            chord: None,
+            resize_repeat: None,
             ex: None,
             keys,
             selection: None,
@@ -249,10 +271,10 @@ impl Session {
         self.windows.values().any(|w| w.tabs.iter().any(|t| t.id == id))
     }
 
-    /// REQ-PANE-005: advance the owning engine with PTY output, whether or
+    /// Advance the owning engine with PTY output, whether or
     /// not that tab is currently visible, then re-derive the tab's name
-    /// (REQ-UI-003) and re-evaluate agent detection against the new
-    /// content (REQ-AGENT-010).
+    /// and re-evaluate agent detection against the new
+    /// content.
     pub fn pty_output(&mut self, id: TabId, bytes: &[u8]) {
         if let Some(tab) = self.find_tab_mut(id) {
             tab.engine.advance_bytes(bytes);
@@ -262,12 +284,29 @@ impl Session {
         }
     }
 
-    /// Any tab waiting out the idle debounce (REQ-AGENT-011)? The server
+    /// Any tab waiting out the idle debounce? The server
     /// switches to a timed wait while one is.
     pub fn has_pending_idle(&self) -> bool {
         self.windows
             .values()
             .any(|w| w.tabs.iter().any(|t| t.agent_pending_idle()))
+    }
+
+    /// Whether the resize submap is held open by an armed repeat
+    /// deadline. The server wakes on a timer while one is, so the
+    /// deadline can close the submap.
+    pub fn has_pending_resize_repeat(&self) -> bool {
+        self.resize_repeat.is_some()
+    }
+
+    /// Close the resize submap once its repeat deadline elapses with no
+    /// keypress, requiring prefix+r again for the next resize.
+    pub fn tick_resize_repeat(&mut self, now: Instant) {
+        if self.resize_repeat.is_some_and(|deadline| now >= deadline) {
+            self.resize_repeat = None;
+            self.chord = None;
+            self.force_redraw = true;
+        }
     }
 
     /// Commit idle debounces whose window elapsed without further output.
@@ -281,8 +320,8 @@ impl Session {
         }
     }
 
-    /// REQ-SESSION-032: resize everything to the attached client's
-    /// terminal (extends REQ-WINDOW-019); the tabs reconcile on the next
+    /// Resize everything to the attached client's
+    /// terminal; the tabs reconcile on the next
     /// compute pass.
     pub fn set_area(&mut self, area: Rect) {
         self.area = area;
@@ -301,31 +340,64 @@ impl Session {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        // REQ-EX-003: while the command line is open, every key press edits
+        // While the command line is open, every key press edits
         // it instead of reaching the focused window's PTY.
         if self.ex.is_some() {
             self.handle_ex_key(key);
             return None;
         }
-        if self.prefix_pending {
-            self.prefix_pending = false;
-            // REQ-KEY-001 / REQ-SESSION-009: every recognized sequence
+        // An elapsed resize-repeat deadline has already closed the resize
+        // submap; the tick normally does this on time, but a key racing
+        // the timer must not land in a submap that should be gone.
+        self.tick_resize_repeat(Instant::now());
+        if let Some(mut path) = self.chord.take() {
+            // Any key either dispatches (re-arming the deadline below) or
+            // ends the sequence, so the armed deadline never outlives it.
+            self.resize_repeat = None;
+            // Whatever this key does, the hint popup changes or closes.
+            self.force_redraw = true;
+            // Escape discards the pending sequence.
+            if key.code == CtKeyCode::Esc {
+                return None;
+            }
+            // Every recognized sequence
             // dispatches through the single, server-side keybinding table.
-            // An unrecognized command key returns None and both keys are
-            // discarded, never forwarded (REQ-WINDOW-007).
-            if let Some(command) = self.keys.lookup(key) {
-                return self.execute(command);
+            let node = self.keys.node_at(&path).expect("pending chord path resolves to a node");
+            match node.get(KeyMatch::from_event(key)) {
+                // A command at any depth dispatches and
+                // ends the sequence — except a resize, which holds its
+                // submap pending and arms the repeat deadline, so a bare
+                // direction key resizes again without prefix+r.
+                Some(&KeyTrie::Command(command)) => {
+                    if matches!(command, Command::ResizeDir(_)) {
+                        self.chord = Some(path);
+                        self.resize_repeat = Some(Instant::now() + RESIZE_REPEAT);
+                    }
+                    return self.execute(command);
+                }
+                // A deeper node — keep waiting, scoped one
+                // level down.
+                Some(KeyTrie::Node(_)) => {
+                    path.push(KeyMatch::from_event(key));
+                    self.chord = Some(path);
+                }
+                // A dead-end key discards the whole
+                // accumulated sequence, dispatching nothing and writing
+                // nothing to the PTY.
+                None => {}
             }
             return None;
         }
-        // REQ-WINDOW-003/004: the prefix key (Ctrl-b by default, config
-        // may override it per REQ-CONFIG-005) arms the prefix instead of
+        // The prefix key (Ctrl-b by default, config
+        // may override it) arms the prefix instead of
         // reaching the focused window's PTY.
         if self.keys.is_prefix(key) {
-            self.prefix_pending = true;
+            self.chord = Some(Vec::new());
+            // Show the hint popup without waiting on output.
+            self.force_redraw = true;
             return None;
         }
-        // REQ-SCROLL-004: in scroll mode every key is consumed by history
+        // In scroll mode every key is consumed by history
         // navigation; nothing reaches the PTY.
         if let Some(win) = self.windows.get_mut(&self.focus)
             && win.active_tab().scroll_mode()
@@ -333,30 +405,30 @@ impl Session {
             let page = win.content_rect().height.max(1) as isize;
             let tab = win.active_tab_mut();
             match key.code {
-                // REQ-SCROLL-005/006: one line at a time.
+                // One line at a time.
                 CtKeyCode::Char('k') | CtKeyCode::Up => {
                     tab.scroll_by(-1);
                 }
                 CtKeyCode::Char('j') | CtKeyCode::Down => {
                     tab.scroll_by(1);
                 }
-                // REQ-SCROLL-007/008: one page at a time.
+                // One page at a time.
                 CtKeyCode::PageUp => {
                     tab.scroll_by(-page);
                 }
                 CtKeyCode::PageDown => {
                     tab.scroll_by(page);
                 }
-                // REQ-SCROLL-011: back to following live output.
+                // Back to following live output.
                 CtKeyCode::Esc | CtKeyCode::Char('q') => tab.exit_scroll_mode(),
                 _ => {}
             }
             self.force_redraw = true;
             return None;
         }
-        // REQ-WINDOW-015: every other key goes only to the focused window's
+        // Every other key goes only to the focused window's
         // active tab; the engine encodes it per the live terminal modes and
-        // writes it to that tab's PTY (REQ-PANE-011). A write can fail when
+        // writes it to that tab's PTY. A write can fail when
         // the child has already exited; the exit event follows.
         if let Some((code, mods)) = map_key(key)
             && let Some(win) = self.windows.get_mut(&self.focus)
@@ -367,7 +439,7 @@ impl Session {
     }
 
     /// Write text to the focused window's active tab's PTY, honoring
-    /// bracketed paste (REQ-SCROLL-023, and client bracketed pastes).
+    /// bracketed paste, including client-initiated pastes.
     pub fn paste_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -382,12 +454,12 @@ impl Session {
         match mouse.kind {
             CtMouseKind::Down(button) => {
                 let id = self.window_at(pos)?;
-                // REQ-SCROLL-002: click-to-focus.
+                // Click-to-focus.
                 if self.focus != id {
                     self.focus = id;
                     self.force_redraw = true;
                 }
-                // REQ-SCROLL-024: a left click on a tab's indicator makes
+                // A left click on a tab's indicator makes
                 // that tab active. The bar is lux chrome, so the click
                 // never reaches a mouse-grabbed program.
                 if button == CtMouseButton::Left
@@ -399,20 +471,20 @@ impl Session {
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
-                // REQ-SCROLL-020: the program owns the mouse.
+                // The program owns the mouse.
                 if tab.engine.is_mouse_grabbed() {
                     forward_mouse(tab, &mouse, content);
                     return None;
                 }
                 match button {
-                    // REQ-SCROLL-014: anchor a selection.
+                    // Anchor a selection.
                     CtMouseButton::Left if content.contains(pos) => {
                         let cell = clamp_to_content(pos, content);
                         self.selection = Some(Selection { window: id, start: cell, end: cell });
                         self.force_redraw = true;
                     }
-                    // REQ-SCROLL-015: with a selection, right-click yanks;
-                    // REQ-SCROLL-023: without one, it pastes.
+                    // With a selection, right-click yanks;
+                    // Without one, it pastes.
                     CtMouseButton::Right => {
                         return if self.selection.is_some() {
                             self.yank_selection()
@@ -423,7 +495,7 @@ impl Session {
                     _ => {}
                 }
             }
-            // REQ-SCROLL-014/019: extend the selection, clamped to the
+            // Extend the selection, clamped to the
             // window where the drag began.
             CtMouseKind::Drag(CtMouseButton::Left) if self.selection.is_some() => {
                 let sel = self.selection.as_mut().expect("checked above");
@@ -439,7 +511,7 @@ impl Session {
                     self.selection = None;
                     self.force_redraw = true;
                 }
-                // REQ-SCROLL-020: releases and motion still reach a
+                // Releases and motion still reach a
                 // grabbed program.
                 let id = self.window_at(pos)?;
                 let win = self.windows.get_mut(&id).expect("window exists");
@@ -454,20 +526,20 @@ impl Session {
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
-                // REQ-SCROLL-020/021: a grabbed program gets the wheel
+                // A grabbed program gets the wheel
                 // encoded; on the alternate screen the engine converts
                 // wheel ticks to arrow keys itself (alternateScroll).
                 if tab.engine.is_mouse_grabbed() || tab.engine.is_alt_screen_active() {
                     forward_mouse(tab, &mouse, content);
                     return None;
                 }
-                // REQ-SCROLL-009: focus, enter scroll mode, scroll 3 lines.
+                // Focus, enter scroll mode, scroll 3 lines.
                 self.focus = id;
                 tab.enter_scroll_mode();
                 let delta = if mouse.kind == CtMouseKind::ScrollUp { -3 } else { 3 };
                 // Wheeling down to the live bottom resumes following
                 // (entering scroll mode just to sit at the tail would trap
-                // accidental wheel-downs behind REQ-SCROLL-010).
+                // accidental wheel-downs).
                 if tab.scroll_by(delta) {
                     tab.exit_scroll_mode();
                 }
@@ -482,9 +554,9 @@ impl Session {
         self.windows.values().find(|w| w.rect.contains(pos)).map(|w| w.id)
     }
 
-    /// REQ-SCROLL-015: yank the selected text and clear the selection;
+    /// Yank the selected text and clear the selection;
     /// yanking never writes to a PTY. The server puts the text on the
-    /// system clipboard (REQ-SCROLL-016).
+    /// system clipboard.
     fn yank_selection(&mut self) -> Option<Effect> {
         let text = self.selection_text();
         self.selection = None;
@@ -522,27 +594,34 @@ impl Session {
     }
 
     /// Apply one dispatched command. Tab commands act only on the focused
-    /// window (REQ-TAB-009).
+    /// window.
     fn execute(&mut self, command: Command) -> Option<Effect> {
         match command {
             Command::SplitSideBySide => self.split(SplitKind::SideBySide),
             Command::SplitStacked => self.split(SplitKind::Stacked),
             Command::NewTab => self.new_tab(),
             Command::NextTab => self.cycle_tab(1),
-            // REQ-TAB-018: previous tab, wrapping.
+            // Previous tab, wrapping.
             Command::PrevTab => self.cycle_tab(-1),
-            // REQ-TAB-019: direct selection by displayed index.
+            // Direct selection by displayed index.
             Command::SelectTab(index) => self.select_tab(index),
             Command::OnlyWindow => self.only_window(),
             Command::FocusDir(dir) => self.focus_dir(dir),
             Command::ResizeDir(dir) => self.resize_focused(dir),
-            // REQ-SESSION-012: real detach, dispatched server-side
-            // (REQ-SESSION-009).
+            // Reset every split to an even ratio.
+            Command::Rebalance => {
+                layout::rebalance(&mut self.tree);
+                self.force_redraw = true;
+            }
+            // Prefix+m then a direction moves the active
+            // tab into the adjacent window.
+            Command::MoveTabDir(dir) => self.move_tab_dir(dir),
+            // Real detach, dispatched server-side.
             Command::Detach => return Some(Effect::Detach),
-            // REQ-SESSION-015: switcher mode is the server's to run.
+            // Switcher mode is the server's to run.
             Command::Switcher => return Some(Effect::OpenSwitcher),
             Command::OpenEx => self.open_ex(),
-            // REQ-SCROLL-003: prefix+[ enters scroll mode.
+            // Prefix+[ enters scroll mode.
             Command::ScrollMode => {
                 if let Some(win) = self.windows.get_mut(&self.focus) {
                     win.active_tab_mut().enter_scroll_mode();
@@ -553,7 +632,7 @@ impl Session {
         None
     }
 
-    /// REQ-EX-001: open the command line for text input.
+    /// Open the command line for text input.
     fn open_ex(&mut self) {
         let mut textarea = TextArea::default();
         // The default cursor-line underline reads as stray chrome in a
@@ -566,11 +645,11 @@ impl Session {
     fn handle_ex_key(&mut self, key: KeyEvent) {
         self.force_redraw = true;
         match key.code {
-            // REQ-EX-007: close without executing anything.
+            // Close without executing anything.
             CtKeyCode::Esc => {
                 self.ex = None;
             }
-            // REQ-EX-008/009/010/011: execute (or discard) and close.
+            // Execute (or discard) and close.
             CtKeyCode::Enter => {
                 let textarea = self.ex.take().expect("ex mode is open");
                 let text = textarea.lines().first().cloned().unwrap_or_default();
@@ -578,12 +657,12 @@ impl Session {
                     Some(ExCommand::SplitSideBySide) => self.split(SplitKind::SideBySide),
                     Some(ExCommand::SplitStacked) => self.split(SplitKind::Stacked),
                     Some(ExCommand::Write(path)) => self.write_visible(&path),
-                    // REQ-EX-011: unrecognized text closes with no action.
+                    // Unrecognized text closes with no action.
                     None => {}
                 }
             }
-            // REQ-EX-004/005 and the rest of line editing via tui-textarea
-            // (REQ-EX-018): character insertion, Backspace, cursor motion.
+            // The rest of line editing goes via tui-textarea: character
+            // insertion, Backspace, cursor motion.
             _ => {
                 let textarea = self.ex.as_mut().expect("ex mode is open");
                 textarea.input(tui_textarea::Input::from(key));
@@ -591,9 +670,9 @@ impl Session {
         }
     }
 
-    /// REQ-EX-010: write the focused window's active tab's visible terminal
+    /// Write the focused window's active tab's visible terminal
     /// content to `path`. There is no error surface yet, so a failed write
-    /// is dropped (per REQ-EX-011's justification).
+    /// is dropped.
     fn write_visible(&self, path: &std::path::Path) {
         let tab = self.windows[&self.focus].active_tab();
         let screen = tab.engine.screen();
@@ -613,14 +692,14 @@ impl Session {
     fn split(&mut self, kind: SplitKind) {
         let rect = self.windows[&self.focus].rect;
         let (first, second, _) = layout::split_areas(kind, 0.5, rect);
-        // REQ-WINDOW-008: never create a window under 10 cols or 3 rows.
+        // Never create a window under 10 cols or 3 rows.
         for half in [first, second] {
             if half.width < MIN_COLS || half.height < MIN_ROWS {
                 return;
             }
         }
         let id = self.next_window_id;
-        // REQ-WINDOW-009/010, REQ-TAB-003: the new window gets one active
+        // The new window gets one active
         // tab with its own shell and engine sized to its content rectangle.
         // If the shell can't spawn, keep the current layout rather than
         // tearing the session down.
@@ -634,14 +713,14 @@ impl Session {
         self.force_redraw = true;
     }
 
-    /// REQ-TAB-006: append a new tab to the focused window's list and make
+    /// Append a new tab to the focused window's list and make
     /// it active.
     fn new_tab(&mut self) {
         let win = self.windows.get_mut(&self.focus).expect("focused window exists");
-        // REQ-TAB-021: the new shell starts in the working directory of
+        // The new shell starts in the working directory of
         // the tab that was active until now.
         let cwd = win.active_tab().working_dir();
-        // REQ-TAB-004/005: the tab gets its own shell and engine sized to
+        // The tab gets its own shell and engine sized to
         // the window's content rectangle.
         let Ok(tab) = Tab::spawn(win.content_rect(), cwd, self.tx.clone()) else {
             return;
@@ -649,23 +728,23 @@ impl Session {
         win.tabs.push(tab);
         win.active = win.tabs.len() - 1;
         self.drop_selection_in(self.focus);
-        // REQ-TAB-008: show the switch without waiting on PTY output.
+        // Show the switch without waiting on PTY output.
         self.force_redraw = true;
     }
 
-    /// REQ-TAB-007/018: cycle the focused window's active tab, wrapping in
+    /// Cycle the focused window's active tab, wrapping in
     /// either direction.
     fn cycle_tab(&mut self, step: isize) {
         let win = self.windows.get_mut(&self.focus).expect("focused window exists");
         let len = win.tabs.len() as isize;
         win.active = (win.active as isize + step).rem_euclid(len) as usize;
         self.drop_selection_in(self.focus);
-        // REQ-TAB-008: show the switch without waiting on PTY output.
+        // Show the switch without waiting on PTY output.
         self.force_redraw = true;
     }
 
-    /// REQ-TAB-019: make the focused window's tab at `index` active; an
-    /// out-of-range index is discarded silently (REQ-TAB-020).
+    /// Make the focused window's tab at `index` active; an
+    /// out-of-range index is discarded silently.
     fn select_tab(&mut self, index: usize) {
         let win = self.windows.get_mut(&self.focus).expect("focused window exists");
         if index >= win.tabs.len() || index == win.active {
@@ -673,12 +752,12 @@ impl Session {
         }
         win.active = index;
         self.drop_selection_in(self.focus);
-        // REQ-TAB-008: show the switch without waiting on PTY output.
+        // Show the switch without waiting on PTY output.
         self.force_redraw = true;
     }
 
     /// The index of the tab badge at `pos` in window `id`'s tab bar, from
-    /// the last computed view's geometry (REQ-SCROLL-024).
+    /// the last computed view's geometry.
     fn tab_badge_at(&self, id: WindowId, pos: Position) -> Option<usize> {
         let chrome = self.view.chrome.iter().find(|c| c.window == id)?;
         let bar = chrome.tab_bar;
@@ -696,8 +775,8 @@ impl Session {
         }
     }
 
-    /// REQ-KEY-004: move focus to the window spatially adjacent in `dir`;
-    /// at a screen edge focus stays put (REQ-KEY-005).
+    /// Move focus to the window spatially adjacent in `dir`;
+    /// at a screen edge focus stays put.
     fn focus_dir(&mut self, dir: Dir) {
         let rects: Vec<(WindowId, Rect)> =
             self.windows.values().map(|w| (w.id, w.rect)).collect();
@@ -708,9 +787,51 @@ impl Session {
         }
     }
 
-    /// REQ-WINDOW-016: vim's "only" — terminate every other window's
+    /// Move the focused window's active tab into the
+    /// window spatially adjacent in `dir`, appended as that window's active
+    /// tab. Focus follows the
+    /// moved tab, keeping exactly one focused window
+    /// whether or not the source window survives.
+    fn move_tab_dir(&mut self, dir: Dir) {
+        let rects: Vec<(WindowId, Rect)> =
+            self.windows.values().map(|w| (w.id, w.rect)).collect();
+        let from = self.windows[&self.focus].rect;
+        // No adjacent window — discard, move nothing.
+        let Some(dest) = layout::spatial_neighbor(&rects, from, dir) else {
+            return;
+        };
+        let source = self.focus;
+        let win = self.windows.get_mut(&source).expect("focused window exists");
+        let tab = win.tabs.remove(win.active);
+        if win.active == win.tabs.len() && win.active > 0 {
+            win.active -= 1;
+        }
+        let emptied = win.tabs.is_empty();
+        // Both windows' visible content changes.
+        self.drop_selection_in(source);
+        self.drop_selection_in(dest);
+        let dest_win = self.windows.get_mut(&dest).expect("adjacent window exists");
+        dest_win.tabs.push(tab);
+        dest_win.active = dest_win.tabs.len() - 1;
+        // The tab renders into a new rectangle now.
+        let content = dest_win.content_rect();
+        dest_win.active_tab_mut().resize(content);
+        self.focus = dest;
+        if emptied {
+            // A window left with no tabs collapses — the
+            // sibling subtree inherits its space.
+            self.windows.remove(&source);
+            let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
+            if let Some(tree) = layout::remove_leaf(tree, source) {
+                self.tree = tree;
+            }
+        }
+        self.force_redraw = true;
+    }
+
+    /// Vim's "only" — terminate every other window's
     /// child processes; the resulting exit events collapse the tree
-    /// through the ordinary removal path (REQ-WINDOW-020).
+    /// through the ordinary removal path.
     fn only_window(&mut self) {
         let focus = self.focus;
         for (_, win) in self.windows.iter_mut().filter(|(id, _)| **id != focus) {
@@ -720,7 +841,7 @@ impl Session {
         }
     }
 
-    /// REQ-WINDOW-017: move the boundary between the focused window and
+    /// Move the boundary between the focused window and
     /// its adjacent sibling one cell in `dir`.
     fn resize_focused(&mut self, dir: Dir) {
         if layout::resize_toward(&mut self.tree, tree_area(self.area), self.focus, dir) {
@@ -729,7 +850,7 @@ impl Session {
     }
 
     /// A tab's PTY hit EOF. Returns `Effect::Ended` when this was the
-    /// session's last window's last tab (REQ-SESSION-023).
+    /// session's last window's last tab.
     pub fn pty_exited(&mut self, id: TabId) -> Option<Effect> {
         let win_id = self
             .windows
@@ -738,7 +859,7 @@ impl Session {
             .id;
         let win = self.windows.get_mut(&win_id).expect("window exists");
         if win.tabs.len() > 1 {
-            // REQ-TAB-015: prune the tab and keep the window on a live one.
+            // Prune the tab and keep the window on a live one.
             let idx = win.tabs.iter().position(|t| t.id == id).expect("tab exists");
             let active_exited = idx == win.active;
             let mut tab = win.tabs.remove(idx);
@@ -752,22 +873,21 @@ impl Session {
             self.force_redraw = true;
             return None;
         }
-        // REQ-TAB-016: a window's last tab exiting collapses the window
-        // per REQ-WINDOW-020.
+        // A window's last tab exiting collapses the window.
         let mut win = self.windows.remove(&win_id).expect("window exists");
         win.tabs.pop().expect("last tab exists").wait();
         if self.windows.is_empty() {
-            // REQ-SESSION-023: the session's last process is gone.
+            // The session's last process is gone.
             return Some(Effect::Ended);
         }
         self.drop_selection_in(win_id);
-        // REQ-WINDOW-021: refocus before the leaf disappears from the tree.
+        // Refocus before the leaf disappears from the tree.
         if self.focus == win_id {
             let ids = layout::leaves(&self.tree);
             let pos = ids.iter().position(|i| *i == win_id).unwrap_or(0);
             self.focus = ids[(pos + 1) % ids.len()];
         }
-        // REQ-WINDOW-020: the sibling subtree inherits the space.
+        // The sibling subtree inherits the space.
         let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
         if let Some(tree) = layout::remove_leaf(tree, win_id) {
             self.tree = tree;
@@ -778,7 +898,7 @@ impl Session {
 
     pub fn needs_redraw(&self) -> bool {
         self.force_redraw
-            // REQ-UI-015: the status line's clock rolled over a minute.
+            // The status line's clock rolled over a minute.
             || self.clock != clock_now()
             || self.has_animation()
             || self.windows.values().any(|w| {
@@ -787,7 +907,7 @@ impl Session {
             })
     }
 
-    /// Any badge in a tab bar currently animated (REQ-UI-005/006)? While
+    /// Any badge in a tab bar currently animated? While
     /// one is on screen, the server redraws on its timer tick so the
     /// animation advances without waiting on PTY output.
     pub fn has_animation(&self) -> bool {
@@ -799,8 +919,7 @@ impl Session {
     }
 
     /// One frame to an attached client's terminal: compute geometry into
-    /// state, then draw purely from that state (REQ-TAB-010, per the herdr
-    /// compute/draw split).
+    /// state, then draw purely from that state (a compute/draw split).
     pub fn draw_frame(&mut self, tui: &mut Terminal<FdBackend>) -> anyhow::Result<()> {
         self.compute_view();
         tui.draw(|frame| self.render(frame))?;
@@ -813,7 +932,7 @@ impl Session {
     }
 
     /// Render this session cropped into `area` of `buf` for the session
-    /// switcher's live preview (REQ-SESSION-016). Doesn't disturb the
+    /// switcher's live preview. Doesn't disturb the
     /// seqno bookkeeping an attached client's redraws rely on.
     pub fn render_preview(&mut self, buf: &mut Buffer, area: Rect) {
         self.compute_view();
@@ -836,8 +955,7 @@ impl Session {
     }
 
     /// Compute this frame's window and tab bar geometry into `self.view`,
-    /// reconciling every window's tabs with their rectangles
-    /// (REQ-WINDOW-018/019, REQ-TAB-010/011).
+    /// reconciling every window's tabs with their rectangles.
     fn compute_view(&mut self) {
         let (rects, separators) = layout::compute(&self.tree, tree_area(self.area));
         let mut chrome = Vec::with_capacity(rects.len());
@@ -845,7 +963,7 @@ impl Session {
             let Some(win) = self.windows.get_mut(&id) else { continue };
             win.rect = rect;
             win.reconcile();
-            // REQ-AGENT-021: the focused window's displayed tab counts as
+            // The focused window's displayed tab counts as
             // seen the moment it's rendered.
             if id == self.focus
                 && let Some(tracker) = &mut win.active_tab_mut().agent
@@ -855,7 +973,7 @@ impl Session {
             let active = win.active;
             let bar = win.tab_bar_rect();
             // Badge spans track render_tab_bar's layout: the two-cell
-            // rule lead-in (REQ-UI-030), then per badge " i:name", the
+            // rule lead-in, then per badge " i:name", the
             // agent text when present, and the trailing separator space.
             let mut next_x = bar.x.saturating_add(2).min(bar.right());
             let tabs = win
@@ -888,8 +1006,8 @@ impl Session {
         }
         self.clock = clock_now();
         let ex = self.compute_ex_chrome();
-        // REQ-UI-012/013/014: the reserved bottom row, unless the command
-        // line owns it this frame (REQ-UI-016/017).
+        // The reserved bottom row, unless the command
+        // line owns it this frame.
         let status = (ex.is_none() && self.area.height > 0 && self.area.width > 0)
             .then(|| StatusChrome {
                 row: Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1),
@@ -902,12 +1020,39 @@ impl Session {
             chrome,
             status,
             ex,
+            hints: self.compute_hint_chrome(),
             elapsed: anim::elapsed(),
         };
     }
 
-    /// Geometry for the open command line: the bottom row (REQ-EX-002) and
-    /// the suggestion row above it (REQ-EX-006).
+    /// Geometry for the key-hint popup while a chord is pending:
+    /// rows from the pending chord's current node, at any
+    /// depth, sized to those rows, in the bottom-right
+    /// corner one row above the reserved status row,
+    /// clipped to the viewport.
+    fn compute_hint_chrome(&self) -> Option<HintChrome> {
+        let path = self.chord.as_ref()?;
+        let rows = self.keys.node_at(path)?.hints();
+        let width = |s: &str| s.chars().count() as u16;
+        let key_width = rows.iter().map(|(keys, _)| width(keys)).max()?;
+        let body = rows
+            .iter()
+            .map(|(_, desc)| key_width + 2 + width(desc))
+            .max()?;
+        // One cell of border plus one of margin on each side.
+        let w = body + 4;
+        let h = rows.len() as u16 + 2;
+        let rect = self.area.intersection(Rect::new(
+            self.area.right().saturating_sub(w),
+            self.area.bottom().saturating_sub(h + 1),
+            w,
+            h,
+        ));
+        Some(HintChrome { rect, key_width, rows })
+    }
+
+    /// Geometry for the open command line: the bottom row and
+    /// the suggestion row above it.
     fn compute_ex_chrome(&self) -> Option<ExChrome> {
         let textarea = self.ex.as_ref()?;
         if self.area.height == 0 || self.area.width < 2 {
@@ -932,30 +1077,29 @@ impl Session {
     }
 
     /// Draw purely from `self.view` and engine state into a buffer; no
-    /// geometry math or state mutation here (REQ-TAB-010).
+    /// geometry math or state mutation here.
     fn render_to_buffer(&self, buf: &mut Buffer) {
-        // REQ-WINDOW-011: each window confined to its own rectangle;
-        // the active tab's content below the tab bar (REQ-TAB-002/012).
+        // Each window confined to its own rectangle;
+        // the active tab's content below the tab bar.
         for win in self.windows.values() {
             render_tab(win.active_tab(), buf);
         }
         for chrome in &self.view.chrome {
             render_tab_bar(chrome, self.focus, buf, self.view.elapsed);
         }
-        // REQ-SCROLL-017: highlight the selected text.
+        // Highlight the selected text.
         if let Some(sel) = &self.selection
             && let Some(win) = self.windows.get(&sel.window)
         {
             render_selection(sel, win.content_rect(), buf);
         }
-        // REQ-WINDOW-012: separators between side-by-side windows,
-        // uniformly dim (REQ-UI-025).
+        // Separators between side-by-side windows,
+        // uniformly dim.
         for sep in &self.view.separators {
             render_separator(sep, buf);
         }
-        // REQ-UI-013/014: the session status line on the reserved bottom
-        // row; absent while the command line renders there instead
-        // (REQ-UI-016/017).
+        // The session status line on the reserved bottom
+        // row; absent while the command line renders there instead.
         if let Some(status) = &self.view.status {
             render_status(status, buf);
         }
@@ -964,6 +1108,10 @@ impl Session {
             if let Some(textarea) = &self.ex {
                 textarea.render(chrome.input, buf);
             }
+        }
+        // The key-hint popup draws over everything else.
+        if let Some(hints) = &self.view.hints {
+            render_hints(hints, buf);
         }
     }
 
@@ -974,7 +1122,7 @@ impl Session {
         if self.ex.is_some() {
             return;
         }
-        // REQ-PANE-009/010: the host cursor tracks the focused window's
+        // The host cursor tracks the focused window's
         // active tab's engine cursor only while it reports it visible. The
         // engine cursor belongs to the live view, so a scrolled tab shows
         // no cursor.
@@ -999,7 +1147,7 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
         return;
     }
     let screen = tab.engine.screen();
-    // The scroll-mode anchor or the live tail (REQ-SCROLL-010/012).
+    // The scroll-mode anchor or the live tail.
     let visible = tab.view_range();
     // Not `with_phys_lines`: at the pinned rev it mis-indexes the second
     // half of a wrapped line deque and panics (its `_mut` twin subtracts
@@ -1016,19 +1164,18 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
             let pos = Position::new(rect.x + x as u16, rect.y + y as u16);
             if let Some(dst) = buf.cell_mut(pos) {
                 dst.set_symbol(cell.str());
-                // REQ-PANE-007/008: colors and text attributes.
+                // Colors and text attributes.
                 dst.set_style(cell_style(cell.attrs()));
             }
         }
     }
 }
 
-/// Draw one window's tab bar: a two-cell rule lead-in (REQ-UI-030), an
-/// indicator per tab (REQ-TAB-013, the active one visually distinct per
-/// REQ-TAB-014), and the remainder ruled. The rule is uniformly thin,
-/// its brightness marking window focus (REQ-UI-028/029, REQ-WINDOW-013);
-/// the bar doubles as the boundary with a stacked window above
-/// (REQ-UI-027).
+/// Draw one window's tab bar: a two-cell rule lead-in, an
+/// indicator per tab (the active one visually distinct), and the
+/// remainder ruled. The rule is uniformly thin,
+/// its brightness marking window focus;
+/// the bar doubles as the boundary with a stacked window above.
 fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: Duration) {
     let bar = chrome.tab_bar;
     if bar.height == 0 || bar.width == 0 {
@@ -1047,33 +1194,38 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         *x += 1;
         true
     };
-    // REQ-UI-028/029: one thin rule weight; brightness signals focus.
-    let rule = Style::default().fg(if focused { Color::White } else { Color::DarkGray });
-    // REQ-UI-030: two cells of rule anchor the bar's left edge.
+    // One thin rule weight; brightness signals focus.
+    // Focused inherits the terminal's default foreground rather than
+    // hardcoding white.
+    let rule = Style::default().fg(if focused { Color::Reset } else { Color::DarkGray });
+    // Two cells of rule anchor the bar's left edge.
     for _ in 0..2 {
         if !put(&mut x, '─', rule) {
             return;
         }
     }
     for (i, badge) in chrome.tabs.iter().enumerate() {
-        // REQ-UI-008/009: active is bright, inactive dimmed, no
+        // Active is bright, inactive dimmed, no
         // background fill — neutral shades only, matching the
-        // brightness-only chrome convention (REQ-UI-025).
+        // brightness-only chrome convention.
         let style = if badge.active {
-            let color = if focused { Color::White } else { Color::Gray };
+            // Focused+active inherits the terminal's default foreground
+            // instead of hardcoding white, so it respects the user's
+            // terminal theme.
+            let color = if focused { Color::Reset } else { Color::Gray };
             Style::default().fg(color)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        // REQ-UI-001/004: `<index>:<name>`, indexed from 0.
+        // `<index>:<name>`, indexed from 0.
         for ch in format!(" {}:{}", i, badge.name).chars() {
             if !put(&mut x, ch, style) {
                 return;
             }
         }
-        // REQ-AGENT-014/015/016: the bracketed status text, in its
+        // The bracketed status text, in its
         // state's color, only for tabs identified as running Claude Code;
-        // working shimmers and blocked breathes (REQ-UI-005/006/007).
+        // working shimmers and blocked breathes.
         if let Some(visual) = &badge.agent {
             if !put(&mut x, ' ', style) {
                 return;
@@ -1094,7 +1246,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
             return;
         }
     }
-    // REQ-UI-028/029: the unused width, same thin rule.
+    // The unused width, same thin rule.
     let indicators_end = x;
     while x < bar.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, bar.y)) {
@@ -1103,7 +1255,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         }
         x += 1;
     }
-    // REQ-SCROLL-013: mark a scrolled tab so a frozen view isn't mistaken
+    // Mark a scrolled tab so a frozen view isn't mistaken
     // for the live tail. Drawn over the rule, right-aligned.
     if chrome.scroll {
         let label = " scroll ";
@@ -1122,7 +1274,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
 }
 
 /// The layout tree's area: the viewport minus the bottom row reserved
-/// for the session status line (REQ-UI-012).
+/// for the session status line.
 fn tree_area(area: Rect) -> Rect {
     Rect {
         height: area.height.saturating_sub(1),
@@ -1130,14 +1282,13 @@ fn tree_area(area: Rect) -> Rect {
     }
 }
 
-/// The status line's clock text (REQ-UI-014), `%H:%M` matching tmux's
-/// default status-right.
+/// The status line's clock text, formatted `%H:%M`.
 fn clock_now() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
-/// Draw the session status line: name left (REQ-UI-013), clock right
-/// (REQ-UI-014), on the neutral chrome background (REQ-UI-022).
+/// Draw the session status line: name left, clock right,
+/// on the neutral chrome background.
 fn render_status(status: &StatusChrome, buf: &mut Buffer) {
     let row = status.row;
     if row.height == 0 || row.width == 0 {
@@ -1161,7 +1312,7 @@ fn render_status(status: &StatusChrome, buf: &mut Buffer) {
             dst.set_style(name_style);
         }
     }
-    // REQ-UI-026: hostname two spaces left of the clock (REQ-UI-014).
+    // Hostname two spaces left of the clock.
     let clock_style = fill.fg(Color::Gray);
     let text = format!("{}  {} ", status.host, status.clock);
     let len = text.chars().count() as u16;
@@ -1176,7 +1327,56 @@ fn render_status(status: &StatusChrome, buf: &mut Buffer) {
     }
 }
 
-/// Invert the selected cells (REQ-SCROLL-017); toggling rather than
+/// Draw the key-hint popup: a bordered box on the neutral
+/// chrome background, one row per table entry — keys bright, description
+/// dimmed — matching the brightness-only chrome convention.
+fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
+    let rect = chrome.rect;
+    if rect.width < 2 || rect.height < 2 {
+        return;
+    }
+    let fill = Style::default().bg(CHROME_BG);
+    let border = fill.fg(Color::DarkGray);
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            let Some(dst) = buf.cell_mut(Position::new(x, y)) else { continue };
+            let on_top = y == rect.top();
+            let on_bottom = y == rect.bottom() - 1;
+            let on_left = x == rect.left();
+            let on_right = x == rect.right() - 1;
+            let ch = match (on_top, on_bottom, on_left, on_right) {
+                (true, _, true, _) => '┌',
+                (true, _, _, true) => '┐',
+                (_, true, true, _) => '└',
+                (_, true, _, true) => '┘',
+                (true, ..) | (_, true, ..) => '─',
+                (_, _, true, _) | (_, _, _, true) => '│',
+                _ => ' ',
+            };
+            dst.set_char(ch);
+            dst.set_style(if ch == ' ' { fill } else { border });
+        }
+    }
+    let keys_style = fill.fg(Color::Reset);
+    let desc_style = fill.fg(Color::Gray);
+    for (i, (keys, desc)) in chrome.rows.iter().enumerate() {
+        let y = rect.y + 1 + i as u16;
+        if y >= rect.bottom() - 1 {
+            break;
+        }
+        // Border plus one margin cell, keys padded to the shared column.
+        let text = format!("{:width$}  {desc}", keys, width = chrome.key_width as usize);
+        let styled = keys.chars().count() as u16 + 2;
+        for (x, (j, ch)) in (rect.x + 2..rect.right() - 2).zip(text.chars().enumerate()) {
+            if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
+                dst.set_char(ch);
+                dst.set_style(if (j as u16) < styled { keys_style } else { desc_style });
+            }
+        }
+    }
+}
+
+/// Invert the selected cells; toggling rather than
 /// setting REVERSED keeps the highlight visible over already-reversed
 /// content.
 fn render_selection(sel: &Selection, content: Rect, buf: &mut Buffer) {
@@ -1201,8 +1401,8 @@ fn render_selection(sel: &Selection, content: Rect, buf: &mut Buffer) {
     }
 }
 
-/// Draw the command line row — cleared, with the `:` prompt (REQ-EX-002) —
-/// and the suggestion row above it (REQ-EX-006). The textarea widget itself
+/// Draw the command line row — cleared, with the `:` prompt —
+/// and the suggestion row above it. The textarea widget itself
 /// renders separately, over the cleared input area.
 fn render_ex_chrome(chrome: &ExChrome, buf: &mut Buffer) {
     for x in chrome.line.left()..chrome.line.right() {
@@ -1232,9 +1432,9 @@ fn render_ex_chrome(chrome: &ExChrome, buf: &mut Buffer) {
     }
 }
 
-/// REQ-WINDOW-012: the vertical separator between side-by-side windows —
-/// the only separator kind left (REQ-UI-027). Always dimmed (REQ-UI-025);
-/// the tab bar's rule brightness alone marks focus (REQ-UI-028/029).
+/// The vertical separator between side-by-side windows —
+/// the only separator kind left. Always dimmed;
+/// the tab bar's rule brightness alone marks focus.
 fn render_separator(sep: &Separator, buf: &mut Buffer) {
     let style = Style::default().fg(Color::DarkGray);
     for y in sep.rect.top()..sep.rect.bottom() {

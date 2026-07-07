@@ -5,31 +5,31 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-# System clipboard read/write (REQ-SCROLL-016/023); image-data support
+# System clipboard read/write; image-data support
 # isn't needed, text only.
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
-# For OSC 52 clipboard payloads (REQ-SCROLL-016).
+# For OSC 52 clipboard payloads.
 base64 = "0.22"
-# Local wall-clock for the session status line (REQ-UI-014).
+# Local wall-clock for the session status line.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ratatui = "0.29"
-# Detection rule matchers (REQ-AGENT-008).
+# Detection rule matchers.
 regex = "1"
 # Unix plumbing for the server/client split: winsize ioctl on passed fds
-# (REQ-SESSION-032), setsid for daemonize (REQ-SESSION-004), poll for
+#, setsid for daemonize, poll for
 # interruptible client-input reads, uname for the status-line hostname
-# (REQ-UI-026).
+#.
 rustix = { version = "0.38", features = ["termios", "process", "event", "system"] }
-# SCM_RIGHTS fd passing over the attach socket (REQ-SESSION-029).
+# SCM_RIGHTS fd passing over the attach socket.
 sendfd = "0.4"
-# SIGWINCH relay in the client (REQ-SESSION-031).
+# SIGWINCH relay in the client.
 signal-hook = "0.3"
 # Command line editing per REQ-EX-018; 0.7 tracks ratatui 0.29.
 tui-textarea = "0.7"
 # preserve_order: REQ-CONFIG-008 resolves duplicate key sequences to the
 # last entry defined in the file, which requires file-order iteration.
 toml = { version = "0.8", features = ["preserve_order"] }
-# wezterm crates pinned to a single commit (REQ-SPIKE-001); termwiz must be
+# wezterm crates pinned to a single commit; termwiz must be
 # the same rev because its types appear in wezterm-term's public API.
 portable-pty = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }
 termwiz = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }

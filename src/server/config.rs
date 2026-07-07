@@ -1,6 +1,5 @@
 //! Config file loading (Phase 6): a TOML file overriding the prefix key
-//! and keybinding table. No other settings, and no live reloading
-//! (REQ-CONFIG-009).
+//! and keybinding table. No other settings, and no live reloading.
 //!
 //! ```toml
 //! # ~/.config/lux/config.toml
@@ -8,7 +7,7 @@
 //!
 //! [keys]
 //! split-side-by-side = "v"   # command names per keys::command_by_name
-//! resize-left = "C-y"        # "C-" prefix means Ctrl is held
+//! scroll-mode = "C-y"        # "C-" prefix means Ctrl is held
 //! ```
 //!
 //! Key specs are a single character, optionally prefixed with `C-`.
@@ -17,9 +16,9 @@ use std::path::PathBuf;
 
 use ratatui::crossterm::event::KeyCode as CtKeyCode;
 
-use crate::server::keys::{Command, KeyMatch, KeyTable, command_by_name};
+use crate::server::keys::{KeyMatch, KeyTable, KeyTrie, KeyTrieNode, command_by_name};
 
-/// REQ-CONFIG-001: `$XDG_CONFIG_HOME/lux/config.toml`, falling back to
+/// `$XDG_CONFIG_HOME/lux/config.toml`, falling back to
 /// `~/.config/lux/config.toml`.
 fn config_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
@@ -29,14 +28,14 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("lux").join("config.toml"))
 }
 
-/// Load the key table at startup (REQ-CONFIG-002). Every failure path
-/// falls back to the hardcoded defaults (REQ-CONFIG-003/004).
+/// Load the key table at startup. Every failure path
+/// falls back to the hardcoded defaults.
 pub fn load() -> KeyTable {
     let Some(path) = config_path() else {
         return KeyTable::default();
     };
     match std::fs::read_to_string(&path) {
-        // REQ-CONFIG-003: no config file is not an error.
+        // No config file is not an error.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => KeyTable::default(),
         Err(err) => {
             eprintln!("lux: {}: {err}", path.display());
@@ -46,11 +45,12 @@ pub fn load() -> KeyTable {
     }
 }
 
-/// One table entry during resolution; `config_idx` is the entry's position
-/// in the config file, `None` for hardcoded defaults.
+/// One root-level table entry during resolution — a command or a chord
+/// node; only commands are configurable. `config_idx` is
+/// the entry's position in the config file, `None` for hardcoded defaults.
 struct Entry {
     key: KeyMatch,
-    command: Command,
+    trie: KeyTrie,
     config_idx: Option<usize>,
 }
 
@@ -58,7 +58,7 @@ fn from_toml(text: &str, origin: &str) -> KeyTable {
     let doc: toml::Table = match toml::from_str(text) {
         Ok(doc) => doc,
         Err(err) => {
-            // REQ-CONFIG-004: report the parse error, run on defaults.
+            // Report the parse error, run on defaults.
             eprintln!("lux: {origin}: {err}");
             return KeyTable::default();
         }
@@ -68,27 +68,28 @@ fn from_toml(text: &str, origin: &str) -> KeyTable {
     let mut prefix = defaults.prefix;
     if let Some(value) = doc.get("prefix") {
         match value.as_str().and_then(parse_key_spec) {
-            // REQ-CONFIG-005: the configured prefix replaces the default.
+            // The configured prefix replaces the default.
             Some(key) => prefix = key,
             None => eprintln!("lux: {origin}: invalid prefix key {value}"),
         }
     }
 
     let mut entries: Vec<Entry> = defaults
+        .root
         .bindings
         .into_iter()
-        .map(|(key, command)| Entry { key, command, config_idx: None })
+        .map(|(key, trie)| Entry { key, trie, config_idx: None })
         .collect();
 
     if let Some(value) = doc.get("keys") {
         let Some(keys) = value.as_table() else {
             eprintln!("lux: {origin}: `keys` must be a table");
-            return KeyTable { prefix, bindings: resolve(entries, origin) };
+            return KeyTable { prefix, root: KeyTrieNode::root(resolve(entries, origin)) };
         };
-        // File order via toml's preserve_order, for REQ-CONFIG-008's
+        // File order via toml's preserve_order, for the
         // last-entry-wins rule.
         for (idx, (name, value)) in keys.iter().enumerate() {
-            // REQ-CONFIG-007: unknown command names are reported and
+            // Unknown command names are reported and
             // ignored.
             let Some(command) = command_by_name(name) else {
                 eprintln!("lux: {origin}: unknown command `{name}`");
@@ -98,24 +99,25 @@ fn from_toml(text: &str, origin: &str) -> KeyTable {
                 eprintln!("lux: {origin}: invalid key {value} for `{name}`");
                 continue;
             };
-            // REQ-CONFIG-006: the configured sequence replaces this
+            // The configured sequence replaces this
             // command's hardcoded default.
             let entry = entries
                 .iter_mut()
-                .find(|e| e.command == command)
+                .find(|e| e.trie == KeyTrie::Command(command))
                 .expect("every named command has a default entry");
             entry.key = key;
             entry.config_idx = Some(idx);
         }
     }
 
-    KeyTable { prefix, bindings: resolve(entries, origin) }
+    KeyTable { prefix, root: KeyTrieNode::root(resolve(entries, origin)) }
 }
 
 /// Resolve duplicate key sequences: a config entry displaces a default on
-/// the same key, and of two config entries the last defined wins, with an
-/// error (REQ-CONFIG-008).
-fn resolve(entries: Vec<Entry>, origin: &str) -> Vec<(KeyMatch, Command)> {
+/// the same key (including a chord node's — rebinding a command onto `m`
+/// displaces the whole submap), and of two config entries the last defined
+/// wins, with an error.
+fn resolve(entries: Vec<Entry>, origin: &str) -> Vec<(KeyMatch, KeyTrie)> {
     let mut kept: Vec<Entry> = Vec::with_capacity(entries.len());
     for entry in entries {
         let Some(pos) = kept.iter().position(|k| k.key == entry.key) else {
@@ -136,7 +138,7 @@ fn resolve(entries: Vec<Entry>, origin: &str) -> Vec<(KeyMatch, Command)> {
             kept[pos] = entry;
         }
     }
-    kept.into_iter().map(|e| (e.key, e.command)).collect()
+    kept.into_iter().map(|e| (e.key, e.trie)).collect()
 }
 
 /// A single character, optionally prefixed with `C-` for Ctrl.
@@ -156,6 +158,7 @@ fn parse_key_spec(spec: &str) -> Option<KeyMatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::keys::Command;
     use crate::server::layout::Dir;
 
     fn table(text: &str) -> KeyTable {
@@ -164,9 +167,10 @@ mod tests {
 
     fn find(table: &KeyTable, command: Command) -> Vec<KeyMatch> {
         table
+            .root
             .bindings
             .iter()
-            .filter(|(_, c)| *c == command)
+            .filter(|(_, t)| *t == KeyTrie::Command(command))
             .map(|(k, _)| *k)
             .collect()
     }
@@ -180,14 +184,14 @@ mod tests {
         let t = table("");
         let d = KeyTable::default();
         assert_eq!(t.prefix, d.prefix);
-        assert_eq!(t.bindings.len(), d.bindings.len());
+        assert_eq!(t.root, d.root);
     }
 
     #[test]
     fn malformed_toml_yields_defaults() {
         let t = table("prefix = [broken");
         assert_eq!(t.prefix, crate::server::keys::DEFAULT_PREFIX);
-        assert_eq!(t.bindings.len(), KeyTable::default().bindings.len());
+        assert_eq!(t.root, KeyTable::default().root);
     }
 
     #[test]
@@ -211,9 +215,19 @@ mod tests {
 
     #[test]
     fn unknown_command_is_ignored() {
-        let t = table("[keys]\nfly-to-the-moon = \"m\"");
-        assert_eq!(t.bindings.len(), KeyTable::default().bindings.len());
-        assert_eq!(t.lookup_char('m'), None);
+        let t = table("[keys]\nfly-to-the-moon = \"q\"");
+        assert_eq!(t.root, KeyTable::default().root);
+        assert_eq!(t.lookup_char('q'), None);
+    }
+
+    #[test]
+    fn config_binding_displaces_the_chord_node_on_its_key() {
+        // The chord node's key follows the same displacement rule as any
+        // default: rebinding a command onto `m` removes
+        // the move-tab submap.
+        let t = table("[keys]\nnew-tab = \"m\"");
+        assert_eq!(find(&t, Command::NewTab), vec![plain('m')]);
+        assert_eq!(t.root.get(plain('m')), Some(&KeyTrie::Command(Command::NewTab)));
     }
 
     #[test]
@@ -227,7 +241,7 @@ mod tests {
 
     #[test]
     fn duplicate_config_key_uses_last_entry() {
-        // REQ-CONFIG-008: both bound to `g`; the later entry wins.
+        // Both bound to `g`; the later entry wins.
         let t = table("[keys]\nnew-tab = \"g\"\nnext-tab = \"g\"");
         assert_eq!(find(&t, Command::NextTab), vec![plain('g')]);
         assert_eq!(find(&t, Command::NewTab), vec![]);
@@ -235,17 +249,28 @@ mod tests {
 
     #[test]
     fn ctrl_specs_parse() {
-        let t = table("[keys]\nresize-left = \"C-y\"");
+        let t = table("[keys]\nscroll-mode = \"C-y\"");
         assert_eq!(
-            find(&t, Command::ResizeDir(Dir::Left)),
+            find(&t, Command::ScrollMode),
             vec![KeyMatch { code: CtKeyCode::Char('y'), ctrl: true }]
         );
     }
 
+    #[test]
+    fn chorded_resize_commands_have_no_config_names() {
+        // Chord bindings aren't configurable yet; a resize name is
+        // reported as unknown and ignored, like any other typo.
+        let t = table("[keys]\nresize-left = \"C-y\"");
+        assert_eq!(t.root, KeyTable::default().root);
+        assert!(find(&t, Command::ResizeDir(Dir::Left)).is_empty());
+    }
+
     impl KeyTable {
         fn lookup_char(&self, c: char) -> Option<Command> {
-            let m = plain(c);
-            self.bindings.iter().find(|(k, _)| *k == m).map(|(_, cmd)| *cmd)
+            match self.root.get(plain(c)) {
+                Some(KeyTrie::Command(command)) => Some(*command),
+                _ => None,
+            }
         }
     }
 }

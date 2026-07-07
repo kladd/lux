@@ -1,6 +1,5 @@
 //! Ex command verbs: parsing typed command text and prefix-matching
-//! suggestions. The recognized verb set is exactly `vs`, `sp`, and `w`
-//! (REQ-EX-012).
+//! suggestions. The recognized verb set is exactly `vs`, `sp`, and `w`.
 
 use std::path::PathBuf;
 
@@ -8,16 +7,16 @@ pub const COMMANDS: &[&str] = &["sp", "vs", "w"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExCommand {
-    /// `vs`: split side-by-side (REQ-EX-008).
+    /// `vs`: split side-by-side.
     SplitSideBySide,
-    /// `sp`: split stacked (REQ-EX-009).
+    /// `sp`: split stacked.
     SplitStacked,
-    /// `w <path>`: write the visible terminal content (REQ-EX-010).
+    /// `w <path>`: write the visible terminal content.
     Write(PathBuf),
 }
 
 /// Parse the command line's text on Enter. `None` means unrecognized —
-/// including `w` with no path argument — and nothing runs (REQ-EX-011).
+/// including `w` with no path argument — and nothing runs.
 pub fn parse(text: &str) -> Option<ExCommand> {
     match text {
         "vs" => Some(ExCommand::SplitSideBySide),
@@ -32,8 +31,7 @@ pub fn parse(text: &str) -> Option<ExCommand> {
     }
 }
 
-/// The recognized commands whose names start with the text typed so far
-/// (REQ-EX-006).
+/// The recognized commands whose names start with the text typed so far.
 pub fn suggestions(text: &str) -> Vec<&'static str> {
     COMMANDS
         .iter()
@@ -61,7 +59,7 @@ mod tests {
         assert_eq!(parse("vs "), None);
         assert_eq!(parse(" vs"), None);
         assert_eq!(parse("q"), None);
-        // REQ-EX-011: `w` with no path argument.
+        // `w` with no path argument.
         assert_eq!(parse("w"), None);
         assert_eq!(parse("w   "), None);
     }

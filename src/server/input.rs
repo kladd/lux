@@ -1,4 +1,4 @@
-//! Server-side terminal input decoding (REQ-SESSION-010/030): raw bytes
+//! Server-side terminal input decoding: raw bytes
 //! read from a client's passed stdin descriptor are parsed with termwiz's
 //! `InputParser` and converted to the crossterm-typed events the session
 //! layer already speaks, reproducing the single-process behavior.
@@ -217,9 +217,8 @@ mod tests {
 
     #[test]
     fn bs_and_del_both_decode_as_backspace() {
-        // No binding distinguishes Ctrl-H from Backspace anymore
-        // (REQ-WINDOW-017 resizes on shifted letters); both bytes pass
-        // through as Backspace, matching termwiz's own collapsing.
+        // No binding distinguishes Ctrl-H from Backspace anymore; both bytes
+        // pass through as Backspace, matching termwiz's own collapsing.
         let mut d = InputDecoder::default();
         assert_eq!(keys(&mut d, b"\x08")[0].code, CtKeyCode::Backspace);
         assert_eq!(keys(&mut d, b"\x7f")[0].code, CtKeyCode::Backspace);

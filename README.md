@@ -44,7 +44,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `n` / `p` | next / previous tab |
 | `0`-`9` | jump to tab by index |
 | `h` `j` `k` `l` | focus split left/down/up/right |
-| `H` `J` `K` `L` | resize split left/down/up/right |
+| `r` then `h` `j` `k` `l` | resize split left/down/up/right (tap again within 500ms to keep resizing) |
 | `o` | close every split but the focused one |
 | `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit) |
 | `d` | detach from the session |
@@ -76,7 +76,7 @@ prefix = "C-a"
 
 [keys]
 split-side-by-side = "v"   # rebind % -> v
-resize-left = "C-y"        # "C-" prefix means Ctrl is held
+scroll-mode = "C-y"        # "C-" prefix means Ctrl is held
 ```
 
 Key specs are a single character, optionally prefixed with `C-` for Ctrl.

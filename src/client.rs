@@ -2,7 +2,7 @@
 //! the attach handshake, then get out of the data path entirely — the
 //! server reads input from and renders to the descriptors the client
 //! passed. The client only relays resize signals and waits for the
-//! connection to end (REQ-SESSION-001/011/013/031).
+//! connection to end.
 
 use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
@@ -32,9 +32,9 @@ pub fn attach(request: Request) -> i32 {
         }
     };
 
-    // REQ-SESSION-028: save the terminal's mode and go raw before passing
+    // Save the terminal's mode and go raw before passing
     // descriptors (enable_raw_mode saves the mode disable_raw_mode
-    // restores). The alt screen and mouse capture (REQ-SCROLL-001) are
+    // restores). The alt screen and mouse capture are
     // also the client's to set up and tear down, so restore works even if
     // the server died.
     if enable_raw_mode().is_err() {
@@ -43,7 +43,7 @@ pub fn attach(request: Request) -> i32 {
     }
     let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
 
-    // REQ-SESSION-029: pass stdin and stdout to the server.
+    // Pass stdin and stdout to the server.
     let fds = [std::io::stdin().as_raw_fd(), std::io::stdout().as_raw_fd()];
     if protocol::send_request_with_fds(&stream, &request, &fds).is_err() {
         restore_terminal();
@@ -64,8 +64,8 @@ pub fn attach(request: Request) -> i32 {
         }
     }
 
-    // REQ-SESSION-031: relay resize signals; the server reads the actual
-    // dimensions from the descriptor itself (REQ-SESSION-032).
+    // Relay resize signals; the server reads the actual
+    // dimensions from the descriptor itself.
     let winch_stream = stream.try_clone().ok();
     std::thread::spawn(move || {
         let Some(mut stream) = winch_stream else { return };
@@ -81,13 +81,12 @@ pub fn attach(request: Request) -> i32 {
         }
     });
 
-    // REQ-SESSION-011: no reads from or writes to the host terminal from
+    // No reads from or writes to the host terminal from
     // here on. Block until the server ends the connection — deliberate
-    // detach and lost connection are handled identically
-    // (REQ-SESSION-012/013/024).
+    // detach and lost connection are handled identically.
     while let Ok(Some(_)) = protocol::read_line(&mut stream) {}
 
-    // REQ-SESSION-013: restore the terminal's original mode and exit.
+    // Restore the terminal's original mode and exit.
     restore_terminal();
     0
 }
@@ -102,8 +101,7 @@ fn restore_terminal() {
     let _ = disable_raw_mode();
 }
 
-/// REQ-SESSION-020: list sessions; errors if no server runs
-/// (REQ-SESSION-022).
+/// List sessions; errors if no server runs.
 pub fn ls() -> i32 {
     let Some(mut stream) = connect_existing() else {
         return 1;
@@ -118,8 +116,7 @@ pub fn ls() -> i32 {
     0
 }
 
-/// REQ-SESSION-021: terminate the server; errors if none runs
-/// (REQ-SESSION-022).
+/// Terminate the server; errors if none runs.
 pub fn kill_server() -> i32 {
     let Some(mut stream) = connect_existing() else {
         return 1;
@@ -133,7 +130,7 @@ pub fn kill_server() -> i32 {
     0
 }
 
-/// REQ-SESSION-022: `ls`/`kill-server` never start a server.
+/// `ls`/`kill-server` never start a server.
 fn connect_existing() -> Option<UnixStream> {
     match UnixStream::connect(protocol::socket_path()) {
         Ok(stream) => Some(stream),
@@ -145,7 +142,7 @@ fn connect_existing() -> Option<UnixStream> {
 }
 
 /// Connect to the server, spawning and daemonizing one first if none is
-/// running (REQ-SESSION-002).
+/// running.
 fn connect_or_spawn() -> std::io::Result<UnixStream> {
     let path = protocol::socket_path();
     if let Ok(stream) = UnixStream::connect(&path) {

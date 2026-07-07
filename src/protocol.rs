@@ -1,14 +1,14 @@
 //! The attach protocol shared by client and server — the only thing the
-//! two sides communicate through (REQ-SESSION-001).
+//! two sides communicate through.
 //!
 //! One Unix stream per client. The client sends a single request line; for
 //! attach requests the same sendmsg carries its stdin and stdout file
-//! descriptors as SCM_RIGHTS ancillary data (REQ-SESSION-029). After a
+//! descriptors as SCM_RIGHTS ancillary data. After a
 //! successful attach the stream stays open as a control channel: the
-//! client sends `resize` lines (REQ-SESSION-031), and the server ending
-//! the stream is the detach/end signal (REQ-SESSION-012/013). All terminal
+//! client sends `resize` lines, and the server ending
+//! the stream is the detach/end signal. All terminal
 //! input and rendered output flow over the passed descriptors directly,
-//! never through protocol messages (REQ-SESSION-030).
+//! never through protocol messages.
 
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -20,16 +20,16 @@ use sendfd::{RecvWithFd, SendWithFd};
 /// Client request line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Create a new session (optionally named) and attach
-    /// (REQ-SESSION-006/019). Carries fds.
+    /// Create a new session (optionally named) and attach.
+    /// Carries fds.
     New(Option<String>),
-    /// Attach to an existing named session (REQ-SESSION-026). Carries fds.
+    /// Attach to an existing named session. Carries fds.
     Attach(String),
-    /// List session names (REQ-SESSION-020).
+    /// List session names.
     Ls,
-    /// Terminate the server (REQ-SESSION-021).
+    /// Terminate the server.
     Kill,
-    /// The attached client's terminal was resized (REQ-SESSION-031).
+    /// The attached client's terminal was resized.
     Resize,
 }
 
@@ -62,7 +62,7 @@ impl Request {
     }
 }
 
-/// REQ-SESSION-003: `$XDG_RUNTIME_DIR/lux/server.sock`, falling back to
+/// `$XDG_RUNTIME_DIR/lux/server.sock`, falling back to
 /// `/tmp/lux-$UID/server.sock`.
 pub fn socket_path() -> PathBuf {
     socket_dir().join("server.sock")
@@ -75,7 +75,7 @@ pub fn socket_dir() -> PathBuf {
     }
 }
 
-/// Send a request line together with the fds to pass (REQ-SESSION-029).
+/// Send a request line together with the fds to pass.
 pub fn send_request_with_fds(
     stream: &UnixStream,
     request: &Request,

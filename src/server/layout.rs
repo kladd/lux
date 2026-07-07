@@ -1,5 +1,5 @@
-//! Binary layout tree of windows (REQ-WINDOW-001), scoped so a later phase
-//! can give each session/screen its own tree (REQ-WINDOW-002). Pure geometry
+//! Binary layout tree of windows, scoped so a later phase
+//! can give each session/screen its own tree. Pure geometry
 //! and tree surgery; no PTY or rendering concerns.
 
 use ratatui::layout::Rect;
@@ -37,16 +37,16 @@ pub struct Split {
     pub second: Box<Node>,
 }
 
-/// A vertical separator between side-by-side windows (REQ-WINDOW-012).
+/// A vertical separator between side-by-side windows.
 /// Stacked windows abut directly — the lower window's tab bar is the
-/// boundary (REQ-UI-027) — so no horizontal separators exist.
+/// boundary — so no horizontal separators exist.
 pub struct Separator {
     pub rect: Rect,
 }
 
 /// Split `area` into (first, second, separator) rectangles. Only
-/// side-by-side splits have a separator column (REQ-WINDOW-012); stacked
-/// splits partition the area completely (REQ-UI-027). When the area is
+/// side-by-side splits have a separator column; stacked
+/// splits partition the area completely. When the area is
 /// too small to hold two windows, `first` gets everything and the other
 /// rects are zero-sized.
 pub fn split_areas(kind: SplitKind, ratio: f64, area: Rect) -> (Rect, Rect, Rect) {
@@ -79,7 +79,7 @@ pub fn split_areas(kind: SplitKind, ratio: f64, area: Rect) -> (Rect, Rect, Rect
 }
 
 /// Compute every window's rectangle and every separator for the whole tree
-/// (REQ-WINDOW-011/012 geometry, computed once then drawn from state).
+/// (geometry, computed once then drawn from state).
 pub fn compute(node: &Node, area: Rect) -> (Vec<(WindowId, Rect)>, Vec<Separator>) {
     let mut rects = Vec::new();
     let mut seps = Vec::new();
@@ -101,8 +101,7 @@ fn walk(node: &Node, area: Rect, rects: &mut Vec<(WindowId, Rect)>, seps: &mut V
     }
 }
 
-/// Window ids in in-order traversal; the prefix+`o` cycle order
-/// (REQ-WINDOW-016).
+/// Window ids in in-order traversal; the prefix+`o` cycle order.
 pub fn leaves(node: &Node) -> Vec<WindowId> {
     match node {
         Node::Leaf(id) => vec![*id],
@@ -122,7 +121,7 @@ pub fn contains(node: &Node, id: WindowId) -> bool {
 }
 
 /// Replace `target`'s leaf with a split holding it and a new leaf for
-/// `new_id` (REQ-WINDOW-005/006 tree change).
+/// `new_id`.
 pub fn split_leaf(node: &mut Node, target: WindowId, kind: SplitKind, new_id: WindowId) {
     match node {
         Node::Leaf(id) if *id == target => {
@@ -142,7 +141,7 @@ pub fn split_leaf(node: &mut Node, target: WindowId, kind: SplitKind, new_id: Wi
 }
 
 /// Remove `target`'s leaf, collapsing its parent split so the sibling
-/// subtree takes the whole space (REQ-WINDOW-020). Returns `None` when the
+/// subtree takes the whole space. Returns `None` when the
 /// tree was just that leaf.
 pub fn remove_leaf(node: Node, target: WindowId) -> Option<Node> {
     match node {
@@ -163,7 +162,7 @@ pub fn remove_leaf(node: Node, target: WindowId) -> Option<Node> {
 }
 
 /// Move the boundary between `focused` and its adjacent sibling one cell in
-/// `dir` (REQ-WINDOW-017): the deepest ancestor split with a sibling on
+/// `dir`: the deepest ancestor split with a sibling on
 /// that side owns the boundary. Returns whether a boundary was found.
 pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -> bool {
     let Node::Split(s) = node else { return false };
@@ -188,7 +187,7 @@ pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -
     }
     let avail = match s.kind {
         SplitKind::SideBySide => area.width.saturating_sub(1),
-        // REQ-UI-027: stacked windows abut, no separator row.
+        // Stacked windows abut, no separator row.
         SplitKind::Stacked => area.height,
     };
     if avail < 2 {
@@ -205,10 +204,20 @@ pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -
     true
 }
 
-/// The window spatially adjacent to `from` in `dir` (REQ-KEY-004): the
+/// Reset every split in the tree to an even division between its two
+/// children.
+pub fn rebalance(node: &mut Node) {
+    if let Node::Split(s) = node {
+        s.ratio = 0.5;
+        rebalance(&mut s.first);
+        rebalance(&mut s.second);
+    }
+}
+
+/// The window spatially adjacent to `from` in `dir`: the
 /// nearest window on that side whose perpendicular extent overlaps `from`,
 /// ties broken by largest overlap. `None` at a screen edge, leaving focus
-/// unchanged (REQ-KEY-005).
+/// unchanged.
 pub fn spatial_neighbor(rects: &[(WindowId, Rect)], from: Rect, dir: Dir) -> Option<WindowId> {
     let mut best: Option<(WindowId, u16, u16)> = None;
     for &(id, rect) in rects {
@@ -259,7 +268,7 @@ mod tests {
         assert_eq!(second.height, 24);
         assert_eq!(sep.x, first.right());
         assert_eq!(second.x, sep.right());
-        // REQ-UI-027: stacked windows abut with no separator row.
+        // Stacked windows abut with no separator row.
         let (first, second, sep) = split_areas(SplitKind::Stacked, 0.5, area());
         assert_eq!(first.height + second.height, 24);
         assert_eq!(second.y, first.bottom());
@@ -287,7 +296,7 @@ mod tests {
         split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
         let (rects, seps) = compute(&tree, area());
         assert_eq!(rects.len(), 3);
-        // Only the side-by-side split has a separator (REQ-UI-027).
+        // Only the side-by-side split has a separator.
         assert_eq!(seps.len(), 1);
         let cells: u32 = rects.iter().map(|(_, r)| r.area() as u32).sum::<u32>()
             + seps.iter().map(|s| s.rect.area() as u32).sum::<u32>();
@@ -311,11 +320,30 @@ mod tests {
         assert_eq!(spatial_neighbor(&rects, rects[1].1, Dir::Down), Some(3));
         assert_eq!(spatial_neighbor(&rects, rects[2].1, Dir::Up), Some(2));
         assert_eq!(spatial_neighbor(&rects, rects[1].1, Dir::Left), Some(1));
-        // REQ-KEY-005: nothing at the screen edge.
+        // Nothing at the screen edge.
         assert_eq!(spatial_neighbor(&rects, rects[0].1, Dir::Left), None);
         assert_eq!(spatial_neighbor(&rects, rects[0].1, Dir::Up), None);
         assert_eq!(spatial_neighbor(&rects, rects[1].1, Dir::Up), None);
         assert_eq!(spatial_neighbor(&rects, rects[2].1, Dir::Down), None);
+    }
+
+    #[test]
+    fn rebalance_evens_every_split() {
+        // Every split at every depth returns to an even
+        // division — the layout matches a freshly built identical tree.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
+        let mut even = Node::Leaf(1);
+        split_leaf(&mut even, 1, SplitKind::SideBySide, 2);
+        split_leaf(&mut even, 2, SplitKind::Stacked, 3);
+        for _ in 0..5 {
+            assert!(resize_toward(&mut tree, area(), 1, Dir::Right));
+            assert!(resize_toward(&mut tree, area(), 2, Dir::Down));
+        }
+        assert_ne!(compute(&tree, area()).0, compute(&even, area()).0);
+        rebalance(&mut tree);
+        assert_eq!(compute(&tree, area()).0, compute(&even, area()).0);
     }
 
     #[test]

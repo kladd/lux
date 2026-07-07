@@ -1,5 +1,5 @@
 //! Windows and tabs. A window is a leaf of the layout tree owning an
-//! ordered list of tabs (REQ-TAB-001); a tab is one PTY running $SHELL plus
+//! ordered list of tabs; a tab is one PTY running $SHELL plus
 //! one terminal engine instance, with a reader thread feeding PTY output
 //! into the app's event channel.
 
@@ -34,20 +34,20 @@ impl TerminalConfiguration for LuxConfig {
 }
 
 /// A leaf of the layout tree: one rectangle of screen space owning an
-/// ordered tab list with exactly one active tab (REQ-TAB-001/002).
+/// ordered tab list with exactly one active tab.
 pub struct Window {
     pub id: WindowId,
     /// Last rectangle the window was laid out into (tab bar + content).
     pub rect: Rect,
     pub tabs: Vec<Tab>,
-    /// Index of the active tab; the only one rendered (REQ-TAB-002).
+    /// Index of the active tab; the only one rendered.
     pub active: usize,
 }
 
 impl Window {
-    /// Create a window whose tab list holds exactly one active tab
-    /// (REQ-TAB-003), with the tab's shell and engine sized to the content
-    /// rectangle below the tab bar row (REQ-WINDOW-009/010, REQ-TAB-005).
+    /// Create a window whose tab list holds exactly one active tab,
+    /// with the tab's shell and engine sized to the content
+    /// rectangle below the tab bar row.
     pub fn new(id: WindowId, rect: Rect, tx: Sender<ServerEvent>) -> anyhow::Result<Self> {
         let tab = Tab::spawn(content_rect(rect), None, tx)?;
         Ok(Self {
@@ -70,12 +70,12 @@ impl Window {
         self.tabs.iter_mut().find(|t| t.id == id)
     }
 
-    /// The rectangle the active tab's content renders into (REQ-TAB-012).
+    /// The rectangle the active tab's content renders into.
     pub fn content_rect(&self) -> Rect {
         content_rect(self.rect)
     }
 
-    /// The tab bar row reserved at the top of the window (REQ-TAB-011).
+    /// The tab bar row reserved at the top of the window.
     pub fn tab_bar_rect(&self) -> Rect {
         Rect {
             height: self.rect.height.min(1),
@@ -84,7 +84,7 @@ impl Window {
     }
 
     /// Bring every tab's PTY and engine in sync with the window's current
-    /// rectangle (REQ-WINDOW-018/019 across all of this window's tabs, so
+    /// rectangle (across all of this window's tabs, so
     /// no tab is stale when it later becomes active).
     pub fn reconcile(&mut self) {
         let content = self.content_rect();
@@ -97,8 +97,8 @@ impl Window {
 }
 
 fn content_rect(rect: Rect) -> Rect {
-    // One chrome row: the tab bar (REQ-TAB-011), which also serves as
-    // the boundary with a stacked window above (REQ-UI-027).
+    // One chrome row: the tab bar, which also serves as
+    // the boundary with a stacked window above.
     Rect {
         y: rect.y + rect.height.min(1),
         height: rect.height.saturating_sub(1),
@@ -115,15 +115,13 @@ struct Foreground {
 }
 
 impl Foreground {
-    /// REQ-AGENT-002: the foreground command name must be `claude`,
+    /// The foreground command name must be `claude`,
     /// under either reading.
     fn is_claude(&self) -> bool {
         self.comm == "claude" || self.arg0 == "claude"
     }
 
-    /// The tab's display name (REQ-UI-002): argv[0]'s basename, matching
-    /// tmux's `pane_current_command` source on Linux
-    /// (`~/src/tmux/osdep-linux.c` reads `/proc/<pgrp>/cmdline`), with
+    /// The tab's display name: argv[0]'s basename, with
     /// comm covering processes that rewrite their argv.
     fn display_name(&self) -> &str {
         if self.arg0.is_empty() { &self.comm } else { &self.arg0 }
@@ -133,20 +131,19 @@ impl Foreground {
 pub struct Tab {
     pub id: TabId,
     /// Display name derived from the PTY's foreground process command
-    /// name, re-derived as that process changes (REQ-UI-002/003).
+    /// name, re-derived as that process changes.
     pub name: String,
     pub engine: Engine,
     /// Last rectangle the tab's PTY and engine were sized to.
     pub rect: Rect,
     /// Engine seqno at the last draw, to skip redraws with no changes.
     pub drawn_seqno: usize,
-    /// Scroll mode (REQ-SCROLL-003): the stable row index of the view's
-    /// top line. `None` means following live output (REQ-SCROLL-012).
+    /// Scroll mode: the stable row index of the view's
+    /// top line. `None` means following live output.
     /// Stable indices survive scrollback growth and trimming, so the view
-    /// stays anchored to content while output arrives (REQ-SCROLL-010).
+    /// stays anchored to content while output arrives.
     scroll_top: Option<isize>,
-    /// Present while the tab is identified as running Claude Code
-    /// (REQ-AGENT-002/016).
+    /// Present while the tab is identified as running Claude Code.
     pub agent: Option<Tracker>,
     master: Box<dyn MasterPty>,
     child: Box<dyn Child + Send + Sync>,
@@ -154,8 +151,8 @@ pub struct Tab {
 
 impl Tab {
     /// Spawn a PTY running $SHELL sized to `rect` with an engine to match
-    /// (REQ-TAB-004/005) and a reader thread feeding `tx` (REQ-PANE-005).
-    /// `cwd` sets the shell's working directory (REQ-TAB-021); `None`
+    /// and a reader thread feeding `tx`.
+    /// `cwd` sets the shell's working directory; `None`
     /// leaves the server's own.
     pub fn spawn(
         rect: Rect,
@@ -195,7 +192,7 @@ impl Tab {
         });
 
         // The engine writes encoded key input back through `writer` into
-        // the PTY (REQ-PANE-011).
+        // the PTY.
         let engine = Engine::new(
             term_size(rect),
             Arc::new(LuxConfig),
@@ -205,8 +202,7 @@ impl Tab {
         );
 
         // Until the first foreground read, the name is the spawned
-        // shell's, matching tmux's fallback to the pane's shell
-        // (`~/src/tmux/names.c` default_window_name).
+        // shell's.
         let name = std::path::Path::new(&shell)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -225,17 +221,15 @@ impl Tab {
         })
     }
 
-    /// Terminate the tab's child process (REQ-WINDOW-016); the tab's
-    /// removal follows the ordinary exit path once its PTY closes
-    /// (REQ-WINDOW-020, REQ-TAB-015/016).
+    /// Terminate the tab's child process; the tab's
+    /// removal follows the ordinary exit path once its PTY closes.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
 
     /// Re-identify the tab after new PTY output: re-derive its display
-    /// name from the foreground command (REQ-UI-002/003, tmux's
-    /// automatic-rename) and re-evaluate agent detection
-    /// (REQ-AGENT-002/010). Returns whether the displayed name or agent
+    /// name from the foreground command and re-evaluate agent detection.
+    /// Returns whether the displayed name or agent
     /// state (including the status text appearing or disappearing)
     /// changed.
     pub fn refresh_identity(&mut self) -> bool {
@@ -250,7 +244,7 @@ impl Tab {
             _ => false,
         };
         if !fg.is_some_and(|fg| fg.is_claude()) {
-            // REQ-AGENT-016/017: not Claude Code — no status text, drop
+            // Not Claude Code — no status text, drop
             // any stale state.
             return self.agent.take().is_some() || renamed;
         }
@@ -275,7 +269,7 @@ impl Tab {
         Some(Foreground { comm: comm.trim().to_string(), arg0 })
     }
 
-    /// The foreground process's working directory (REQ-TAB-021), via the
+    /// The foreground process's working directory, via the
     /// same /proc inspection `foreground` uses.
     pub fn working_dir(&self) -> Option<std::path::PathBuf> {
         let pid = self.master.process_group_leader()?;
@@ -283,7 +277,7 @@ impl Tab {
     }
 
     /// Commit a pending idle debounce whose window has elapsed with no
-    /// further output (REQ-AGENT-011); returns whether display changed.
+    /// further output; returns whether display changed.
     pub fn tick_agent(&mut self, now: std::time::Instant) -> bool {
         self.agent.as_mut().is_some_and(|t| t.tick(now))
     }
@@ -296,21 +290,21 @@ impl Tab {
         self.scroll_top.is_some()
     }
 
-    /// Enter scroll mode anchored at the current live view (REQ-SCROLL-003).
+    /// Enter scroll mode anchored at the current live view.
     pub fn enter_scroll_mode(&mut self) {
         if self.scroll_top.is_none() {
             self.scroll_top = Some(self.engine.screen().visible_row_to_stable_row(0));
         }
     }
 
-    /// Exit scroll mode and resume following live output (REQ-SCROLL-011).
+    /// Exit scroll mode and resume following live output.
     pub fn exit_scroll_mode(&mut self) {
         self.scroll_top = None;
     }
 
     /// Scroll the view by `delta` lines (negative = up into history),
-    /// clamped to the oldest scrollback line and the live view
-    /// (REQ-SCROLL-005..008). Returns true if the view is at the live
+    /// clamped to the oldest scrollback line and the live view.
+    /// Returns true if the view is at the live
     /// bottom afterwards.
     pub fn scroll_by(&mut self, delta: isize) -> bool {
         let Some(top) = self.scroll_top else {
@@ -325,7 +319,7 @@ impl Tab {
     }
 
     /// The physical rows the tab's view shows: the scroll-mode anchor
-    /// (REQ-SCROLL-010) or the live tail (REQ-SCROLL-012).
+    /// or the live tail.
     pub fn view_range(&self) -> std::ops::Range<usize> {
         let screen = self.engine.screen();
         let rows = screen.physical_rows as isize;
@@ -335,15 +329,14 @@ impl Tab {
         }
     }
 
-    /// Resize the PTY and engine to a new content rectangle
-    /// (REQ-PANE-012/013, REQ-WINDOW-018/019).
+    /// Resize the PTY and engine to a new content rectangle.
     pub fn resize(&mut self, rect: Rect) {
         self.rect = rect;
         let _ = self.master.resize(pty_size(rect));
         self.engine.resize(term_size(rect));
     }
 
-    /// Reap the exited child and return its exit status (REQ-WINDOW-022).
+    /// Reap the exited child and return its exit status.
     pub fn wait(&mut self) -> i32 {
         match self.child.wait() {
             Ok(status) => status.exit_code() as i32,
@@ -383,8 +376,7 @@ mod tests {
 
     #[test]
     fn display_name_prefers_argv0_basename() {
-        // REQ-UI-002 via tmux's pane_current_command: argv[0] first,
-        // comm when argv is rewritten/unreadable.
+        // argv[0] first, comm when argv is rewritten/unreadable.
         assert_eq!(fg("vim", "vim").display_name(), "vim");
         assert_eq!(fg("node", "claude").display_name(), "claude");
         assert_eq!(fg("bash", "").display_name(), "bash");
@@ -392,7 +384,7 @@ mod tests {
 
     #[test]
     fn claude_is_identified_under_either_reading() {
-        // REQ-AGENT-002: comm or argv[0] basename.
+        // Comm or argv[0] basename.
         assert!(fg("claude", "node").is_claude());
         assert!(fg("node", "claude").is_claude());
         assert!(!fg("node", "node").is_claude());

@@ -1,9 +1,9 @@
 //! The lux server: owns every session's layout tree, windows, tabs, PTYs,
-//! and terminal engines, independent of attached clients
-//! (REQ-SESSION-005), decodes all terminal input, and renders directly to
-//! each attached client's passed descriptors (REQ-SESSION-010/030). The
+//! and terminal engines, independent of attached clients, decodes all
+//! terminal input, and renders directly to
+//! each attached client's passed descriptors. The
 //! client side lives in `crate::client`; the two communicate only through
-//! `crate::protocol` (REQ-SESSION-001).
+//! `crate::protocol`.
 
 pub mod agent;
 pub mod anim;
@@ -44,11 +44,11 @@ type ConnId = u64;
 type SessionId = usize;
 
 pub enum ServerEvent {
-    /// Output bytes read from a tab's PTY (REQ-PANE-005).
+    /// Output bytes read from a tab's PTY.
     PtyOutput(TabId, Vec<u8>),
     /// A tab's PTY reached EOF: the child's side is closed.
     PtyExited(TabId),
-    /// A client finished its attach handshake (REQ-SESSION-029).
+    /// A client finished its attach handshake.
     Attach {
         conn: ConnId,
         stream: UnixStream,
@@ -56,19 +56,19 @@ pub enum ServerEvent {
         stdin: OwnedFd,
         stdout: OwnedFd,
     },
-    /// `ls` over a fresh connection (REQ-SESSION-020).
+    /// `ls` over a fresh connection.
     Ls(UnixStream),
-    /// `kill-server` over a fresh connection (REQ-SESSION-021).
+    /// `kill-server` over a fresh connection.
     Kill(UnixStream),
-    /// The client relayed a SIGWINCH (REQ-SESSION-031).
+    /// The client relayed a SIGWINCH.
     Resized(ConnId),
-    /// The control connection ended, for any reason (REQ-SESSION-014).
+    /// The control connection ended, for any reason.
     ConnGone(ConnId),
     /// Raw bytes read from an attached client's stdin descriptor.
     Input(ConnId, Vec<u8>),
 }
 
-/// One attached client (REQ-SESSION-025: at most one per session).
+/// One attached client (at most one per session).
 struct Client {
     control: UnixStream,
     terminal: Terminal<FdBackend>,
@@ -77,15 +77,15 @@ struct Client {
     raw_out: File,
     decoder: InputDecoder,
     /// Stops the stdin reader thread so a detached client's keystrokes
-    /// are never consumed by a stale read (REQ-SESSION-012).
+    /// are never consumed by a stale read.
     stdin_stop: Arc<AtomicBool>,
     attached: SessionId,
-    /// `Some(highlighted index)` while in switcher mode (REQ-SESSION-015).
+    /// `Some(highlighted index)` while in switcher mode.
     switcher: Option<usize>,
 }
 
 pub fn run() -> i32 {
-    // REQ-SESSION-004: detach from the controlling terminal so the server
+    // Detach from the controlling terminal so the server
     // outlives it. Fails harmlessly if already a session leader.
     let _ = rustix::process::setsid();
 
@@ -97,7 +97,7 @@ pub fn run() -> i32 {
     let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     let path = protocol::socket_path();
     let _ = std::fs::remove_file(&path);
-    // REQ-SESSION-003: the well-known per-user socket.
+    // The well-known per-user socket.
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(err) => {
@@ -106,8 +106,8 @@ pub fn run() -> i32 {
         }
     };
 
-    // REQ-SESSION-009: the keybinding table lives server-side; config is
-    // loaded here (REQ-CONFIG-002).
+    // The keybinding table lives server-side; config is
+    // loaded here.
     let keys = Arc::new(config::load());
     let (tx, rx) = mpsc::channel::<ServerEvent>();
 
@@ -130,9 +130,9 @@ pub fn run() -> i32 {
         tx,
     };
     loop {
-        // While an idle debounce is pending (REQ-AGENT-011) or an
-        // attached client is showing an animated status text
-        // (REQ-UI-005/006), wake on a short timer so the debounce can
+        // While an idle debounce is pending or an
+        // attached client is showing an animated status text, wake on a
+        // short timer so the debounce can
         // commit and the animation advances; otherwise block until
         // something happens.
         let event = if server.needs_timed_tick() {
@@ -142,7 +142,7 @@ pub fn run() -> i32 {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
             }
         } else {
-            // REQ-UI-015: even fully quiet, wake at the next wall-clock
+            // Even fully quiet, wake at the next wall-clock
             // minute so the session status line's clock advances.
             match rx.recv_timeout(until_next_minute()) {
                 Ok(event) => Some(event),
@@ -162,7 +162,7 @@ pub fn run() -> i32 {
     }
 }
 
-/// Time until the next wall-clock minute boundary (REQ-UI-015). Sub-second
+/// Time until the next wall-clock minute boundary. Sub-second
 /// truncation lands the wake just past the boundary, never before it.
 fn until_next_minute() -> std::time::Duration {
     let secs = std::time::SystemTime::now()
@@ -234,12 +234,13 @@ impl Server {
     }
 
     /// Whether the event loop should wake on a timer rather than block:
-    /// an idle debounce is waiting to commit (REQ-AGENT-011), or a
+    /// an idle debounce is waiting to commit, a resize submap's repeat
+    /// deadline is armed, or a
     /// session some client is viewing — attached or as a live switcher
-    /// preview (REQ-SESSION-016) — has an animated status text to advance
-    /// (REQ-UI-005/006).
+    /// preview — has an animated status text to advance.
     fn needs_timed_tick(&self) -> bool {
         self.has_pending_idle()
+            || self.sessions.values().any(|s| s.has_pending_resize_repeat())
             || self.clients.values().any(|c| {
                 if c.switcher.is_some() {
                     self.sessions.values().any(|s| s.has_animation())
@@ -249,11 +250,13 @@ impl Server {
             })
     }
 
-    /// Commit any idle debounces whose window elapsed (REQ-AGENT-011).
+    /// Commit any idle debounces whose window elapsed, and close any
+    /// resize submap whose repeat deadline did.
     fn tick_agents(&mut self) {
         let now = std::time::Instant::now();
         for session in self.sessions.values_mut() {
             session.tick_agents(now);
+            session.tick_resize_repeat(now);
         }
     }
 
@@ -278,13 +281,13 @@ impl Server {
                 self.attach(conn, stream, request, stdin, stdout);
             }
             ServerEvent::Ls(mut stream) => {
-                // REQ-SESSION-020: one name per line.
+                // One name per line.
                 for session in self.sessions.values() {
                     let _ = protocol::write_line(&mut stream, &session.name);
                 }
             }
             ServerEvent::Kill(mut stream) => {
-                // REQ-SESSION-021: end every session, disconnect every
+                // End every session, disconnect every
                 // client, terminate.
                 let _ = protocol::write_line(&mut stream, "ok");
                 let conns: Vec<ConnId> = self.clients.keys().copied().collect();
@@ -295,7 +298,7 @@ impl Server {
                 std::process::exit(0);
             }
             ServerEvent::Resized(conn) => {
-                // REQ-SESSION-032: read the real dimensions from the
+                // Read the real dimensions from the
                 // client's descriptor and resize the attached session.
                 let Some(client) = self.clients.get_mut(&conn) else { return };
                 let size = term::fd_size(&client.raw_out);
@@ -305,7 +308,7 @@ impl Server {
                 }
             }
             ServerEvent::ConnGone(conn) => {
-                // REQ-SESSION-014: the session lives on regardless of why
+                // The session lives on regardless of why
                 // the connection ended.
                 self.detach(conn);
             }
@@ -326,10 +329,10 @@ impl Server {
         let area = Rect::new(0, 0, size.width, size.height);
 
         let sid = match request {
-            // REQ-SESSION-006/007: bare connect creates an auto-named
+            // Bare connect creates an auto-named
             // session.
             Request::New(None) => self.create_session(None, area),
-            // REQ-SESSION-019: named create fails on collision.
+            // Named create fails on collision.
             Request::New(Some(name)) => {
                 if self.session_by_name(&name).is_some() {
                     let _ = protocol::write_line(
@@ -340,7 +343,7 @@ impl Server {
                 }
                 self.create_session(Some(name), area)
             }
-            // REQ-SESSION-008/026: attach to the named session or fail.
+            // Attach to the named session or fail.
             Request::Attach(name) => match self.session_by_name(&name) {
                 Some(sid) => Ok(sid),
                 None => {
@@ -365,7 +368,7 @@ impl Server {
             return;
         }
 
-        // REQ-SESSION-027: attachment is exclusive; the old client is
+        // Attachment is exclusive; the old client is
         // disconnected first.
         if let Some(&old) = self
             .clients
@@ -407,8 +410,8 @@ impl Server {
     }
 
     fn create_session(&mut self, name: Option<String>, area: Rect) -> Result<SessionId, String> {
-        // REQ-SESSION-007: generate a name when none was requested — the
-        // smallest unused non-negative integer, tmux-style.
+        // Generate a name when none was requested — the
+        // smallest unused non-negative integer.
         let name = match name {
             Some(name) => name,
             None => (0..)
@@ -431,9 +434,9 @@ impl Server {
             .map(|(&sid, _)| sid)
     }
 
-    /// End a client's connection, keeping its session running
-    /// (REQ-SESSION-012/014). The client restores its own terminal on
-    /// seeing the stream close (REQ-SESSION-013).
+    /// End a client's connection, keeping its session running.
+    /// The client restores its own terminal on
+    /// seeing the stream close.
     fn detach(&mut self, conn: ConnId) {
         let Some(client) = self.clients.remove(&conn) else { return };
         // Stop the stdin reader before dropping our fds so a lingering
@@ -442,7 +445,7 @@ impl Server {
         let _ = client.control.shutdown(Shutdown::Both);
     }
 
-    /// REQ-SESSION-023/024: a session that ended takes its attached
+    /// A session that ended takes its attached
     /// client's connection with it.
     fn end_session(&mut self, sid: SessionId) {
         self.sessions.remove(&sid);
@@ -490,9 +493,8 @@ impl Server {
 
     fn apply_effect(&mut self, conn: ConnId, sid: SessionId, effect: Effect) {
         match effect {
-            // REQ-SESSION-012.
             Effect::Detach => self.detach(conn),
-            // REQ-SESSION-015: switcher mode is per-connection.
+            // Switcher mode is per-connection.
             Effect::OpenSwitcher => {
                 let highlight = self
                     .sessions
@@ -503,7 +505,7 @@ impl Server {
                     client.switcher = Some(highlight);
                 }
             }
-            // REQ-SCROLL-016: native clipboard plus OSC 52 so the client's
+            // Native clipboard plus OSC 52 so the client's
             // terminal (or an outer multiplexer/SSH hop) mirrors it.
             Effect::Copy(text) => {
                 if let Some(clipboard) = &mut self.clipboard {
@@ -513,7 +515,7 @@ impl Server {
                     osc52_copy(&mut client.raw_out, &text);
                 }
             }
-            // REQ-SCROLL-023: paste the system clipboard's current text.
+            // Paste the system clipboard's current text.
             Effect::Paste => {
                 let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) else {
                     return;
@@ -533,23 +535,21 @@ impl Server {
         let Some(highlight) = client.switcher else { return };
         let ctrl = key.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
         match key.code {
-            // REQ-SESSION-034: `k`, Up, or Ctrl-p (tmux's `choose-tree`
-            // binding) moves the highlight up, wrapping to the last.
+            // `k`, Up, or Ctrl-p moves the highlight up, wrapping to the last.
             CtKeyCode::Up | CtKeyCode::Char('k') if !ctrl => {
                 client.switcher = Some(highlight.checked_sub(1).unwrap_or(count.saturating_sub(1)));
             }
             CtKeyCode::Char('p') if ctrl => {
                 client.switcher = Some(highlight.checked_sub(1).unwrap_or(count.saturating_sub(1)));
             }
-            // REQ-SESSION-035: `j`, Down, or Ctrl-n (tmux's `choose-tree`
-            // binding) moves the highlight down, wrapping to the first.
+            // `j`, Down, or Ctrl-n moves the highlight down, wrapping to the first.
             CtKeyCode::Down | CtKeyCode::Char('j') if !ctrl => {
                 client.switcher = Some(if count == 0 { 0 } else { (highlight + 1) % count });
             }
             CtKeyCode::Char('n') if ctrl => {
                 client.switcher = Some(if count == 0 { 0 } else { (highlight + 1) % count });
             }
-            // REQ-SESSION-018: back out without changing attachment.
+            // Back out without changing attachment.
             CtKeyCode::Esc => {
                 client.switcher = None;
                 let sid = client.attached;
@@ -557,14 +557,14 @@ impl Server {
                     session.request_redraw();
                 }
             }
-            // REQ-SESSION-017: re-attach the connection to the selection.
+            // Re-attach the connection to the selection.
             CtKeyCode::Enter => {
                 client.switcher = None;
                 let Some(&target) = self.sessions.keys().nth(highlight) else { return };
                 let current = client.attached;
                 let size = term::fd_size(&client.raw_out);
                 if target != current {
-                    // REQ-SESSION-027: exclusive attachment.
+                    // Exclusive attachment.
                     if let Some(other) = self
                         .clients
                         .iter()
@@ -587,7 +587,7 @@ impl Server {
     }
 
     /// Draw every attached client that needs it: switcher frames render
-    /// each pass (their preview is live, REQ-SESSION-016); attached
+    /// each pass (their preview is live); attached
     /// sessions render when their state advanced.
     fn render_all(&mut self) {
         let Server { sessions, clients, .. } = self;
@@ -604,7 +604,7 @@ impl Server {
 }
 
 /// The switcher frame: session list on the left, live preview of the
-/// highlighted session on the right (REQ-SESSION-015/016).
+/// highlighted session on the right.
 fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
@@ -672,8 +672,8 @@ fn clear_region(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// Read raw input from a client's passed stdin descriptor
-/// (REQ-SESSION-010/030). Poll with a short timeout so `stop` can end the
+/// Read raw input from a client's passed stdin descriptor.
+/// Poll with a short timeout so `stop` can end the
 /// thread promptly on detach — a blocked read would otherwise race the
 /// user's shell for the keystrokes typed after detach.
 fn spawn_stdin_reader(
@@ -705,7 +705,7 @@ fn spawn_stdin_reader(
     });
 }
 
-/// OSC 52 written straight to the client's terminal (REQ-SCROLL-016).
+/// OSC 52 written straight to the client's terminal.
 fn osc52_copy(out: &mut File, text: &str) {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);

@@ -1,4 +1,4 @@
-//! Time-driven status-text animations (REQ-UI-005/006), modeled on
+//! Time-driven status-text animations, modeled on
 //! Codex's shimmer (`~/src/codex/codex-rs/tui/src/shimmer.rs`): a
 //! highlight band sweeping across the text for shimmer, an intensity
 //! pulse for breathing, both keyed off elapsed wall time rather than
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
 
-/// How a status text's color moves over time (REQ-UI-005/006/007).
+/// How a status text's color moves over time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Anim {
     None,
@@ -32,7 +32,7 @@ const BAND_HALF_WIDTH: f32 = 5.0;
 /// and fully exits past the other instead of wrapping abruptly.
 const PADDING: usize = 10;
 
-/// The shimmer band's color for character `i` of `len` (REQ-UI-005): a
+/// The shimmer band's color for character `i` of `len`: a
 /// raised-cosine highlight band sweeping the text, blending the state
 /// color toward white under the band's center.
 pub fn shimmer(base: Color, i: usize, len: usize, elapsed: Duration) -> Color {
@@ -46,7 +46,7 @@ pub fn shimmer(base: Color, i: usize, len: usize, elapsed: Duration) -> Color {
     blend(rgb(base), (255, 255, 255), t * 0.9)
 }
 
-/// The whole text's color mid-breath (REQ-UI-006): a raised-cosine pulse
+/// The whole text's color mid-breath: a raised-cosine pulse
 /// between the state color's dimmed and full intensity.
 pub fn breathe(base: Color, elapsed: Duration) -> Color {
     let phase = (elapsed.as_secs_f32() % PERIOD) / PERIOD;

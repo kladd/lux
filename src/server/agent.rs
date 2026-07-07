@@ -1,9 +1,8 @@
 //! Claude Code agent detection (Phase 9): hardcoded, priority-ordered
 //! rules gated by nested `all`/`any`/`not` combinators over
 //! `contains`/`regex` matchers, evaluated against a tab's visible screen
-//! text and OSC title/progress signals (REQ-AGENT-001/006/008). The model
-//! mirrors herdr's verified design; the configurable TOML delivery
-//! mechanism is deliberately absent (REQ-AGENT-018).
+//! text and OSC title/progress signals. The configurable TOML delivery
+//! mechanism is deliberately absent.
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -14,11 +13,11 @@ use wezterm_term::{Progress, Terminal as Engine};
 
 use crate::server::anim::Anim;
 
-/// REQ-AGENT-011: how long a working/blocked → idle result must hold
+/// How long a working/blocked → idle result must hold
 /// before the displayed state updates.
 pub const IDLE_DEBOUNCE: Duration = Duration::from_millis(400);
 
-/// REQ-AGENT-003: the three detectable states.
+/// The three detectable states.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentState {
     Idle,
@@ -26,7 +25,7 @@ pub enum AgentState {
     Blocked,
 }
 
-/// The evidence a rule matches against (REQ-AGENT-006/007): the tab's
+/// The evidence a rule matches against: the tab's
 /// current screen text, or the OSC title / OSC 9;4 progress state the
 /// engine captured from the PTY stream.
 enum Source {
@@ -52,7 +51,7 @@ impl Snapshot {
             screen.push_str(line.as_str().trim_end());
             screen.push('\n');
         }
-        // REQ-AGENT-007: OSC 0/2 title and OSC 9;4 progress, as captured
+        // OSC 0/2 title and OSC 9;4 progress, as captured
         // by the engine while parsing the PTY stream.
         let progress = match engine.get_progress() {
             Progress::None => "none".to_string(),
@@ -68,7 +67,7 @@ impl Snapshot {
     }
 }
 
-/// REQ-AGENT-008: a recursive gate of matchers and sub-gates.
+/// A recursive gate of matchers and sub-gates.
 #[derive(Default)]
 struct Gate {
     /// Case-insensitive substrings (stored lowercase).
@@ -80,7 +79,7 @@ struct Gate {
 }
 
 impl Gate {
-    /// REQ-AGENT-009: every direct matcher matches, every `all` sub-gate
+    /// Every direct matcher matches, every `all` sub-gate
     /// matches, at least one `any` sub-gate matches (or there are none),
     /// and no `not` sub-gate matches.
     fn matches(&self, text: &str, lower: &str) -> bool {
@@ -92,7 +91,7 @@ impl Gate {
     }
 }
 
-/// REQ-AGENT-003/004: target state plus priority.
+/// Target state plus priority.
 struct Rule {
     state: AgentState,
     priority: u32,
@@ -111,8 +110,8 @@ fn regex(patterns: &[&str]) -> Gate {
     }
 }
 
-/// The hardcoded Claude Code rule set (REQ-AGENT-001), evaluated against
-/// the current snapshot on every new PTY output (REQ-AGENT-010).
+/// The hardcoded Claude Code rule set, evaluated against
+/// the current snapshot on every new PTY output.
 static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     vec![
         // Permission/confirmation prompts: Claude Code is waiting on the
@@ -133,7 +132,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         },
         // Any interactive prompt renders a numbered option list with a ❯
         // selector regardless of wording — AskUserQuestion, trust
-        // dialogs, permission variants (REQ-AGENT-022).
+        // dialogs, permission variants.
         Rule {
             state: AgentState::Blocked,
             priority: 890,
@@ -141,7 +140,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             gate: regex(&["❯\\s*1\\."]),
         },
         // The CLI animates a Braille spinner into the window title while
-        // it runs (the same signal herdr keys off).
+        // it runs.
         Rule {
             state: AgentState::Working,
             priority: 850,
@@ -169,9 +168,8 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     ]
 });
 
-/// REQ-AGENT-005: evaluate every rule; the highest-priority match wins,
-/// ties favoring the earliest declared. No match at all means idle
-/// (REQ-AGENT-013).
+/// Evaluate every rule; the highest-priority match wins,
+/// ties favoring the earliest declared. No match at all means idle.
 pub fn evaluate(snapshot: &Snapshot) -> AgentState {
     let mut best: Option<&Rule> = None;
     for rule in RULES.iter() {
@@ -191,11 +189,10 @@ pub fn evaluate(snapshot: &Snapshot) -> AgentState {
 }
 
 /// Per-tab agent display state: the debounced state the tab bar shows,
-/// plus whether the user has seen the tab since it last became idle
-/// (REQ-AGENT-019).
+/// plus whether the user has seen the tab since it last became idle.
 pub struct Tracker {
     displayed: AgentState,
-    /// When a working/blocked tab first evaluated idle (REQ-AGENT-011).
+    /// When a working/blocked tab first evaluated idle.
     pending_idle: Option<Instant>,
     seen: bool,
 }
@@ -212,8 +209,8 @@ impl Default for Tracker {
 
 impl Tracker {
     /// Fold a fresh evaluation in; returns whether the displayed state
-    /// changed. Transitions into idle are debounced (REQ-AGENT-011) and
-    /// cancelled if the evidence moves off idle first (REQ-AGENT-012).
+    /// changed. Transitions into idle are debounced and
+    /// cancelled if the evidence moves off idle first.
     pub fn observe(&mut self, raw: AgentState, now: Instant) -> bool {
         if raw == self.displayed {
             self.pending_idle = None;
@@ -232,7 +229,7 @@ impl Tracker {
                 }
             }
         } else {
-            // REQ-AGENT-012 also covers direct working↔blocked moves.
+            // This also covers direct working↔blocked moves.
             self.pending_idle = None;
             self.displayed = raw;
             true
@@ -254,7 +251,7 @@ impl Tracker {
     fn commit_idle(&mut self) {
         self.displayed = AgentState::Idle;
         self.pending_idle = None;
-        // REQ-AGENT-020: freshly idle means not yet seen ("done").
+        // Freshly idle means not yet seen ("done").
         self.seen = false;
     }
 
@@ -262,15 +259,15 @@ impl Tracker {
         self.pending_idle.is_some()
     }
 
-    /// REQ-AGENT-021: the tab is being displayed in the focused window.
+    /// The tab is being displayed in the focused window.
     pub fn mark_seen(&mut self) {
         self.seen = true;
     }
 
-    /// REQ-AGENT-014/015: bracketed status text and color per visual
+    /// Bracketed status text and color per visual
     /// state — done is idle-but-unseen, idle is idle-and-seen. Working
-    /// shimmers and blocked breathes (REQ-UI-005/006); idle and done stay
-    /// still (REQ-UI-007).
+    /// shimmers and blocked breathes; idle and done stay
+    /// still.
     pub fn visual(&self) -> Visual {
         let (text, color, anim) = match (self.displayed, self.seen) {
             (AgentState::Working, _) => ("[working]", Color::Yellow, Anim::Shimmer),
@@ -282,8 +279,7 @@ impl Tracker {
     }
 }
 
-/// A tab's bracketed status text as the tab bar draws it
-/// (REQ-AGENT-014/015, REQ-UI-005/006/007).
+/// A tab's bracketed status text as the tab bar draws it.
 pub struct Visual {
     pub text: &'static str,
     pub color: Color,
@@ -304,7 +300,6 @@ mod tests {
 
     #[test]
     fn no_evidence_is_idle() {
-        // REQ-AGENT-013.
         assert_eq!(evaluate(&snap("$ ls\nfoo bar\n", "bash", "none")), AgentState::Idle);
     }
 
@@ -329,7 +324,7 @@ mod tests {
 
     #[test]
     fn permission_prompt_outranks_working_evidence() {
-        // REQ-AGENT-005: both match; blocked has the higher priority.
+        // Both match; blocked has the higher priority.
         let s = snap(
             "Bash command…\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n(esc to interrupt)\n",
             "⠹ claude",
@@ -340,7 +335,7 @@ mod tests {
 
     #[test]
     fn option_selector_prompt_is_blocked() {
-        // REQ-AGENT-022: freeform prompts (AskUserQuestion, trust
+        // Freeform prompts (AskUserQuestion, trust
         // dialogs) share only their selector chrome, not their wording.
         let s = snap(
             "Which library should we use?\n❯ 1. serde\n  2. nanoserde\n",
@@ -359,7 +354,7 @@ mod tests {
 
     #[test]
     fn gate_semantics_hold() {
-        // REQ-AGENT-009: empty `any` passes; `not` excludes.
+        // Empty `any` passes; `not` excludes.
         let gate = Gate {
             contains: vec!["alpha"],
             not: vec![contains(&["veto"])],
@@ -383,14 +378,14 @@ mod tests {
         // First idle result arms the debounce without changing display.
         assert!(!t.observe(AgentState::Idle, t0));
         assert!(t.pending());
-        // REQ-AGENT-012: evidence moves back to working → cancelled.
+        // Evidence moves back to working → cancelled.
         assert!(!t.observe(AgentState::Working, t0 + Duration::from_millis(100)));
         assert!(!t.pending());
         assert_eq!(t.visual().text, "[working]");
-        // REQ-AGENT-011: idle held past the debounce commits...
+        // Idle held past the debounce commits...
         assert!(!t.observe(AgentState::Idle, t0 + Duration::from_millis(200)));
         assert!(t.observe(AgentState::Idle, t0 + Duration::from_millis(200) + IDLE_DEBOUNCE));
-        // ...and lands as done (unseen) until marked seen (REQ-AGENT-020).
+        // ...and lands as done (unseen) until marked seen.
         assert_eq!(t.visual().text, "[done]");
         t.mark_seen();
         assert_eq!(t.visual().text, "[idle]");
