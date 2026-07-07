@@ -11,7 +11,8 @@ pub enum ExCommand {
     SplitSideBySide,
     /// `sp`: split stacked.
     SplitStacked,
-    /// `w <path>`: write the visible terminal content.
+    /// `w <path>`: write the tab's entire terminal content, scrollback
+    /// included.
     Write(PathBuf),
 }
 

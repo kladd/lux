@@ -39,8 +39,8 @@ use crate::server::window::{Tab, TabId, Window};
 const MIN_COLS: u16 = 10;
 const MIN_ROWS: u16 = 3;
 
-/// The resize submap's repeat deadline, matching tmux's default
-/// `repeat-time`; restarted on each repeated resize dispatch.
+/// The resize submap's repeat deadline; restarted on each repeated
+/// resize dispatch.
 const RESIZE_REPEAT: Duration = Duration::from_millis(500);
 
 /// A session-level consequence the server must act on; everything else is
@@ -656,7 +656,7 @@ impl Session {
                 match ex::parse(&text) {
                     Some(ExCommand::SplitSideBySide) => self.split(SplitKind::SideBySide),
                     Some(ExCommand::SplitStacked) => self.split(SplitKind::Stacked),
-                    Some(ExCommand::Write(path)) => self.write_visible(&path),
+                    Some(ExCommand::Write(path)) => self.write_tab_content(&path),
                     // Unrecognized text closes with no action.
                     None => {}
                 }
@@ -670,19 +670,26 @@ impl Session {
         }
     }
 
-    /// Write the focused window's active tab's visible terminal
-    /// content to `path`. There is no error surface yet, so a failed write
-    /// is dropped.
-    fn write_visible(&self, path: &std::path::Path) {
+    /// Write the focused window's active tab's entire terminal content,
+    /// scrollback included, to `path`. A leading `~/` expands to the
+    /// user's home directory. There is no error surface yet, so a failed
+    /// write is dropped.
+    fn write_tab_content(&self, path: &std::path::Path) {
         let tab = self.windows[&self.focus].active_tab();
         let screen = tab.engine.screen();
-        let visible = screen.phys_range(&(0..screen.physical_rows as i64));
+        // Every physical row: scrollback plus the visible grid.
+        // (`scrollback_rows` counts all rows, not just the scrolled-off
+        // ones.)
+        let all = 0..screen.scrollback_rows();
         let mut out = String::new();
-        for line in screen.lines_in_phys_range(visible) {
+        for line in screen.lines_in_phys_range(all) {
             out.push_str(line.as_str().trim_end());
             out.push('\n');
         }
-        let _ = std::fs::write(path, out);
+        // The grid's blank tail rows aren't content.
+        let trimmed = out.trim_end_matches('\n');
+        let out = if trimmed.is_empty() { String::new() } else { format!("{trimmed}\n") };
+        let _ = std::fs::write(expand_tilde(path), out);
     }
 
     fn find_tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
@@ -1285,6 +1292,17 @@ fn tree_area(area: Rect) -> Rect {
 /// The status line's clock text, formatted `%H:%M`.
 fn clock_now() -> String {
     chrono::Local::now().format("%H:%M").to_string()
+}
+
+/// Expand a leading `~/` to the user's home directory; the server has no
+/// shell to do it. Any other path passes through unchanged.
+fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(rest) = path.strip_prefix("~")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    path.to_path_buf()
 }
 
 /// Draw the session status line: name left, clock right,

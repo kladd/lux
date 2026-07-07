@@ -1,6 +1,6 @@
 //! The keybinding table: every recognized prefix key sequence dispatches
-//! through this single table. The default table and prefix
-//! are hardcoded; a config file may override both.
+//! through this single table. The table is hardcoded and
+//! non-configurable; a config file may override only the prefix key.
 
 use ratatui::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers as CtMods};
 
@@ -72,38 +72,8 @@ impl Command {
     }
 }
 
-/// The config-file name for each command, or `None` for a
-/// name no table command carries. The chorded move-tab and resize
-/// commands have no names: chord bindings aren't configurable yet.
-pub fn command_by_name(name: &str) -> Option<Command> {
-    // One name per digit, `select-tab-0` … `select-tab-9`.
-    if let Some(rest) = name.strip_prefix("select-tab-")
-        && let &[d @ b'0'..=b'9'] = rest.as_bytes()
-    {
-        return Some(Command::SelectTab((d - b'0') as usize));
-    }
-    Some(match name {
-        "split-side-by-side" => Command::SplitSideBySide,
-        "split-stacked" => Command::SplitStacked,
-        "new-tab" => Command::NewTab,
-        "next-tab" => Command::NextTab,
-        "previous-tab" => Command::PrevTab,
-        "only-window" => Command::OnlyWindow,
-        "detach" => Command::Detach,
-        "session-switcher" => Command::Switcher,
-        "open-ex" => Command::OpenEx,
-        "scroll-mode" => Command::ScrollMode,
-        "rebalance" => Command::Rebalance,
-        "focus-left" => Command::FocusDir(Dir::Left),
-        "focus-down" => Command::FocusDir(Dir::Down),
-        "focus-up" => Command::FocusDir(Dir::Up),
-        "focus-right" => Command::FocusDir(Dir::Right),
-        _ => return None,
-    })
-}
-
 /// One key sequence following the prefix: a key code plus whether Ctrl is
-/// held. This is the identity duplicate key sequences are deduplicated on.
+/// held. This is the identity table lookups match on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyMatch {
     pub code: CtKeyCode,
@@ -395,13 +365,11 @@ mod tests {
 
     #[test]
     fn rebalance_is_bound_to_equals() {
-        // Checks the default binding and the command's config name.
         let table = KeyTable::default();
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('='), KeyModifiers::NONE)),
             Some(Command::Rebalance)
         );
-        assert_eq!(command_by_name("rebalance"), Some(Command::Rebalance));
     }
 
     #[test]
@@ -426,7 +394,7 @@ mod tests {
     #[test]
     fn prefix_r_is_a_chord_node_of_directional_resizes() {
         // R resolves to the resize submap, binding exactly the four vim
-        // directions; the resize commands have no config names.
+        // directions.
         let table = KeyTable::default();
         let plain = |c| KeyMatch { code: CtKeyCode::Char(c), ctrl: false };
         let Some(KeyTrie::Node(node)) = table.root.get(plain('r')) else {
@@ -438,7 +406,6 @@ mod tests {
         }
         assert_eq!(node.get(plain('r')), None);
         assert_eq!(node.bindings.len(), 4);
-        assert_eq!(command_by_name("resize-left"), None);
     }
 
     #[test]
@@ -471,15 +438,6 @@ mod tests {
         assert!(rows.contains(&("l".to_string(), "move tab right")));
         // The root's rows include the node entry itself.
         assert!(table.root.hints().contains(&("m".to_string(), "move tab to window")));
-    }
-
-    #[test]
-    fn select_tab_names_resolve_single_digits_only() {
-        assert_eq!(command_by_name("select-tab-0"), Some(Command::SelectTab(0)));
-        assert_eq!(command_by_name("select-tab-9"), Some(Command::SelectTab(9)));
-        assert_eq!(command_by_name("select-tab-10"), None);
-        assert_eq!(command_by_name("select-tab-"), None);
-        assert_eq!(command_by_name("select-tab-x"), None);
     }
 
     #[test]

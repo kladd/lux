@@ -55,7 +55,9 @@ Ex commands (typed after `:`, with autocomplete):
 
 - `:vs` — split side-by-side
 - `:sp` — split stacked
-- `:w <path>` — write the visible scrollback to a file
+- `:w <path>` — write the tab's entire content, scrollback included, to a
+  file (a leading `~/` expands to your home directory; relative paths
+  resolve against the server's working directory)
 
 ### Navigating sessions
 
@@ -67,18 +69,12 @@ preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
 
 Lux reads `$XDG_CONFIG_HOME/lux/config.toml` (falling back to
 `~/.config/lux/config.toml`) at startup. A missing file is fine; a malformed
-one falls back to defaults with an error printed to stderr. You can override
-the prefix key and any subset of the default keybindings:
+one falls back to defaults with an error printed to stderr. The prefix key
+is the only setting; the keybinding table itself is not configurable:
 
 ```toml
 # ~/.config/lux/config.toml
-prefix = "C-a"
-
-[keys]
-split-side-by-side = "v"   # rebind % -> v
-scroll-mode = "C-y"        # "C-" prefix means Ctrl is held
+prefix = "C-a"   # "C-" prefix means Ctrl is held
 ```
 
-Key specs are a single character, optionally prefixed with `C-` for Ctrl.
-Rebinding a command to a key already in use displaces whatever default held
-that key.
+The key spec is a single character, optionally prefixed with `C-` for Ctrl.

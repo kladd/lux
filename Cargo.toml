@@ -24,9 +24,9 @@ rustix = { version = "0.38", features = ["termios", "process", "event", "system"
 sendfd = "0.4"
 # SIGWINCH relay in the client.
 signal-hook = "0.3"
-# Command line editing per REQ-EX-018; 0.7 tracks ratatui 0.29.
+# Command line editing; 0.7 tracks ratatui 0.29.
 tui-textarea = "0.7"
-# preserve_order: REQ-CONFIG-008 resolves duplicate key sequences to the
+# preserve_order: resolves duplicate key sequences to the
 # last entry defined in the file, which requires file-order iteration.
 toml = { version = "0.8", features = ["preserve_order"] }
 # wezterm crates pinned to a single commit; termwiz must be
