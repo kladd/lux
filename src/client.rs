@@ -68,9 +68,10 @@ pub fn attach(request: Request) -> i32 {
     // dimensions from the descriptor itself.
     let winch_stream = stream.try_clone().ok();
     std::thread::spawn(move || {
-        let Some(mut stream) = winch_stream else { return };
-        let Ok(mut signals) =
-            signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])
+        let Some(mut stream) = winch_stream else {
+            return;
+        };
+        let Ok(mut signals) = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])
         else {
             return;
         };

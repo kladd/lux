@@ -100,12 +100,18 @@ struct Rule {
 }
 
 fn contains(needles: &[&'static str]) -> Gate {
-    Gate { contains: needles.to_vec(), ..Default::default() }
+    Gate {
+        contains: needles.to_vec(),
+        ..Default::default()
+    }
 }
 
 fn regex(patterns: &[&str]) -> Gate {
     Gate {
-        regex: patterns.iter().map(|p| Regex::new(p).expect("valid rule regex")).collect(),
+        regex: patterns
+            .iter()
+            .map(|p| Regex::new(p).expect("valid rule regex"))
+            .collect(),
         ..Default::default()
     }
 }
@@ -179,9 +185,7 @@ pub fn evaluate(snapshot: &Snapshot) -> AgentState {
             Source::OscProgress => &snapshot.progress,
         };
         let lower = text.to_lowercase();
-        if rule.gate.matches(text, &lower)
-            && best.is_none_or(|b| rule.priority > b.priority)
-        {
+        if rule.gate.matches(text, &lower) && best.is_none_or(|b| rule.priority > b.priority) {
             best = Some(rule);
         }
     }
@@ -300,7 +304,10 @@ mod tests {
 
     #[test]
     fn no_evidence_is_idle() {
-        assert_eq!(evaluate(&snap("$ ls\nfoo bar\n", "bash", "none")), AgentState::Idle);
+        assert_eq!(
+            evaluate(&snap("$ ls\nfoo bar\n", "bash", "none")),
+            AgentState::Idle
+        );
     }
 
     #[test]
@@ -317,8 +324,14 @@ mod tests {
 
     #[test]
     fn progress_is_working() {
-        assert_eq!(evaluate(&snap("", "", "percentage:40")), AgentState::Working);
-        assert_eq!(evaluate(&snap("", "", "indeterminate")), AgentState::Working);
+        assert_eq!(
+            evaluate(&snap("", "", "percentage:40")),
+            AgentState::Working
+        );
+        assert_eq!(
+            evaluate(&snap("", "", "indeterminate")),
+            AgentState::Working
+        );
         assert_eq!(evaluate(&snap("", "", "none")), AgentState::Idle);
     }
 
@@ -384,7 +397,10 @@ mod tests {
         assert_eq!(t.visual().text, "[working]");
         // Idle held past the debounce commits...
         assert!(!t.observe(AgentState::Idle, t0 + Duration::from_millis(200)));
-        assert!(t.observe(AgentState::Idle, t0 + Duration::from_millis(200) + IDLE_DEBOUNCE));
+        assert!(t.observe(
+            AgentState::Idle,
+            t0 + Duration::from_millis(200) + IDLE_DEBOUNCE
+        ));
         // ...and lands as done (unseen) until marked seen.
         assert_eq!(t.visual().text, "[done]");
         t.mark_seen();

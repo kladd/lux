@@ -196,7 +196,13 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
                 return;
             };
             if tx
-                .send(ServerEvent::Attach { conn, stream, request, stdin, stdout })
+                .send(ServerEvent::Attach {
+                    conn,
+                    stream,
+                    request,
+                    stdin,
+                    stdout,
+                })
                 .is_err()
             {
                 return;
@@ -240,12 +246,17 @@ impl Server {
     /// preview — has an animated status text to advance.
     fn needs_timed_tick(&self) -> bool {
         self.has_pending_idle()
-            || self.sessions.values().any(|s| s.has_pending_resize_repeat())
+            || self
+                .sessions
+                .values()
+                .any(|s| s.has_pending_resize_repeat())
             || self.clients.values().any(|c| {
                 if c.switcher.is_some() {
                     self.sessions.values().any(|s| s.has_animation())
                 } else {
-                    self.sessions.get(&c.attached).is_some_and(|s| s.has_animation())
+                    self.sessions
+                        .get(&c.attached)
+                        .is_some_and(|s| s.has_animation())
                 }
             })
     }
@@ -268,8 +279,7 @@ impl Server {
                 }
             }
             ServerEvent::PtyExited(tab) => {
-                let Some((&sid, session)) =
-                    self.sessions.iter_mut().find(|(_, s)| s.has_tab(tab))
+                let Some((&sid, session)) = self.sessions.iter_mut().find(|(_, s)| s.has_tab(tab))
                 else {
                     return;
                 };
@@ -277,7 +287,13 @@ impl Server {
                     self.end_session(sid);
                 }
             }
-            ServerEvent::Attach { conn, stream, request, stdin, stdout } => {
+            ServerEvent::Attach {
+                conn,
+                stream,
+                request,
+                stdin,
+                stdout,
+            } => {
                 self.attach(conn, stream, request, stdin, stdout);
             }
             ServerEvent::Ls(mut stream) => {
@@ -300,7 +316,9 @@ impl Server {
             ServerEvent::Resized(conn) => {
                 // Read the real dimensions from the
                 // client's descriptor and resize the attached session.
-                let Some(client) = self.clients.get_mut(&conn) else { return };
+                let Some(client) = self.clients.get_mut(&conn) else {
+                    return;
+                };
                 let size = term::fd_size(&client.raw_out);
                 client.terminal.backend_mut().set_size(size);
                 if let Some(session) = self.sessions.get_mut(&client.attached) {
@@ -379,7 +397,9 @@ impl Server {
             self.detach(old);
         }
 
-        let Ok(raw_out) = stdout_file.try_clone() else { return };
+        let Ok(raw_out) = stdout_file.try_clone() else {
+            return;
+        };
         let mut terminal = match Terminal::new(FdBackend::new(stdout_file, size)) {
             Ok(terminal) => terminal,
             Err(_) => return,
@@ -438,7 +458,9 @@ impl Server {
     /// The client restores its own terminal on
     /// seeing the stream close.
     fn detach(&mut self, conn: ConnId) {
-        let Some(client) = self.clients.remove(&conn) else { return };
+        let Some(client) = self.clients.remove(&conn) else {
+            return;
+        };
         // Stop the stdin reader before dropping our fds so a lingering
         // read can't swallow keystrokes meant for the user's shell.
         client.stdin_stop.store(true, Ordering::Relaxed);
@@ -467,16 +489,22 @@ impl Server {
     }
 
     fn client_input(&mut self, conn: ConnId, bytes: Vec<u8>) {
-        let Some(client) = self.clients.get_mut(&conn) else { return };
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
         let events = client.decoder.decode(&bytes);
         for event in events {
-            let Some(client) = self.clients.get(&conn) else { return };
+            let Some(client) = self.clients.get(&conn) else {
+                return;
+            };
             if client.switcher.is_some() {
                 self.switcher_input(conn, &event);
                 continue;
             }
             let sid = client.attached;
-            let Some(session) = self.sessions.get_mut(&sid) else { continue };
+            let Some(session) = self.sessions.get_mut(&sid) else {
+                continue;
+            };
             let effect = match event {
                 DecodedInput::Key(key) => session.handle_key(key),
                 DecodedInput::Mouse(mouse) => session.handle_mouse(mouse),
@@ -496,11 +524,7 @@ impl Server {
             Effect::Detach => self.detach(conn),
             // Switcher mode is per-connection.
             Effect::OpenSwitcher => {
-                let highlight = self
-                    .sessions
-                    .keys()
-                    .position(|&id| id == sid)
-                    .unwrap_or(0);
+                let highlight = self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
                 if let Some(client) = self.clients.get_mut(&conn) {
                     client.switcher = Some(highlight);
                 }
@@ -529,11 +553,19 @@ impl Server {
     }
 
     fn switcher_input(&mut self, conn: ConnId, event: &DecodedInput) {
-        let DecodedInput::Key(key) = event else { return };
+        let DecodedInput::Key(key) = event else {
+            return;
+        };
         let count = self.sessions.len();
-        let Some(client) = self.clients.get_mut(&conn) else { return };
-        let Some(highlight) = client.switcher else { return };
-        let ctrl = key.modifiers.contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        let Some(highlight) = client.switcher else {
+            return;
+        };
+        let ctrl = key
+            .modifiers
+            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
         match key.code {
             // `k`, Up, or Ctrl-p moves the highlight up, wrapping to the last.
             CtKeyCode::Up | CtKeyCode::Char('k') if !ctrl => {
@@ -544,10 +576,18 @@ impl Server {
             }
             // `j`, Down, or Ctrl-n moves the highlight down, wrapping to the first.
             CtKeyCode::Down | CtKeyCode::Char('j') if !ctrl => {
-                client.switcher = Some(if count == 0 { 0 } else { (highlight + 1) % count });
+                client.switcher = Some(if count == 0 {
+                    0
+                } else {
+                    (highlight + 1) % count
+                });
             }
             CtKeyCode::Char('n') if ctrl => {
-                client.switcher = Some(if count == 0 { 0 } else { (highlight + 1) % count });
+                client.switcher = Some(if count == 0 {
+                    0
+                } else {
+                    (highlight + 1) % count
+                });
             }
             // Back out without changing attachment.
             CtKeyCode::Esc => {
@@ -560,7 +600,9 @@ impl Server {
             // Re-attach the connection to the selection.
             CtKeyCode::Enter => {
                 client.switcher = None;
-                let Some(&target) = self.sessions.keys().nth(highlight) else { return };
+                let Some(&target) = self.sessions.keys().nth(highlight) else {
+                    return;
+                };
                 let current = client.attached;
                 let size = term::fd_size(&client.raw_out);
                 if target != current {
@@ -590,7 +632,9 @@ impl Server {
     /// each pass (their preview is live); attached
     /// sessions render when their state advanced.
     fn render_all(&mut self) {
-        let Server { sessions, clients, .. } = self;
+        let Server {
+            sessions, clients, ..
+        } = self;
         for client in clients.values_mut() {
             if let Some(highlight) = client.switcher {
                 render_switcher(client, sessions, highlight);
@@ -626,7 +670,9 @@ fn render_switcher(
                 break;
             }
             let style = if i == highlight {
-                Style::default().fg(Color::Green).add_modifier(Modifier::REVERSED)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
@@ -688,13 +734,19 @@ fn spawn_stdin_reader(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            let mut fds = [rustix::event::PollFd::new(&stdin, rustix::event::PollFlags::IN)];
+            let mut fds = [rustix::event::PollFd::new(
+                &stdin,
+                rustix::event::PollFlags::IN,
+            )];
             match rustix::event::poll(&mut fds, 25) {
                 Ok(0) => continue,
                 Ok(_) => match rustix::io::read(&stdin, &mut buf) {
                     Ok(0) | Err(_) => return,
                     Ok(n) => {
-                        if tx.send(ServerEvent::Input(conn, buf[..n].to_vec())).is_err() {
+                        if tx
+                            .send(ServerEvent::Input(conn, buf[..n].to_vec()))
+                            .is_err()
+                        {
                             return;
                         }
                     }

@@ -85,10 +85,12 @@ mod tests {
         // Far from the band, the base color is untouched; as the band
         // reaches a cell its color lifts toward white, so two instants a
         // quarter-period apart style some cell differently.
-        let a: Vec<Color> =
-            (0..len).map(|i| shimmer(Color::Yellow, i, len, Duration::ZERO)).collect();
-        let b: Vec<Color> =
-            (0..len).map(|i| shimmer(Color::Yellow, i, len, Duration::from_millis(500))).collect();
+        let a: Vec<Color> = (0..len)
+            .map(|i| shimmer(Color::Yellow, i, len, Duration::ZERO))
+            .collect();
+        let b: Vec<Color> = (0..len)
+            .map(|i| shimmer(Color::Yellow, i, len, Duration::from_millis(500)))
+            .collect();
         assert_ne!(a, b, "the band must move");
     }
 
@@ -107,7 +109,10 @@ mod tests {
     fn breathe_pulses_between_dim_and_full() {
         // Phase 0 is the dim end, half-period the full state color.
         assert_eq!(breathe(Color::Red, Duration::ZERO), Color::Rgb(68, 0, 0));
-        assert_eq!(breathe(Color::Red, Duration::from_secs(1)), Color::Rgb(205, 0, 0));
+        assert_eq!(
+            breathe(Color::Red, Duration::from_secs(1)),
+            Color::Rgb(205, 0, 0)
+        );
         assert_eq!(
             breathe(Color::Red, Duration::from_millis(500)),
             breathe(Color::Red, Duration::from_millis(1500)),

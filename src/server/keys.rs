@@ -102,7 +102,10 @@ impl KeyMatch {
 }
 
 /// Ctrl-b is the default prefix key.
-pub const DEFAULT_PREFIX: KeyMatch = KeyMatch { code: CtKeyCode::Char('b'), ctrl: true };
+pub const DEFAULT_PREFIX: KeyMatch = KeyMatch {
+    code: CtKeyCode::Char('b'),
+    ctrl: true,
+};
 
 /// One entry in the keybinding tree: a key resolves to
 /// either a command or a deeper node of further bindings, forming a
@@ -136,13 +139,19 @@ pub struct KeyTrieNode {
 impl KeyTrieNode {
     /// The table's root: no key enters it, so it carries no description.
     pub fn root(bindings: Vec<(KeyMatch, KeyTrie)>) -> Self {
-        Self { description: "", bindings }
+        Self {
+            description: "",
+            bindings,
+        }
     }
 
     /// The entry bound to `key` at this node. `None` means the pending
     /// sequence dead-ends and is discarded.
     pub fn get(&self, key: KeyMatch) -> Option<&KeyTrie> {
-        self.bindings.iter().find(|(k, _)| *k == key).map(|(_, t)| t)
+        self.bindings
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, t)| t)
     }
 
     /// The key-hint popup's rows for this node, at whichever
@@ -179,7 +188,10 @@ impl Default for KeyTable {
     /// the detach stub, the session switcher, and the ex command line.
     fn default() -> Self {
         fn plain(c: char) -> KeyMatch {
-            KeyMatch { code: CtKeyCode::Char(c), ctrl: false }
+            KeyMatch {
+                code: CtKeyCode::Char(c),
+                ctrl: false,
+            }
         }
         fn cmd(c: char, command: Command) -> (KeyMatch, KeyTrie) {
             (plain(c), KeyTrie::Command(command))
@@ -236,7 +248,10 @@ impl Default for KeyTable {
             let c = char::from_digit(d, 10).expect("single digit");
             bindings.push(cmd(c, Command::SelectTab(d as usize)));
         }
-        Self { prefix: DEFAULT_PREFIX, root: KeyTrieNode::root(bindings) }
+        Self {
+            prefix: DEFAULT_PREFIX,
+            root: KeyTrieNode::root(bindings),
+        }
     }
 }
 
@@ -279,7 +294,10 @@ fn key_group_label(keys: &[KeyMatch]) -> String {
             return format!("{}-{}", chars[0], chars[chars.len() - 1]);
         }
     }
-    keys.iter().map(|k| k.label()).collect::<Vec<_>>().join(", ")
+    keys.iter()
+        .map(|k| k.label())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -309,18 +327,36 @@ mod tests {
             lookup(&table, key(CtKeyCode::Char('h'), KeyModifiers::NONE)),
             Some(Command::FocusDir(Dir::Left))
         );
-        assert_eq!(lookup(&table, key(CtKeyCode::Char('H'), KeyModifiers::SHIFT)), None);
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('H'), KeyModifiers::SHIFT)),
+            None
+        );
         // No Ctrl chords remain in the default table.
-        assert_eq!(lookup(&table, key(CtKeyCode::Char('h'), KeyModifiers::CONTROL)), None);
-        assert_eq!(lookup(&table, key(CtKeyCode::Backspace, KeyModifiers::CONTROL)), None);
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('h'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Backspace, KeyModifiers::CONTROL)),
+            None
+        );
     }
 
     #[test]
     fn unrecognized_sequences_map_to_none() {
         let table = KeyTable::default();
-        assert_eq!(lookup(&table, key(CtKeyCode::Char('x'), KeyModifiers::NONE)), None);
-        assert_eq!(lookup(&table, key(CtKeyCode::Char('%'), KeyModifiers::CONTROL)), None);
-        assert_eq!(lookup(&table, key(CtKeyCode::Esc, KeyModifiers::NONE)), None);
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('x'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('%'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Esc, KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]
@@ -360,7 +396,10 @@ mod tests {
                 Some(Command::SelectTab(d as usize))
             );
         }
-        assert_eq!(lookup(&table, key(CtKeyCode::Char('3'), KeyModifiers::CONTROL)), None);
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('3'), KeyModifiers::CONTROL)),
+            None
+        );
     }
 
     #[test]
@@ -377,13 +416,24 @@ mod tests {
         // M resolves to a node, not a command, and
         // its submap binds exactly the four vim directions.
         let table = KeyTable::default();
-        let plain = |c| KeyMatch { code: CtKeyCode::Char(c), ctrl: false };
+        let plain = |c| KeyMatch {
+            code: CtKeyCode::Char(c),
+            ctrl: false,
+        };
         let Some(KeyTrie::Node(node)) = table.root.get(plain('m')) else {
             panic!("m is not a chord node");
         };
         assert_eq!(node.description, "move tab to window");
-        for (c, dir) in [('h', Dir::Left), ('j', Dir::Down), ('k', Dir::Up), ('l', Dir::Right)] {
-            assert_eq!(node.get(plain(c)), Some(&KeyTrie::Command(Command::MoveTabDir(dir))));
+        for (c, dir) in [
+            ('h', Dir::Left),
+            ('j', Dir::Down),
+            ('k', Dir::Up),
+            ('l', Dir::Right),
+        ] {
+            assert_eq!(
+                node.get(plain(c)),
+                Some(&KeyTrie::Command(Command::MoveTabDir(dir)))
+            );
         }
         // Any other key dead-ends inside the node.
         assert_eq!(node.get(plain('x')), None);
@@ -396,13 +446,24 @@ mod tests {
         // R resolves to the resize submap, binding exactly the four vim
         // directions.
         let table = KeyTable::default();
-        let plain = |c| KeyMatch { code: CtKeyCode::Char(c), ctrl: false };
+        let plain = |c| KeyMatch {
+            code: CtKeyCode::Char(c),
+            ctrl: false,
+        };
         let Some(KeyTrie::Node(node)) = table.root.get(plain('r')) else {
             panic!("r is not a chord node");
         };
         assert_eq!(node.description, "resize window");
-        for (c, dir) in [('h', Dir::Left), ('j', Dir::Down), ('k', Dir::Up), ('l', Dir::Right)] {
-            assert_eq!(node.get(plain(c)), Some(&KeyTrie::Command(Command::ResizeDir(dir))));
+        for (c, dir) in [
+            ('h', Dir::Left),
+            ('j', Dir::Down),
+            ('k', Dir::Up),
+            ('l', Dir::Right),
+        ] {
+            assert_eq!(
+                node.get(plain(c)),
+                Some(&KeyTrie::Command(Command::ResizeDir(dir)))
+            );
         }
         assert_eq!(node.get(plain('r')), None);
         assert_eq!(node.bindings.len(), 4);
@@ -411,7 +472,10 @@ mod tests {
     #[test]
     fn node_at_walks_the_pending_path() {
         let table = KeyTable::default();
-        let plain = |c| KeyMatch { code: CtKeyCode::Char(c), ctrl: false };
+        let plain = |c| KeyMatch {
+            code: CtKeyCode::Char(c),
+            ctrl: false,
+        };
         // The empty path is the root (a bare prefix press).
         assert_eq!(
             table.node_at(&[]).expect("root").bindings.len(),
@@ -431,13 +495,21 @@ mod tests {
         // While a chord is pending the popup's rows come
         // from the pending node, not the root.
         let table = KeyTable::default();
-        let m = KeyMatch { code: CtKeyCode::Char('m'), ctrl: false };
+        let m = KeyMatch {
+            code: CtKeyCode::Char('m'),
+            ctrl: false,
+        };
         let rows = table.node_at(&[m]).expect("m node").hints();
         assert_eq!(rows.len(), 4);
         assert!(rows.contains(&("h".to_string(), "move tab left")));
         assert!(rows.contains(&("l".to_string(), "move tab right")));
         // The root's rows include the node entry itself.
-        assert!(table.root.hints().contains(&("m".to_string(), "move tab to window")));
+        assert!(
+            table
+                .root
+                .hints()
+                .contains(&("m".to_string(), "move tab to window"))
+        );
     }
 
     #[test]
@@ -448,7 +520,10 @@ mod tests {
         // including node descriptions — is blank).
         fn check(node: &KeyTrieNode) {
             for (_, trie) in &node.bindings {
-                assert!(!trie.description().is_empty(), "{trie:?} has no description");
+                assert!(
+                    !trie.description().is_empty(),
+                    "{trie:?} has no description"
+                );
                 if let KeyTrie::Node(node) = trie {
                     check(node);
                 }
@@ -488,12 +563,21 @@ mod tests {
         assert!(rows.contains(&("0-9".to_string(), "select tab by index")));
         assert!(rows.contains(&("%".to_string(), "split side by side")));
         // Ctrl chords label with the config file's C- syntax.
-        let ctrl = KeyMatch { code: CtKeyCode::Char('x'), ctrl: true };
+        let ctrl = KeyMatch {
+            code: CtKeyCode::Char('x'),
+            ctrl: true,
+        };
         assert_eq!(ctrl.label(), "C-x");
         // Two keys on one description join with a comma, not a range.
         let pair = [
-            KeyMatch { code: CtKeyCode::Char('a'), ctrl: false },
-            KeyMatch { code: CtKeyCode::Char('b'), ctrl: false },
+            KeyMatch {
+                code: CtKeyCode::Char('a'),
+                ctrl: false,
+            },
+            KeyMatch {
+                code: CtKeyCode::Char('b'),
+                ctrl: false,
+            },
         ];
         assert_eq!(key_group_label(&pair), "a, b");
     }

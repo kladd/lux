@@ -73,7 +73,10 @@ fn parse_key_spec(spec: &str) -> Option<KeyMatch> {
     if chars.next().is_some() {
         return None;
     }
-    Some(KeyMatch { code: CtKeyCode::Char(c), ctrl })
+    Some(KeyMatch {
+        code: CtKeyCode::Char(c),
+        ctrl,
+    })
 }
 
 #[cfg(test)]
@@ -102,14 +105,29 @@ mod tests {
     #[test]
     fn configured_prefix_replaces_default() {
         let t = table("prefix = \"C-a\"");
-        assert_eq!(t.prefix, KeyMatch { code: CtKeyCode::Char('a'), ctrl: true });
+        assert_eq!(
+            t.prefix,
+            KeyMatch {
+                code: CtKeyCode::Char('a'),
+                ctrl: true
+            }
+        );
     }
 
     #[test]
     fn invalid_prefix_keeps_default() {
-        assert_eq!(table("prefix = \"C-\"").prefix, crate::server::keys::DEFAULT_PREFIX);
-        assert_eq!(table("prefix = \"abc\"").prefix, crate::server::keys::DEFAULT_PREFIX);
-        assert_eq!(table("prefix = 5").prefix, crate::server::keys::DEFAULT_PREFIX);
+        assert_eq!(
+            table("prefix = \"C-\"").prefix,
+            crate::server::keys::DEFAULT_PREFIX
+        );
+        assert_eq!(
+            table("prefix = \"abc\"").prefix,
+            crate::server::keys::DEFAULT_PREFIX
+        );
+        assert_eq!(
+            table("prefix = 5").prefix,
+            crate::server::keys::DEFAULT_PREFIX
+        );
     }
 
     #[test]
@@ -117,6 +135,12 @@ mod tests {
         // Per-command keybinding overrides are prohibited: a `[keys]` table changes nothing.
         let t = table("prefix = \"C-a\"\n[keys]\nnew-tab = \"t\"");
         assert_eq!(t.root, KeyTable::default().root);
-        assert_eq!(t.prefix, KeyMatch { code: CtKeyCode::Char('a'), ctrl: true });
+        assert_eq!(
+            t.prefix,
+            KeyMatch {
+                code: CtKeyCode::Char('a'),
+                ctrl: true
+            }
+        );
     }
 }

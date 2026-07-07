@@ -62,7 +62,11 @@ impl InputDecoder {
                 let alt = i > start && bytes[i - 1] == 0x1b;
                 let seg_end = if alt { i - 1 } else { i };
                 self.parse_into(&bytes[start..seg_end], &mut out);
-                let mods = if alt { CtMods::CONTROL | CtMods::ALT } else { CtMods::CONTROL };
+                let mods = if alt {
+                    CtMods::CONTROL | CtMods::ALT
+                } else {
+                    CtMods::CONTROL
+                };
                 out.push(DecodedInput::Key(KeyEvent::new(CtKeyCode::Char('j'), mods)));
                 start = i + 1;
                 i = start;
@@ -237,7 +241,11 @@ mod tests {
         let codes: Vec<_> = evs.iter().map(|e| e.code).collect();
         assert_eq!(
             codes,
-            vec![CtKeyCode::Char('a'), CtKeyCode::Char('j'), CtKeyCode::Char('b')]
+            vec![
+                CtKeyCode::Char('a'),
+                CtKeyCode::Char('j'),
+                CtKeyCode::Char('b')
+            ]
         );
         // Alt-Ctrl-J arrives ESC-prefixed.
         let evs = keys(&mut d, b"\x1b\n");

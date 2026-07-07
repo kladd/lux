@@ -25,9 +25,7 @@ fn main() {
         }
         // Attach to an existing session. The `attach`
         // verb form is accepted for the same reason.
-        ["-t", name] | ["attach", "-t", name] => {
-            client::attach(Request::Attach((*name).into()))
-        }
+        ["-t", name] | ["attach", "-t", name] => client::attach(Request::Attach((*name).into())),
         ["ls"] => client::ls(),
         ["kill-server"] => client::kill_server(),
         ["__server"] => server::run(),

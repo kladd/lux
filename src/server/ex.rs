@@ -49,7 +49,10 @@ mod tests {
     fn exact_verbs_parse() {
         assert_eq!(parse("vs"), Some(ExCommand::SplitSideBySide));
         assert_eq!(parse("sp"), Some(ExCommand::SplitStacked));
-        assert_eq!(parse("w /tmp/out.txt"), Some(ExCommand::Write("/tmp/out.txt".into())));
+        assert_eq!(
+            parse("w /tmp/out.txt"),
+            Some(ExCommand::Write("/tmp/out.txt".into()))
+        );
         assert_eq!(parse("w   spaced"), Some(ExCommand::Write("spaced".into())));
     }
 

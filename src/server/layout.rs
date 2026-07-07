@@ -57,10 +57,23 @@ pub fn split_areas(kind: SplitKind, ratio: f64, area: Rect) -> (Rect, Rect, Rect
                 return (area, empty, empty);
             }
             let avail = area.width - 1;
-            let first_w = (f64::from(avail) * ratio).round().clamp(1.0, f64::from(avail - 1)) as u16;
-            let first = Rect { width: first_w, ..area };
-            let sep = Rect { x: area.x + first_w, width: 1, ..area };
-            let second = Rect { x: sep.x + 1, width: avail - first_w, ..area };
+            let first_w = (f64::from(avail) * ratio)
+                .round()
+                .clamp(1.0, f64::from(avail - 1)) as u16;
+            let first = Rect {
+                width: first_w,
+                ..area
+            };
+            let sep = Rect {
+                x: area.x + first_w,
+                width: 1,
+                ..area
+            };
+            let second = Rect {
+                x: sep.x + 1,
+                width: avail - first_w,
+                ..area
+            };
             (first, second, sep)
         }
         SplitKind::Stacked => {
@@ -69,9 +82,18 @@ pub fn split_areas(kind: SplitKind, ratio: f64, area: Rect) -> (Rect, Rect, Rect
                 return (area, empty, empty);
             }
             let avail = area.height;
-            let first_h = (f64::from(avail) * ratio).round().clamp(1.0, f64::from(avail - 1)) as u16;
-            let first = Rect { height: first_h, ..area };
-            let second = Rect { y: area.y + first_h, height: avail - first_h, ..area };
+            let first_h = (f64::from(avail) * ratio)
+                .round()
+                .clamp(1.0, f64::from(avail - 1)) as u16;
+            let first = Rect {
+                height: first_h,
+                ..area
+            };
+            let second = Rect {
+                y: area.y + first_h,
+                height: avail - first_h,
+                ..area
+            };
             let empty = Rect::new(area.x, area.y + first_h, 0, 0);
             (first, second, empty)
         }
@@ -193,7 +215,9 @@ pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -
     if avail < 2 {
         return true;
     }
-    let first_size = (f64::from(avail) * s.ratio).round().clamp(1.0, f64::from(avail - 1));
+    let first_size = (f64::from(avail) * s.ratio)
+        .round()
+        .clamp(1.0, f64::from(avail - 1));
     // The boundary moves in `dir`: right/down grow `first`, left/up shrink it.
     let delta = match dir {
         Dir::Right | Dir::Down => 1.0,
@@ -229,12 +253,14 @@ pub fn spatial_neighbor(rects: &[(WindowId, Rect)], from: Rect, dir: Dir) -> Opt
             _ => continue,
         };
         let overlap = match dir {
-            Dir::Left | Dir::Right => {
-                rect.bottom().min(from.bottom()).saturating_sub(rect.top().max(from.top()))
-            }
-            Dir::Up | Dir::Down => {
-                rect.right().min(from.right()).saturating_sub(rect.left().max(from.left()))
-            }
+            Dir::Left | Dir::Right => rect
+                .bottom()
+                .min(from.bottom())
+                .saturating_sub(rect.top().max(from.top())),
+            Dir::Up | Dir::Down => rect
+                .right()
+                .min(from.right())
+                .saturating_sub(rect.left().max(from.left())),
         };
         if overlap == 0 {
             continue;

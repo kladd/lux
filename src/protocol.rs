@@ -115,7 +115,13 @@ pub fn read_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
     let mut byte = [0u8; 1];
     loop {
         match stream.read(&mut byte)? {
-            0 => return Ok(if line.is_empty() { None } else { Some(String::from_utf8_lossy(&line).into_owned()) }),
+            0 => {
+                return Ok(if line.is_empty() {
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(&line).into_owned())
+                });
+            }
             _ => {
                 if byte[0] == b'\n' {
                     return Ok(Some(String::from_utf8_lossy(&line).into_owned()));

@@ -160,7 +160,10 @@ const CHROME_BG: Color = Color::Indexed(235);
 
 /// The local hostname, fixed for the server's lifetime.
 static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    rustix::system::uname().nodename().to_string_lossy().into_owned()
+    rustix::system::uname()
+        .nodename()
+        .to_string_lossy()
+        .into_owned()
 });
 
 /// Per-frame session status line chrome, absent
@@ -268,7 +271,9 @@ impl Session {
     }
 
     pub fn has_tab(&self, id: TabId) -> bool {
-        self.windows.values().any(|w| w.tabs.iter().any(|t| t.id == id))
+        self.windows
+            .values()
+            .any(|w| w.tabs.iter().any(|t| t.id == id))
     }
 
     /// Advance the owning engine with PTY output, whether or
@@ -362,7 +367,10 @@ impl Session {
             }
             // Every recognized sequence
             // dispatches through the single, server-side keybinding table.
-            let node = self.keys.node_at(&path).expect("pending chord path resolves to a node");
+            let node = self
+                .keys
+                .node_at(&path)
+                .expect("pending chord path resolves to a node");
             match node.get(KeyMatch::from_event(key)) {
                 // A command at any depth dispatches and
                 // ends the sequence — except a resize, which holds its
@@ -480,7 +488,11 @@ impl Session {
                     // Anchor a selection.
                     CtMouseButton::Left if content.contains(pos) => {
                         let cell = clamp_to_content(pos, content);
-                        self.selection = Some(Selection { window: id, start: cell, end: cell });
+                        self.selection = Some(Selection {
+                            window: id,
+                            start: cell,
+                            end: cell,
+                        });
                         self.force_redraw = true;
                     }
                     // With a selection, right-click yanks;
@@ -536,7 +548,11 @@ impl Session {
                 // Focus, enter scroll mode, scroll 3 lines.
                 self.focus = id;
                 tab.enter_scroll_mode();
-                let delta = if mouse.kind == CtMouseKind::ScrollUp { -3 } else { 3 };
+                let delta = if mouse.kind == CtMouseKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                };
                 // Wheeling down to the live bottom resumes following
                 // (entering scroll mode just to sit at the tail would trap
                 // accidental wheel-downs).
@@ -551,7 +567,10 @@ impl Session {
     }
 
     fn window_at(&self, pos: Position) -> Option<WindowId> {
-        self.windows.values().find(|w| w.rect.contains(pos)).map(|w| w.id)
+        self.windows
+            .values()
+            .find(|w| w.rect.contains(pos))
+            .map(|w| w.id)
     }
 
     /// Yank the selected text and clear the selection;
@@ -688,7 +707,11 @@ impl Session {
         }
         // The grid's blank tail rows aren't content.
         let trimmed = out.trim_end_matches('\n');
-        let out = if trimmed.is_empty() { String::new() } else { format!("{trimmed}\n") };
+        let out = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        };
         let _ = std::fs::write(expand_tilde(path), out);
     }
 
@@ -723,7 +746,10 @@ impl Session {
     /// Append a new tab to the focused window's list and make
     /// it active.
     fn new_tab(&mut self) {
-        let win = self.windows.get_mut(&self.focus).expect("focused window exists");
+        let win = self
+            .windows
+            .get_mut(&self.focus)
+            .expect("focused window exists");
         // The new shell starts in the working directory of
         // the tab that was active until now.
         let cwd = win.active_tab().working_dir();
@@ -742,7 +768,10 @@ impl Session {
     /// Cycle the focused window's active tab, wrapping in
     /// either direction.
     fn cycle_tab(&mut self, step: isize) {
-        let win = self.windows.get_mut(&self.focus).expect("focused window exists");
+        let win = self
+            .windows
+            .get_mut(&self.focus)
+            .expect("focused window exists");
         let len = win.tabs.len() as isize;
         win.active = (win.active as isize + step).rem_euclid(len) as usize;
         self.drop_selection_in(self.focus);
@@ -753,7 +782,10 @@ impl Session {
     /// Make the focused window's tab at `index` active; an
     /// out-of-range index is discarded silently.
     fn select_tab(&mut self, index: usize) {
-        let win = self.windows.get_mut(&self.focus).expect("focused window exists");
+        let win = self
+            .windows
+            .get_mut(&self.focus)
+            .expect("focused window exists");
         if index >= win.tabs.len() || index == win.active {
             return;
         }
@@ -785,8 +817,7 @@ impl Session {
     /// Move focus to the window spatially adjacent in `dir`;
     /// at a screen edge focus stays put.
     fn focus_dir(&mut self, dir: Dir) {
-        let rects: Vec<(WindowId, Rect)> =
-            self.windows.values().map(|w| (w.id, w.rect)).collect();
+        let rects: Vec<(WindowId, Rect)> = self.windows.values().map(|w| (w.id, w.rect)).collect();
         let from = self.windows[&self.focus].rect;
         if let Some(id) = layout::spatial_neighbor(&rects, from, dir) {
             self.focus = id;
@@ -800,15 +831,17 @@ impl Session {
     /// moved tab, keeping exactly one focused window
     /// whether or not the source window survives.
     fn move_tab_dir(&mut self, dir: Dir) {
-        let rects: Vec<(WindowId, Rect)> =
-            self.windows.values().map(|w| (w.id, w.rect)).collect();
+        let rects: Vec<(WindowId, Rect)> = self.windows.values().map(|w| (w.id, w.rect)).collect();
         let from = self.windows[&self.focus].rect;
         // No adjacent window — discard, move nothing.
         let Some(dest) = layout::spatial_neighbor(&rects, from, dir) else {
             return;
         };
         let source = self.focus;
-        let win = self.windows.get_mut(&source).expect("focused window exists");
+        let win = self
+            .windows
+            .get_mut(&source)
+            .expect("focused window exists");
         let tab = win.tabs.remove(win.active);
         if win.active == win.tabs.len() && win.active > 0 {
             win.active -= 1;
@@ -867,7 +900,11 @@ impl Session {
         let win = self.windows.get_mut(&win_id).expect("window exists");
         if win.tabs.len() > 1 {
             // Prune the tab and keep the window on a live one.
-            let idx = win.tabs.iter().position(|t| t.id == id).expect("tab exists");
+            let idx = win
+                .tabs
+                .iter()
+                .position(|t| t.id == id)
+                .expect("tab exists");
             let active_exited = idx == win.active;
             let mut tab = win.tabs.remove(idx);
             tab.wait();
@@ -919,9 +956,11 @@ impl Session {
     /// animation advances without waiting on PTY output.
     pub fn has_animation(&self) -> bool {
         self.windows.values().any(|w| {
-            w.tabs
-                .iter()
-                .any(|t| t.agent.as_ref().is_some_and(|a| a.visual().anim != Anim::None))
+            w.tabs.iter().any(|t| {
+                t.agent
+                    .as_ref()
+                    .is_some_and(|a| a.visual().anim != Anim::None)
+            })
         })
     }
 
@@ -967,7 +1006,9 @@ impl Session {
         let (rects, separators) = layout::compute(&self.tree, tree_area(self.area));
         let mut chrome = Vec::with_capacity(rects.len());
         for (id, rect) in rects {
-            let Some(win) = self.windows.get_mut(&id) else { continue };
+            let Some(win) = self.windows.get_mut(&id) else {
+                continue;
+            };
             win.rect = rect;
             win.reconcile();
             // The focused window's displayed tab counts as
@@ -1015,8 +1056,8 @@ impl Session {
         let ex = self.compute_ex_chrome();
         // The reserved bottom row, unless the command
         // line owns it this frame.
-        let status = (ex.is_none() && self.area.height > 0 && self.area.width > 0)
-            .then(|| StatusChrome {
+        let status =
+            (ex.is_none() && self.area.height > 0 && self.area.width > 0).then(|| StatusChrome {
                 row: Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1),
                 name: self.name.clone(),
                 host: HOSTNAME.clone(),
@@ -1055,7 +1096,11 @@ impl Session {
             w,
             h,
         ));
-        Some(HintChrome { rect, key_width, rows })
+        Some(HintChrome {
+            rect,
+            key_width,
+            rows,
+        })
     }
 
     /// Geometry for the open command line: the bottom row and
@@ -1204,7 +1249,11 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
     // One thin rule weight; brightness signals focus.
     // Focused inherits the terminal's default foreground rather than
     // hardcoding white.
-    let rule = Style::default().fg(if focused { Color::Reset } else { Color::DarkGray });
+    let rule = Style::default().fg(if focused {
+        Color::Reset
+    } else {
+        Color::DarkGray
+    });
     // Two cells of rule anchor the bar's left edge.
     for _ in 0..2 {
         if !put(&mut x, '─', rule) {
@@ -1268,7 +1317,9 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         let label = " scroll ";
         let len = label.len() as u16;
         if bar.width >= len && bar.right() - len >= indicators_end {
-            let style = Style::default().fg(Color::Yellow).add_modifier(Modifier::REVERSED);
+            let style = Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::REVERSED);
             let start = bar.right() - len;
             for (i, ch) in label.chars().enumerate() {
                 if let Some(dst) = buf.cell_mut(Position::new(start + i as u16, bar.y)) {
@@ -1357,7 +1408,9 @@ fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
     let border = fill.fg(Color::DarkGray);
     for y in rect.top()..rect.bottom() {
         for x in rect.left()..rect.right() {
-            let Some(dst) = buf.cell_mut(Position::new(x, y)) else { continue };
+            let Some(dst) = buf.cell_mut(Position::new(x, y)) else {
+                continue;
+            };
             let on_top = y == rect.top();
             let on_bottom = y == rect.bottom() - 1;
             let on_left = x == rect.left();
@@ -1388,7 +1441,11 @@ fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
         for (x, (j, ch)) in (rect.x + 2..rect.right() - 2).zip(text.chars().enumerate()) {
             if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
                 dst.set_char(ch);
-                dst.set_style(if (j as u16) < styled { keys_style } else { desc_style });
+                dst.set_style(if (j as u16) < styled {
+                    keys_style
+                } else {
+                    desc_style
+                });
             }
         }
     }

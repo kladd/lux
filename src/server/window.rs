@@ -124,7 +124,11 @@ impl Foreground {
     /// The tab's display name: argv[0]'s basename, with
     /// comm covering processes that rewrite their argv.
     fn display_name(&self) -> &str {
-        if self.arg0.is_empty() { &self.comm } else { &self.arg0 }
+        if self.arg0.is_empty() {
+            &self.comm
+        } else {
+            &self.arg0
+        }
     }
 }
 
@@ -182,7 +186,10 @@ impl Tab {
                     // EOF or EIO: child side of the PTY closed.
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if tx.send(ServerEvent::PtyOutput(id, buf[..n].to_vec())).is_err() {
+                        if tx
+                            .send(ServerEvent::PtyOutput(id, buf[..n].to_vec()))
+                            .is_err()
+                        {
                             return;
                         }
                     }
@@ -266,7 +273,10 @@ impl Tab {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        Some(Foreground { comm: comm.trim().to_string(), arg0 })
+        Some(Foreground {
+            comm: comm.trim().to_string(),
+            arg0,
+        })
     }
 
     /// The foreground process's working directory, via the
@@ -371,7 +381,10 @@ mod tests {
     use super::*;
 
     fn fg(comm: &str, arg0: &str) -> Foreground {
-        Foreground { comm: comm.into(), arg0: arg0.into() }
+        Foreground {
+            comm: comm.into(),
+            arg0: arg0.into(),
+        }
     }
 
     #[test]
