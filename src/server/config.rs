@@ -1,10 +1,12 @@
-//! Config file loading (Phase 6): a TOML file overriding the prefix key.
-//! The keybinding table itself is hardcoded and non-configurable.
-//! No other settings, and no live reloading.
+//! Config file loading (Phase 6): a TOML file overriding the prefix key
+//! and the session-restore toggle. The keybinding table
+//! itself is hardcoded and non-configurable. No other settings, and no
+//! live reloading.
 //!
 //! ```toml
 //! # ~/.config/lux/config.toml
-//! prefix = "C-a"   # "C-" prefix means Ctrl is held
+//! prefix = "C-a"    # "C-" prefix means Ctrl is held
+//! restore = false   # skip restoring persisted sessions at startup
 //! ```
 //!
 //! The key spec is a single character, optionally prefixed with `C-`.
@@ -14,6 +16,24 @@ use std::path::PathBuf;
 use ratatui::crossterm::event::KeyCode as CtKeyCode;
 
 use crate::server::keys::{KeyMatch, KeyTable};
+
+/// The loaded settings. Every field has a default, so a missing or
+/// broken config file still yields a working server.
+pub struct Config {
+    pub keys: KeyTable,
+    /// Whether the server restores persisted session state at startup;
+    /// saving is unconditional either way. Absent means restore.
+    pub restore: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            keys: KeyTable::default(),
+            restore: true,
+        }
+    }
+}
 
 /// `$XDG_CONFIG_HOME/lux/config.toml`, falling back to
 /// `~/.config/lux/config.toml`.
@@ -25,41 +45,47 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("lux").join("config.toml"))
 }
 
-/// Load the key table at startup. Every failure path
+/// Load the settings at startup. Every failure path
 /// falls back to the hardcoded defaults.
-pub fn load() -> KeyTable {
+pub fn load() -> Config {
     let Some(path) = config_path() else {
-        return KeyTable::default();
+        return Config::default();
     };
     match std::fs::read_to_string(&path) {
         // No config file is not an error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => KeyTable::default(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(err) => {
             eprintln!("lux: {}: {err}", path.display());
-            KeyTable::default()
+            Config::default()
         }
         Ok(text) => from_toml(&text, &path.display().to_string()),
     }
 }
 
-fn from_toml(text: &str, origin: &str) -> KeyTable {
+fn from_toml(text: &str, origin: &str) -> Config {
     let doc: toml::Table = match toml::from_str(text) {
         Ok(doc) => doc,
         Err(err) => {
             // Report the parse error, run on defaults.
             eprintln!("lux: {origin}: {err}");
-            return KeyTable::default();
+            return Config::default();
         }
     };
-    let mut table = KeyTable::default();
+    let mut config = Config::default();
     if let Some(value) = doc.get("prefix") {
         match value.as_str().and_then(parse_key_spec) {
             // The configured prefix replaces the default.
-            Some(key) => table.prefix = key,
+            Some(key) => config.keys.prefix = key,
             None => eprintln!("lux: {origin}: invalid prefix key {value}"),
         }
     }
-    table
+    if let Some(value) = doc.get("restore") {
+        match value.as_bool() {
+            Some(restore) => config.restore = restore,
+            None => eprintln!("lux: {origin}: invalid restore value {value}"),
+        }
+    }
+    config
 }
 
 /// A single character, optionally prefixed with `C-` for Ctrl.
@@ -84,7 +110,7 @@ mod tests {
     use super::*;
 
     fn table(text: &str) -> KeyTable {
-        from_toml(text, "test")
+        from_toml(text, "test").keys
     }
 
     #[test]
@@ -93,6 +119,7 @@ mod tests {
         let d = KeyTable::default();
         assert_eq!(t.prefix, d.prefix);
         assert_eq!(t.root, d.root);
+        assert!(from_toml("", "test").restore);
     }
 
     #[test]
@@ -100,6 +127,16 @@ mod tests {
         let t = table("prefix = [broken");
         assert_eq!(t.prefix, crate::server::keys::DEFAULT_PREFIX);
         assert_eq!(t.root, KeyTable::default().root);
+    }
+
+    #[test]
+    fn restore_option_parses_and_defaults_on() {
+        // Absent means restore.
+        assert!(from_toml("prefix = \"C-a\"", "test").restore);
+        assert!(!from_toml("restore = false", "test").restore);
+        assert!(from_toml("restore = true", "test").restore);
+        // A non-boolean value keeps the default.
+        assert!(from_toml("restore = \"no\"", "test").restore);
     }
 
     #[test]

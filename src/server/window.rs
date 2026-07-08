@@ -83,6 +83,45 @@ impl Window {
         }
     }
 
+    /// Rebuild a window from its persisted snapshot: a fresh shell per
+    /// tab in its saved working directory, or a resumed Claude Code
+    /// session where one was saved. Tabs that fail to spawn are dropped;
+    /// a window left with no tabs is `None`.
+    pub fn restore(
+        rect: Rect,
+        snap: &crate::server::persist::WindowSnapshot,
+        tx: &Sender<ServerEvent>,
+    ) -> Option<Self> {
+        let content = content_rect(rect);
+        let mut tabs = Vec::new();
+        for tab in &snap.tabs {
+            // A saved directory that no longer exists falls back to the
+            // server's own, rather than losing the tab.
+            let cwd = tab.cwd.is_dir().then(|| tab.cwd.clone());
+            let spawned = match &tab.claude_session {
+                // A failed resume spawn still gets its shell back.
+                Some(session) => {
+                    Tab::spawn_claude_resume(content, cwd.clone(), session, tx.clone())
+                        .or_else(|_| Tab::spawn(content, cwd, tx.clone()))
+                }
+                None => Tab::spawn(content, cwd, tx.clone()),
+            };
+            if let Ok(tab) = spawned {
+                tabs.push(tab);
+            }
+        }
+        if tabs.is_empty() {
+            return None;
+        }
+        let active = snap.active.min(tabs.len() - 1);
+        Some(Self {
+            id: snap.id,
+            rect,
+            tabs,
+            active,
+        })
+    }
+
     /// Bring every tab's PTY and engine in sync with the window's current
     /// rectangle (across all of this window's tabs, so
     /// no tab is stale when it later becomes active).
@@ -167,11 +206,31 @@ impl Tab {
         cwd: Option<std::path::PathBuf>,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        Self::spawn_argv(rect, cwd, &[&shell], tx)
+    }
+
+    /// Spawn `claude --resume <session>` in place of the shell, picking a
+    /// persisted Claude Code session back up.
+    pub fn spawn_claude_resume(
+        rect: Rect,
+        cwd: Option<std::path::PathBuf>,
+        session: &str,
+        tx: Sender<ServerEvent>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_argv(rect, cwd, &["claude", "--resume", session], tx)
+    }
+
+    fn spawn_argv(
+        rect: Rect,
+        cwd: Option<std::path::PathBuf>,
+        argv: &[&str],
+        tx: Sender<ServerEvent>,
+    ) -> anyhow::Result<Self> {
         let id = NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pty = native_pty_system();
         let pair = pty.openpty(pty_size(rect)).context("open PTY")?;
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = CommandBuilder::from_argv(argv.iter().map(|arg| (*arg).into()).collect());
         // The engine speaks xterm's protocol regardless of the host terminal.
         cmd.env("TERM", "xterm-256color");
         if let Some(dir) = cwd {
@@ -213,11 +272,11 @@ impl Tab {
         );
 
         // Until the first foreground read, the name is the spawned
-        // shell's.
-        let name = std::path::Path::new(&shell)
+        // command's.
+        let name = std::path::Path::new(argv[0])
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| shell.clone());
+            .unwrap_or_else(|| argv[0].to_string());
 
         Ok(Self {
             id,

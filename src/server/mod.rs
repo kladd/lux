@@ -12,6 +12,7 @@ pub mod ex;
 pub mod input;
 pub mod keys;
 pub mod layout;
+pub mod persist;
 pub mod session;
 pub mod term;
 pub mod window;
@@ -108,7 +109,8 @@ pub fn run() -> i32 {
 
     // The keybinding table lives server-side; config is
     // loaded here.
-    let keys = Arc::new(config::load());
+    let config = config::load();
+    let keys = Arc::new(config.keys);
     let (tx, rx) = mpsc::channel::<ServerEvent>();
 
     let accept_tx = tx.clone();
@@ -127,8 +129,17 @@ pub fn run() -> i32 {
         keys,
         clipboard: arboard::Clipboard::new().ok(),
         next_session_id: 0,
+        save_deadline: None,
+        last_saved: None,
         tx,
     };
+    // Bring back every persisted session before any client
+    // attaches; disabled restore starts empty, as if no state existed.
+    if config.restore
+        && let Some(snapshot) = persist::load()
+    {
+        server.restore_sessions(&snapshot);
+    }
     loop {
         // While an idle debounce is pending or an
         // attached client is showing an animated status text, wake on a
@@ -158,9 +169,14 @@ pub fn run() -> i32 {
             }
         }
         server.tick_agents();
+        server.tick_save();
         server.render_all();
     }
 }
+
+/// How long after a state-changing event the automatic save runs,
+/// coalescing bursts (keystrokes, streaming output) into one write.
+const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Time until the next wall-clock minute boundary. Sub-second
 /// truncation lands the wake just past the boundary, never before it.
@@ -231,6 +247,11 @@ struct Server {
     keys: Arc<KeyTable>,
     clipboard: Option<arboard::Clipboard>,
     next_session_id: SessionId,
+    /// When the pending automatic save runs; armed by any event that can
+    /// change persisted state.
+    save_deadline: Option<std::time::Instant>,
+    /// The last snapshot written, to skip writes when nothing changed.
+    last_saved: Option<String>,
     tx: Sender<ServerEvent>,
 }
 
@@ -241,11 +262,12 @@ impl Server {
 
     /// Whether the event loop should wake on a timer rather than block:
     /// an idle debounce is waiting to commit, a resize submap's repeat
-    /// deadline is armed, or a
+    /// deadline is armed, an automatic save is pending, or a
     /// session some client is viewing — attached or as a live switcher
     /// preview — has an animated status text to advance.
     fn needs_timed_tick(&self) -> bool {
         self.has_pending_idle()
+            || self.save_deadline.is_some()
             || self
                 .sessions
                 .values()
@@ -271,7 +293,73 @@ impl Server {
         }
     }
 
+    /// Arm the automatic save; the debounce coalesces event bursts into
+    /// one write.
+    fn mark_dirty(&mut self) {
+        if self.save_deadline.is_none() {
+            self.save_deadline = Some(std::time::Instant::now() + SAVE_DEBOUNCE);
+        }
+    }
+
+    /// Run a pending automatic save whose debounce elapsed.
+    fn tick_save(&mut self) {
+        if self
+            .save_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.save_deadline = None;
+            self.save_sessions();
+        }
+    }
+
+    /// Persist every session's state now, skipping the
+    /// write when nothing changed since the last save.
+    fn save_sessions(&mut self) {
+        let snapshot = persist::StateSnapshot {
+            sessions: self.sessions.values().map(Session::snapshot).collect(),
+        };
+        let Ok(json) = serde_json::to_string_pretty(&snapshot) else {
+            return;
+        };
+        if self.last_saved.as_deref() == Some(&json) {
+            return;
+        }
+        persist::save(&json);
+        self.last_saved = Some(json);
+    }
+
+    /// Recreate every persisted session at startup; clients then attach
+    /// to them by name as usual.
+    fn restore_sessions(&mut self, snapshot: &persist::StateSnapshot) {
+        // No client is attached yet; a plausible size until one is.
+        let area = Rect::new(0, 0, 80, 24);
+        for snap in &snapshot.sessions {
+            if self.session_by_name(&snap.name).is_some() {
+                continue;
+            }
+            let Some(session) = Session::restore(snap, area, self.keys.clone(), self.tx.clone())
+            else {
+                continue;
+            };
+            let sid = self.next_session_id;
+            self.next_session_id += 1;
+            self.sessions.insert(sid, session);
+        }
+    }
+
     fn handle(&mut self, event: ServerEvent) {
+        // Anything a client does, and anything a tab's process does, can
+        // change persisted state; connection lifecycle and reads can't.
+        match event {
+            ServerEvent::PtyOutput(..)
+            | ServerEvent::PtyExited(_)
+            | ServerEvent::Attach { .. }
+            | ServerEvent::Input(..) => self.mark_dirty(),
+            ServerEvent::Ls(_)
+            | ServerEvent::Kill(_)
+            | ServerEvent::Resized(_)
+            | ServerEvent::ConnGone(_) => {}
+        }
         match event {
             ServerEvent::PtyOutput(tab, bytes) => {
                 if let Some(session) = self.sessions.values_mut().find(|s| s.has_tab(tab)) {
@@ -304,7 +392,9 @@ impl Server {
             }
             ServerEvent::Kill(mut stream) => {
                 // End every session, disconnect every
-                // client, terminate.
+                // client, terminate. A final save first, so the killed
+                // sessions restore when the server next starts.
+                self.save_sessions();
                 let _ = protocol::write_line(&mut stream, "ok");
                 let conns: Vec<ConnId> = self.clients.keys().copied().collect();
                 for conn in conns {

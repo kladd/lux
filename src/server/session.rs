@@ -32,6 +32,7 @@ use crate::server::anim::{self, Anim};
 use crate::server::ex::{self, ExCommand};
 use crate::server::keys::{Command, KeyMatch, KeyTable, KeyTrie};
 use crate::server::layout::{self, Dir, Node, Separator, SplitKind, WindowId};
+use crate::server::persist;
 use crate::server::term::FdBackend;
 use crate::server::window::{Tab, TabId, Window};
 
@@ -303,6 +304,113 @@ impl Session {
             force_redraw: true,
             tx,
         })
+    }
+
+    /// Rebuild a session from its persisted snapshot: the saved layout
+    /// tree and tab lists, each tab getting a fresh shell in its saved
+    /// working directory — or a resumed Claude Code session where one was
+    /// saved. Windows whose tabs all fail to spawn collapse out of the
+    /// tree; a session with none left is `None`.
+    pub fn restore(
+        snap: &persist::SessionSnapshot,
+        area: Rect,
+        keys: Arc<KeyTable>,
+        tx: Sender<ServerEvent>,
+    ) -> Option<Self> {
+        let mut tree = Some(persist::restore_node(&snap.tree));
+        // Lay the tree out up front so each window's PTYs spawn at their
+        // final size rather than a placeholder.
+        let rects: HashMap<WindowId, Rect> = layout::compute(tree.as_ref()?, tree_area(area))
+            .0
+            .into_iter()
+            .collect();
+        let mut windows = HashMap::new();
+        for wsnap in &snap.windows {
+            let Some(&rect) = rects.get(&wsnap.id) else {
+                // Not a leaf of the saved tree; nowhere to put it.
+                continue;
+            };
+            if windows.contains_key(&wsnap.id) {
+                continue;
+            }
+            match Window::restore(rect, wsnap, &tx) {
+                Some(win) => {
+                    windows.insert(wsnap.id, win);
+                }
+                None => tree = layout::remove_leaf(tree.take()?, wsnap.id),
+            }
+        }
+        // Leaves with no window snapshot at all collapse the same way.
+        let mut tree = tree?;
+        for id in layout::leaves(&tree) {
+            if !windows.contains_key(&id) {
+                tree = layout::remove_leaf(tree, id)?;
+            }
+        }
+        let focus = layout::leaves(&tree).first().copied()?;
+        let next_window_id = windows.keys().max().copied().unwrap_or(0) + 1;
+        Some(Self {
+            name: snap.name.clone(),
+            tree,
+            windows,
+            focus,
+            chord: None,
+            resize_repeat: None,
+            prompt: None,
+            keys,
+            selection: None,
+            view: View::default(),
+            area,
+            clock: String::new(),
+            next_window_id,
+            force_redraw: true,
+            tx,
+        })
+    }
+
+    /// Capture this session's persistable state: name, layout tree, each
+    /// window's tab list and active tab, each tab's working directory,
+    /// and — for tabs identified as running Claude Code — a session
+    /// reference to resume it by.
+    pub fn snapshot(&self) -> persist::SessionSnapshot {
+        let windows = layout::leaves(&self.tree)
+            .into_iter()
+            .filter_map(|id| {
+                let win = self.windows.get(&id)?;
+                let tabs = win
+                    .tabs
+                    .iter()
+                    .map(|tab| {
+                        let cwd = tab.working_dir().unwrap_or_else(|| {
+                            // No readable foreground process; the home
+                            // directory beats losing the tab.
+                            std::env::var_os("HOME")
+                                .map(std::path::PathBuf::from)
+                                .unwrap_or_else(|| "/".into())
+                        });
+                        let claude_session = tab
+                            .agent
+                            .is_some()
+                            .then(|| persist::claude_session_ref(&cwd))
+                            .flatten();
+                        persist::TabSnapshot {
+                            cwd,
+                            claude_session,
+                        }
+                    })
+                    .collect();
+                Some(persist::WindowSnapshot {
+                    id,
+                    active: win.active,
+                    tabs,
+                })
+            })
+            .collect();
+        persist::SessionSnapshot {
+            name: self.name.clone(),
+            tree: persist::capture_node(&self.tree),
+            windows,
+        }
     }
 
     pub fn has_tab(&self, id: TabId) -> bool {
