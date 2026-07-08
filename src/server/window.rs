@@ -135,8 +135,12 @@ impl Foreground {
 pub struct Tab {
     pub id: TabId,
     /// Display name derived from the PTY's foreground process command
-    /// name, re-derived as that process changes.
+    /// name, re-derived as that process changes — until a manual rename
+    /// pins it.
     pub name: String,
+    /// Whether the name was set by the rename prompt; a pinned name no
+    /// longer tracks the foreground process.
+    manual_name: bool,
     pub engine: Engine,
     /// Last rectangle the tab's PTY and engine were sized to.
     pub rect: Rect,
@@ -218,6 +222,7 @@ impl Tab {
         Ok(Self {
             id,
             name,
+            manual_name: false,
             engine,
             rect,
             drawn_seqno: 0,
@@ -234,6 +239,13 @@ impl Tab {
         let _ = self.child.kill();
     }
 
+    /// Manually set the tab's display name, pinning it against automatic
+    /// renaming.
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+        self.manual_name = true;
+    }
+
     /// Re-identify the tab after new PTY output: re-derive its display
     /// name from the foreground command and re-evaluate agent detection.
     /// Returns whether the displayed name or agent
@@ -241,14 +253,19 @@ impl Tab {
     /// changed.
     pub fn refresh_identity(&mut self) -> bool {
         let fg = self.foreground();
-        let renamed = match fg.as_ref().map(Foreground::display_name) {
-            Some(name) if !name.is_empty() && name != self.name => {
-                self.name = name.to_string();
-                true
+        let renamed = if self.manual_name {
+            // A manually renamed tab keeps its name.
+            false
+        } else {
+            match fg.as_ref().map(Foreground::display_name) {
+                Some(name) if !name.is_empty() && name != self.name => {
+                    self.name = name.to_string();
+                    true
+                }
+                // No readable foreground process (e.g. mid-exec): keep the
+                // current name rather than flickering through a fallback.
+                _ => false,
             }
-            // No readable foreground process (e.g. mid-exec): keep the
-            // current name rather than flickering through a fallback.
-            _ => false,
         };
         if !fg.is_some_and(|fg| fg.is_claude()) {
             // Not Claude Code — no status text, drop

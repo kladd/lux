@@ -17,21 +17,22 @@ fn main() {
     let code = match strs.as_slice() {
         // Create-and-attach a fresh session.
         [] => client::attach(Request::New(None)),
-        // Create named, failing on collision. The
-        // `new-session` verb form is accepted for compatibility with
-        // other multiplexers' CLIs.
-        ["-s", name] | ["new-session", "-s", name] => {
+        // Create named, failing on collision. tmux's verb
+        // name and alias are both accepted for compatibility with its CLI.
+        ["-s", name] | ["new", "-s", name] | ["new-session", "-s", name] => {
             client::attach(Request::New(Some((*name).into())))
         }
-        // Attach to an existing session. The `attach`
-        // verb form is accepted for the same reason.
-        ["-t", name] | ["attach", "-t", name] => client::attach(Request::Attach((*name).into())),
+        // Attach to an existing session. Both verb forms
+        // accepted for the same reason.
+        ["-t", name] | ["attach", "-t", name] | ["attach-session", "-t", name] => {
+            client::attach(Request::Attach((*name).into()))
+        }
         ["ls"] => client::ls(),
         ["kill-server"] => client::kill_server(),
         ["__server"] => server::run(),
         _ => {
             eprintln!(
-                "usage: lux [[new-session] -s <name> | [attach] -t <name> | ls | kill-server]"
+                "usage: lux [[new|new-session] -s <name> | [attach|attach-session] -t <name> | ls | kill-server]"
             );
             2
         }

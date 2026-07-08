@@ -34,6 +34,11 @@ pub enum Command {
     MoveTabDir(Dir),
     /// Reset every split in the layout tree to an even ratio.
     Rebalance,
+    /// Open the rename prompt for the focused window's active tab.
+    RenameTab,
+    /// Terminate every tab in the focused window
+    /// (tmux's `kill-pane`).
+    CloseWindow,
 }
 
 impl Command {
@@ -68,6 +73,8 @@ impl Command {
             Command::MoveTabDir(Dir::Up) => "move tab up",
             Command::MoveTabDir(Dir::Right) => "move tab right",
             Command::Rebalance => "rebalance splits",
+            Command::RenameTab => "rename tab",
+            Command::CloseWindow => "close window",
         }
     }
 }
@@ -213,6 +220,10 @@ impl Default for KeyTable {
             cmd('l', Command::FocusDir(Dir::Right)),
             // `=` evokes making the splits equal.
             cmd('=', Command::Rebalance),
+            // tmux's rename-window key.
+            cmd(',', Command::RenameTab),
+            // tmux's kill-pane key.
+            cmd('x', Command::CloseWindow),
             // Prefix+m enters the move-tab submap,
             // then a vim-directional key picks the destination window.
             (
@@ -346,7 +357,7 @@ mod tests {
     fn unrecognized_sequences_map_to_none() {
         let table = KeyTable::default();
         assert_eq!(
-            lookup(&table, key(CtKeyCode::Char('x'), KeyModifiers::NONE)),
+            lookup(&table, key(CtKeyCode::Char('q'), KeyModifiers::NONE)),
             None
         );
         assert_eq!(
@@ -399,6 +410,20 @@ mod tests {
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('3'), KeyModifiers::CONTROL)),
             None
+        );
+    }
+
+    #[test]
+    fn rename_and_close_window_use_tmux_keys() {
+        // Comma matches tmux's rename-window, x its kill-pane.
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char(','), KeyModifiers::NONE)),
+            Some(Command::RenameTab)
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('x'), KeyModifiers::NONE)),
+            Some(Command::CloseWindow)
         );
     }
 

@@ -175,13 +175,47 @@ struct StatusChrome {
     clock: String,
 }
 
-/// Per-frame command line geometry, present while it's open.
-struct ExChrome {
-    /// The whole bottom row, including the `:` prompt cell.
+/// What an open bottom-row prompt collects; both kinds share the same
+/// textarea-backed text entry rather than each hand-rolling an input
+/// widget.
+enum PromptKind {
+    /// The ex command line: parse and run the text on Enter.
+    Ex,
+    /// Rename the focused window's active tab to the text on Enter.
+    Rename,
+}
+
+/// The open bottom-row text prompt.
+struct Prompt {
+    kind: PromptKind,
+    textarea: TextArea<'static>,
+}
+
+impl Prompt {
+    /// The label drawn before the input area.
+    fn label(&self) -> &'static str {
+        match self.kind {
+            PromptKind::Ex => ":",
+            PromptKind::Rename => "rename: ",
+        }
+    }
+
+    /// The prompt's current text.
+    fn text(&self) -> String {
+        self.textarea.lines().first().cloned().unwrap_or_default()
+    }
+}
+
+/// Per-frame prompt geometry, present while a prompt is open.
+struct PromptChrome {
+    /// The whole bottom row, including the label.
     line: Rect,
-    /// Where the textarea widget renders (after the prompt).
+    /// The label drawn before the input area.
+    label: &'static str,
+    /// Where the textarea widget renders (after the label).
     input: Rect,
-    /// Commands matching the typed text, on the row above.
+    /// Ex commands matching the typed text, on the row above; always
+    /// empty for the rename prompt.
     suggestions: Vec<&'static str>,
     suggestion_row: Option<Rect>,
 }
@@ -202,7 +236,7 @@ struct View {
     separators: Vec<Separator>,
     chrome: Vec<Chrome>,
     status: Option<StatusChrome>,
-    ex: Option<ExChrome>,
+    prompt: Option<PromptChrome>,
     hints: Option<HintChrome>,
     /// The animation clock this frame renders at.
     elapsed: Duration,
@@ -224,8 +258,9 @@ pub struct Session {
     /// held pending after a resize dispatch, so a bare direction key
     /// resizes again; elapsing closes the submap.
     resize_repeat: Option<Instant>,
-    /// The open ex command line, if any.
-    ex: Option<TextArea<'static>>,
+    /// The open bottom-row prompt (ex command line or tab rename), if
+    /// any.
+    prompt: Option<Prompt>,
     /// The server's prefix and bindings (config may override both).
     keys: Arc<KeyTable>,
     /// The current drag selection, if any.
@@ -258,7 +293,7 @@ impl Session {
             focus: 0,
             chord: None,
             resize_repeat: None,
-            ex: None,
+            prompt: None,
             keys,
             selection: None,
             view: View::default(),
@@ -345,10 +380,10 @@ impl Session {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        // While the command line is open, every key press edits
+        // While a prompt is open, every key press edits
         // it instead of reaching the focused window's PTY.
-        if self.ex.is_some() {
-            self.handle_ex_key(key);
+        if self.prompt.is_some() {
+            self.handle_prompt_key(key);
             return None;
         }
         // An elapsed resize-repeat deadline has already closed the resize
@@ -639,7 +674,14 @@ impl Session {
             Command::Detach => return Some(Effect::Detach),
             // Switcher mode is the server's to run.
             Command::Switcher => return Some(Effect::OpenSwitcher),
-            Command::OpenEx => self.open_ex(),
+            Command::OpenEx => self.open_prompt(PromptKind::Ex, String::new()),
+            // Prefix+, prompts for the active tab's new name.
+            Command::RenameTab => {
+                let name = self.windows[&self.focus].active_tab().name.clone();
+                self.open_prompt(PromptKind::Rename, name);
+            }
+            // Prefix+x closes the focused window outright.
+            Command::CloseWindow => self.close_window(),
             // Prefix+[ enters scroll mode.
             Command::ScrollMode => {
                 if let Some(win) = self.windows.get_mut(&self.focus) {
@@ -651,40 +693,51 @@ impl Session {
         None
     }
 
-    /// Open the command line for text input.
-    fn open_ex(&mut self) {
-        let mut textarea = TextArea::default();
+    /// Open a bottom-row prompt pre-filled with `text`, cursor at the
+    /// end.
+    fn open_prompt(&mut self, kind: PromptKind, text: String) {
+        let mut textarea = TextArea::from([text]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
         // The default cursor-line underline reads as stray chrome in a
         // one-line input.
         textarea.set_cursor_line_style(Style::default());
-        self.ex = Some(textarea);
+        self.prompt = Some(Prompt { kind, textarea });
         self.force_redraw = true;
     }
 
-    fn handle_ex_key(&mut self, key: KeyEvent) {
+    fn handle_prompt_key(&mut self, key: KeyEvent) {
         self.force_redraw = true;
         match key.code {
             // Close without executing anything.
             CtKeyCode::Esc => {
-                self.ex = None;
+                self.prompt = None;
             }
-            // Execute (or discard) and close.
+            // Commit (or discard) and close.
             CtKeyCode::Enter => {
-                let textarea = self.ex.take().expect("ex mode is open");
-                let text = textarea.lines().first().cloned().unwrap_or_default();
-                match ex::parse(&text) {
-                    Some(ExCommand::SplitSideBySide) => self.split(SplitKind::SideBySide),
-                    Some(ExCommand::SplitStacked) => self.split(SplitKind::Stacked),
-                    Some(ExCommand::Write(path)) => self.write_tab_content(&path),
-                    // Unrecognized text closes with no action.
-                    None => {}
+                let prompt = self.prompt.take().expect("prompt is open");
+                let text = prompt.text();
+                match prompt.kind {
+                    PromptKind::Ex => match ex::parse(&text) {
+                        Some(ExCommand::SplitSideBySide) => self.split(SplitKind::SideBySide),
+                        Some(ExCommand::SplitStacked) => self.split(SplitKind::Stacked),
+                        Some(ExCommand::Write(path)) => self.write_tab_content(&path),
+                        // Unrecognized text closes with no action.
+                        None => {}
+                    },
+                    PromptKind::Rename => {
+                        let win = self
+                            .windows
+                            .get_mut(&self.focus)
+                            .expect("focused window exists");
+                        win.active_tab_mut().set_name(text);
+                    }
                 }
             }
             // The rest of line editing goes via tui-textarea: character
             // insertion, Backspace, cursor motion.
             _ => {
-                let textarea = self.ex.as_mut().expect("ex mode is open");
-                textarea.input(tui_textarea::Input::from(key));
+                let prompt = self.prompt.as_mut().expect("prompt is open");
+                prompt.textarea.input(tui_textarea::Input::from(key));
             }
         }
     }
@@ -867,6 +920,19 @@ impl Session {
             }
         }
         self.force_redraw = true;
+    }
+
+    /// Terminate the focused window's child processes,
+    /// with no confirmation; the resulting exit events collapse the
+    /// window through the ordinary removal path.
+    fn close_window(&mut self) {
+        let win = self
+            .windows
+            .get_mut(&self.focus)
+            .expect("focused window exists");
+        for tab in &mut win.tabs {
+            tab.kill();
+        }
     }
 
     /// Vim's "only" — terminate every other window's
@@ -1053,21 +1119,21 @@ impl Session {
             });
         }
         self.clock = clock_now();
-        let ex = self.compute_ex_chrome();
-        // The reserved bottom row, unless the command
-        // line owns it this frame.
-        let status =
-            (ex.is_none() && self.area.height > 0 && self.area.width > 0).then(|| StatusChrome {
+        let prompt = self.compute_prompt_chrome();
+        // The reserved bottom row, unless a prompt owns it this frame.
+        let status = (prompt.is_none() && self.area.height > 0 && self.area.width > 0).then(|| {
+            StatusChrome {
                 row: Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1),
                 name: self.name.clone(),
                 host: HOSTNAME.clone(),
                 clock: self.clock.clone(),
-            });
+            }
+        });
         self.view = View {
             separators,
             chrome,
             status,
-            ex,
+            prompt,
             hints: self.compute_hint_chrome(),
             elapsed: anim::elapsed(),
         };
@@ -1103,25 +1169,30 @@ impl Session {
         })
     }
 
-    /// Geometry for the open command line: the bottom row and
-    /// the suggestion row above it.
-    fn compute_ex_chrome(&self) -> Option<ExChrome> {
-        let textarea = self.ex.as_ref()?;
-        if self.area.height == 0 || self.area.width < 2 {
+    /// Geometry for the open prompt: the bottom row — label then input —
+    /// and, for the ex command line, the suggestion row above it.
+    fn compute_prompt_chrome(&self) -> Option<PromptChrome> {
+        let prompt = self.prompt.as_ref()?;
+        let label = prompt.label();
+        let label_len = label.chars().count() as u16;
+        if self.area.height == 0 || self.area.width <= label_len {
             return None;
         }
         let line = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
         let input = Rect {
-            x: line.x + 1,
-            width: line.width - 1,
+            x: line.x + label_len,
+            width: line.width - label_len,
             ..line
         };
-        let text = textarea.lines().first().cloned().unwrap_or_default();
-        let suggestions = ex::suggestions(&text);
+        let suggestions = match prompt.kind {
+            PromptKind::Ex => ex::suggestions(&prompt.text()),
+            PromptKind::Rename => Vec::new(),
+        };
         let suggestion_row = (!suggestions.is_empty() && self.area.height >= 2)
             .then(|| Rect::new(line.x, line.y - 1, line.width, 1));
-        Some(ExChrome {
+        Some(PromptChrome {
             line,
+            label,
             input,
             suggestions,
             suggestion_row,
@@ -1151,14 +1222,14 @@ impl Session {
             render_separator(sep, buf);
         }
         // The session status line on the reserved bottom
-        // row; absent while the command line renders there instead.
+        // row; absent while a prompt renders there instead.
         if let Some(status) = &self.view.status {
             render_status(status, buf);
         }
-        if let Some(chrome) = &self.view.ex {
-            render_ex_chrome(chrome, buf);
-            if let Some(textarea) = &self.ex {
-                textarea.render(chrome.input, buf);
+        if let Some(chrome) = &self.view.prompt {
+            render_prompt_chrome(chrome, buf);
+            if let Some(prompt) = &self.prompt {
+                prompt.textarea.render(chrome.input, buf);
             }
         }
         // The key-hint popup draws over everything else.
@@ -1169,9 +1240,9 @@ impl Session {
 
     fn render(&self, frame: &mut Frame) {
         self.render_to_buffer(frame.buffer_mut());
-        // While the command line is open its textarea draws its own block
+        // While a prompt is open its textarea draws its own block
         // cursor; the host cursor stays hidden.
-        if self.ex.is_some() {
+        if self.prompt.is_some() {
             return;
         }
         // The host cursor tracks the focused window's
@@ -1476,17 +1547,19 @@ fn render_selection(sel: &Selection, content: Rect, buf: &mut Buffer) {
     }
 }
 
-/// Draw the command line row — cleared, with the `:` prompt —
+/// Draw the prompt row — cleared, with its label —
 /// and the suggestion row above it. The textarea widget itself
 /// renders separately, over the cleared input area.
-fn render_ex_chrome(chrome: &ExChrome, buf: &mut Buffer) {
+fn render_prompt_chrome(chrome: &PromptChrome, buf: &mut Buffer) {
     for x in chrome.line.left()..chrome.line.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, chrome.line.y)) {
             dst.reset();
         }
     }
-    if let Some(dst) = buf.cell_mut(Position::new(chrome.line.x, chrome.line.y)) {
-        dst.set_char(':');
+    for (i, ch) in chrome.label.chars().enumerate() {
+        if let Some(dst) = buf.cell_mut(Position::new(chrome.line.x + i as u16, chrome.line.y)) {
+            dst.set_char(ch);
+        }
     }
     let Some(row) = chrome.suggestion_row else {
         return;
