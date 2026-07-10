@@ -44,12 +44,22 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `n` / `p` | next / previous tab |
 | `0`-`9` | jump to tab by index |
 | `h` `j` `k` `l` | focus split left/down/up/right |
+| `H` `J` `K` `L` | move the active tab into the split left/down/up/right |
 | `r` then `h` `j` `k` `l` | resize split left/down/up/right (tap again within 500ms to keep resizing) |
+| `m` then `h`/`l` or `j`/`k` | mirror the enclosing split horizontally or vertically |
+| `i` | rotate (flip the orientation of) the enclosing split |
+| `=` | rebalance every split to an even ratio |
+| `z` | maximize/zoom the focused window |
 | `o` | close every split but the focused one |
+| `x` | close the focused window |
+| `,` | rename the active tab |
 | `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit) |
 | `d` | detach from the session |
 | `s` | open the session switcher |
 | `:` | open the ex command line |
+
+Arrow keys work as alternates for `h`/`j`/`k`/`l` (and Shift-arrows for
+`H`/`J`/`K`/`L`).
 
 Ex commands (typed after `:`, with autocomplete):
 
