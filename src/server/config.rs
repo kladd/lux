@@ -102,6 +102,7 @@ fn parse_key_spec(spec: &str) -> Option<KeyMatch> {
     Some(KeyMatch {
         code: CtKeyCode::Char(c),
         ctrl,
+        shift: false,
     })
 }
 
@@ -146,7 +147,8 @@ mod tests {
             t.prefix,
             KeyMatch {
                 code: CtKeyCode::Char('a'),
-                ctrl: true
+                ctrl: true,
+                shift: false
             }
         );
     }
@@ -176,7 +178,8 @@ mod tests {
             t.prefix,
             KeyMatch {
                 code: CtKeyCode::Char('a'),
-                ctrl: true
+                ctrl: true,
+                shift: false
             }
         );
     }

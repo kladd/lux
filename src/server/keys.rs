@@ -4,7 +4,7 @@
 
 use ratatui::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers as CtMods};
 
-use crate::server::layout::Dir;
+use crate::server::layout::{Dir, SplitKind};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
@@ -32,6 +32,14 @@ pub enum Command {
     /// Move the focused window's active tab into the spatially adjacent
     /// window in this direction.
     MoveTabDir(Dir),
+    /// Reverse the two children of the nearest ancestor split of this
+    /// orientation enclosing the focused window.
+    Mirror(SplitKind),
+    /// Toggle the focused window's maximized state.
+    Maximize,
+    /// Flip the orientation of the split immediately containing the
+    /// focused window.
+    Rotate,
     /// Reset every split in the layout tree to an even ratio.
     Rebalance,
     /// Open the rename prompt for the focused window's active tab.
@@ -72,6 +80,10 @@ impl Command {
             Command::MoveTabDir(Dir::Down) => "move tab down",
             Command::MoveTabDir(Dir::Up) => "move tab up",
             Command::MoveTabDir(Dir::Right) => "move tab right",
+            Command::Mirror(SplitKind::SideBySide) => "mirror horizontally",
+            Command::Mirror(SplitKind::Stacked) => "mirror vertically",
+            Command::Maximize => "maximize window",
+            Command::Rotate => "rotate split",
             Command::Rebalance => "rebalance splits",
             Command::RenameTab => "rename tab",
             Command::CloseWindow => "close window",
@@ -79,31 +91,42 @@ impl Command {
     }
 }
 
-/// One key sequence following the prefix: a key code plus whether Ctrl is
-/// held. This is the identity table lookups match on.
+/// One key sequence following the prefix: a key code plus whether Ctrl
+/// and Shift are held. This is the identity table lookups match on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyMatch {
     pub code: CtKeyCode,
     pub ctrl: bool,
+    pub shift: bool,
 }
 
 impl KeyMatch {
     pub fn from_event(key: KeyEvent) -> Self {
+        let shift = match key.code {
+            // A character's case already carries Shift; tracking the
+            // modifier too would split `H` into two identities depending
+            // on how the terminal reports it.
+            CtKeyCode::Char(_) => false,
+            _ => key.modifiers.contains(CtMods::SHIFT),
+        };
         Self {
             code: key.code,
             ctrl: key.modifiers.contains(CtMods::CONTROL),
+            shift,
         }
     }
 
     /// The key's display label in the hint popup, matching the config
-    /// file's key-spec syntax (`x`, `C-x`).
+    /// file's key-spec syntax (`x`, `C-x`) extended with arrow names
+    /// (`Left`, `S-Left`).
     pub fn label(self) -> String {
         let key = match self.code {
             CtKeyCode::Char(c) => c.to_string(),
-            // Unreachable today: the defaults and the config parser only
-            // produce `Char` codes.
+            // The arrow keys Debug-format as their display names (Left,
+            // Down, Up, Right).
             other => format!("{other:?}"),
         };
+        let key = if self.shift { format!("S-{key}") } else { key };
         if self.ctrl { format!("C-{key}") } else { key }
     }
 }
@@ -112,6 +135,7 @@ impl KeyMatch {
 pub const DEFAULT_PREFIX: KeyMatch = KeyMatch {
     code: CtKeyCode::Char('b'),
     ctrl: true,
+    shift: false,
 };
 
 /// One entry in the keybinding tree: a key resolves to
@@ -198,10 +222,32 @@ impl Default for KeyTable {
             KeyMatch {
                 code: CtKeyCode::Char(c),
                 ctrl: false,
+                shift: false,
             }
         }
         fn cmd(c: char, command: Command) -> (KeyMatch, KeyTrie) {
             (plain(c), KeyTrie::Command(command))
+        }
+        // Arrow-key alternates for the vim directional letters.
+        fn arrow(code: CtKeyCode, command: Command) -> (KeyMatch, KeyTrie) {
+            (
+                KeyMatch {
+                    code,
+                    ctrl: false,
+                    shift: false,
+                },
+                KeyTrie::Command(command),
+            )
+        }
+        fn shift_arrow(code: CtKeyCode, command: Command) -> (KeyMatch, KeyTrie) {
+            (
+                KeyMatch {
+                    code,
+                    ctrl: false,
+                    shift: true,
+                },
+                KeyTrie::Command(command),
+            )
         }
         let mut bindings = vec![
             cmd('%', Command::SplitSideBySide),
@@ -218,23 +264,45 @@ impl Default for KeyTable {
             cmd('j', Command::FocusDir(Dir::Down)),
             cmd('k', Command::FocusDir(Dir::Up)),
             cmd('l', Command::FocusDir(Dir::Right)),
+            arrow(CtKeyCode::Left, Command::FocusDir(Dir::Left)),
+            arrow(CtKeyCode::Down, Command::FocusDir(Dir::Down)),
+            arrow(CtKeyCode::Up, Command::FocusDir(Dir::Up)),
+            arrow(CtKeyCode::Right, Command::FocusDir(Dir::Right)),
+            // The shifted directional keys move the active tab into the
+            // adjacent window, where the unshifted ones move focus.
+            cmd('H', Command::MoveTabDir(Dir::Left)),
+            cmd('J', Command::MoveTabDir(Dir::Down)),
+            cmd('K', Command::MoveTabDir(Dir::Up)),
+            cmd('L', Command::MoveTabDir(Dir::Right)),
+            shift_arrow(CtKeyCode::Left, Command::MoveTabDir(Dir::Left)),
+            shift_arrow(CtKeyCode::Down, Command::MoveTabDir(Dir::Down)),
+            shift_arrow(CtKeyCode::Up, Command::MoveTabDir(Dir::Up)),
+            shift_arrow(CtKeyCode::Right, Command::MoveTabDir(Dir::Right)),
+            // tmux's zoom key.
+            cmd('z', Command::Maximize),
+            cmd('i', Command::Rotate),
             // `=` evokes making the splits equal.
             cmd('=', Command::Rebalance),
             // tmux's rename-window key.
             cmd(',', Command::RenameTab),
             // tmux's kill-pane key.
             cmd('x', Command::CloseWindow),
-            // Prefix+m enters the move-tab submap,
-            // then a vim-directional key picks the destination window.
+            // Prefix+m enters the mirror submap; the direction key picks
+            // the axis: h/l reverse the nearest horizontal split's
+            // children, j/k the nearest vertical split's.
             (
                 plain('m'),
                 KeyTrie::Node(KeyTrieNode {
-                    description: "move tab to window",
+                    description: "mirror split",
                     bindings: vec![
-                        cmd('h', Command::MoveTabDir(Dir::Left)),
-                        cmd('j', Command::MoveTabDir(Dir::Down)),
-                        cmd('k', Command::MoveTabDir(Dir::Up)),
-                        cmd('l', Command::MoveTabDir(Dir::Right)),
+                        cmd('h', Command::Mirror(SplitKind::SideBySide)),
+                        cmd('l', Command::Mirror(SplitKind::SideBySide)),
+                        arrow(CtKeyCode::Left, Command::Mirror(SplitKind::SideBySide)),
+                        arrow(CtKeyCode::Right, Command::Mirror(SplitKind::SideBySide)),
+                        cmd('j', Command::Mirror(SplitKind::Stacked)),
+                        cmd('k', Command::Mirror(SplitKind::Stacked)),
+                        arrow(CtKeyCode::Down, Command::Mirror(SplitKind::Stacked)),
+                        arrow(CtKeyCode::Up, Command::Mirror(SplitKind::Stacked)),
                     ],
                 }),
             ),
@@ -250,6 +318,10 @@ impl Default for KeyTable {
                         cmd('j', Command::ResizeDir(Dir::Down)),
                         cmd('k', Command::ResizeDir(Dir::Up)),
                         cmd('l', Command::ResizeDir(Dir::Right)),
+                        arrow(CtKeyCode::Left, Command::ResizeDir(Dir::Left)),
+                        arrow(CtKeyCode::Down, Command::ResizeDir(Dir::Down)),
+                        arrow(CtKeyCode::Up, Command::ResizeDir(Dir::Up)),
+                        arrow(CtKeyCode::Right, Command::ResizeDir(Dir::Right)),
                     ],
                 }),
             ),
@@ -330,18 +402,25 @@ mod tests {
     }
 
     #[test]
-    fn hjkl_focus_and_shifted_letters_are_unbound() {
-        // Lowercase h focuses; resize lives behind the r submap, not
-        // shifted letters.
+    fn hjkl_focus_and_shifted_letters_move_tabs() {
+        // Lowercase h focuses; its shifted twin moves the active tab the
+        // same direction.
         let table = KeyTable::default();
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('h'), KeyModifiers::NONE)),
             Some(Command::FocusDir(Dir::Left))
         );
-        assert_eq!(
-            lookup(&table, key(CtKeyCode::Char('H'), KeyModifiers::SHIFT)),
-            None
-        );
+        for (c, dir) in [
+            ('H', Dir::Left),
+            ('J', Dir::Down),
+            ('K', Dir::Up),
+            ('L', Dir::Right),
+        ] {
+            assert_eq!(
+                lookup(&table, key(CtKeyCode::Char(c), KeyModifiers::SHIFT)),
+                Some(Command::MoveTabDir(dir))
+            );
+        }
         // No Ctrl chords remain in the default table.
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('h'), KeyModifiers::CONTROL)),
@@ -350,6 +429,47 @@ mod tests {
         assert_eq!(
             lookup(&table, key(CtKeyCode::Backspace, KeyModifiers::CONTROL)),
             None
+        );
+    }
+
+    #[test]
+    fn arrows_focus_and_shifted_arrows_move_tabs() {
+        // The arrow keys are alternates for the vim letters: bare arrows
+        // focus, shifted arrows move the active tab.
+        let table = KeyTable::default();
+        for (code, dir) in [
+            (CtKeyCode::Left, Dir::Left),
+            (CtKeyCode::Down, Dir::Down),
+            (CtKeyCode::Up, Dir::Up),
+            (CtKeyCode::Right, Dir::Right),
+        ] {
+            assert_eq!(
+                lookup(&table, key(code, KeyModifiers::NONE)),
+                Some(Command::FocusDir(dir))
+            );
+            assert_eq!(
+                lookup(&table, key(code, KeyModifiers::SHIFT)),
+                Some(Command::MoveTabDir(dir))
+            );
+        }
+        // Ctrl-Arrow stays unbound.
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Left, KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn maximize_and_rotate_are_bound() {
+        // z matches tmux's zoom key; i flips the enclosing split.
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('z'), KeyModifiers::NONE)),
+            Some(Command::Maximize)
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('i'), KeyModifiers::NONE)),
+            Some(Command::Rotate)
         );
     }
 
@@ -437,61 +557,73 @@ mod tests {
     }
 
     #[test]
-    fn prefix_m_is_a_chord_node_of_directional_moves() {
-        // M resolves to a node, not a command, and
-        // its submap binds exactly the four vim directions.
+    fn prefix_m_is_a_chord_node_of_directional_mirrors() {
+        // M resolves to a node, not a command, and its submap binds the
+        // four vim directions plus their arrow alternates: h/l/Left/Right
+        // mirror the nearest horizontal split, j/k/Down/Up the nearest
+        // vertical one.
         let table = KeyTable::default();
         let plain = |c| KeyMatch {
             code: CtKeyCode::Char(c),
             ctrl: false,
+            shift: false,
+        };
+        let arrow = |code| KeyMatch {
+            code,
+            ctrl: false,
+            shift: false,
         };
         let Some(KeyTrie::Node(node)) = table.root.get(plain('m')) else {
             panic!("m is not a chord node");
         };
-        assert_eq!(node.description, "move tab to window");
-        for (c, dir) in [
-            ('h', Dir::Left),
-            ('j', Dir::Down),
-            ('k', Dir::Up),
-            ('l', Dir::Right),
+        assert_eq!(node.description, "mirror split");
+        for (c, code, kind) in [
+            ('h', CtKeyCode::Left, SplitKind::SideBySide),
+            ('l', CtKeyCode::Right, SplitKind::SideBySide),
+            ('j', CtKeyCode::Down, SplitKind::Stacked),
+            ('k', CtKeyCode::Up, SplitKind::Stacked),
         ] {
-            assert_eq!(
-                node.get(plain(c)),
-                Some(&KeyTrie::Command(Command::MoveTabDir(dir)))
-            );
+            let expect = Some(&KeyTrie::Command(Command::Mirror(kind)));
+            assert_eq!(node.get(plain(c)), expect);
+            assert_eq!(node.get(arrow(code)), expect);
         }
         // Any other key dead-ends inside the node.
         assert_eq!(node.get(plain('x')), None);
         assert_eq!(node.get(plain('m')), None);
-        assert_eq!(node.bindings.len(), 4);
+        assert_eq!(node.bindings.len(), 8);
     }
 
     #[test]
     fn prefix_r_is_a_chord_node_of_directional_resizes() {
-        // R resolves to the resize submap, binding exactly the four vim
-        // directions.
+        // R resolves to the resize submap, binding the four vim
+        // directions and their arrow alternates.
         let table = KeyTable::default();
         let plain = |c| KeyMatch {
             code: CtKeyCode::Char(c),
             ctrl: false,
+            shift: false,
+        };
+        let arrow = |code| KeyMatch {
+            code,
+            ctrl: false,
+            shift: false,
         };
         let Some(KeyTrie::Node(node)) = table.root.get(plain('r')) else {
             panic!("r is not a chord node");
         };
         assert_eq!(node.description, "resize window");
-        for (c, dir) in [
-            ('h', Dir::Left),
-            ('j', Dir::Down),
-            ('k', Dir::Up),
-            ('l', Dir::Right),
+        for (c, code, dir) in [
+            ('h', CtKeyCode::Left, Dir::Left),
+            ('j', CtKeyCode::Down, Dir::Down),
+            ('k', CtKeyCode::Up, Dir::Up),
+            ('l', CtKeyCode::Right, Dir::Right),
         ] {
-            assert_eq!(
-                node.get(plain(c)),
-                Some(&KeyTrie::Command(Command::ResizeDir(dir)))
-            );
+            let expect = Some(&KeyTrie::Command(Command::ResizeDir(dir)));
+            assert_eq!(node.get(plain(c)), expect);
+            assert_eq!(node.get(arrow(code)), expect);
         }
         assert_eq!(node.get(plain('r')), None);
-        assert_eq!(node.bindings.len(), 4);
+        assert_eq!(node.bindings.len(), 8);
     }
 
     #[test]
@@ -500,6 +632,7 @@ mod tests {
         let plain = |c| KeyMatch {
             code: CtKeyCode::Char(c),
             ctrl: false,
+            shift: false,
         };
         // The empty path is the root (a bare prefix press).
         assert_eq!(
@@ -523,17 +656,20 @@ mod tests {
         let m = KeyMatch {
             code: CtKeyCode::Char('m'),
             ctrl: false,
+            shift: false,
         };
         let rows = table.node_at(&[m]).expect("m node").hints();
-        assert_eq!(rows.len(), 4);
-        assert!(rows.contains(&("h".to_string(), "move tab left")));
-        assert!(rows.contains(&("l".to_string(), "move tab right")));
+        // The keys per axis share a description and collapse into one
+        // row each.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&("h, l, Left, Right".to_string(), "mirror horizontally")));
+        assert!(rows.contains(&("j, k, Down, Up".to_string(), "mirror vertically")));
         // The root's rows include the node entry itself.
         assert!(
             table
                 .root
                 .hints()
-                .contains(&("m".to_string(), "move tab to window"))
+                .contains(&("m".to_string(), "mirror split"))
         );
     }
 
@@ -587,10 +723,15 @@ mod tests {
         // range label.
         assert!(rows.contains(&("0-9".to_string(), "select tab by index")));
         assert!(rows.contains(&("%".to_string(), "split side by side")));
+        // A vim letter and its arrow alternate share a row; shifted
+        // arrows label with the S- prefix.
+        assert!(rows.contains(&("h, Left".to_string(), "focus window left")));
+        assert!(rows.contains(&("H, S-Left".to_string(), "move tab left")));
         // Ctrl chords label with the config file's C- syntax.
         let ctrl = KeyMatch {
             code: CtKeyCode::Char('x'),
             ctrl: true,
+            shift: false,
         };
         assert_eq!(ctrl.label(), "C-x");
         // Two keys on one description join with a comma, not a range.
@@ -598,10 +739,12 @@ mod tests {
             KeyMatch {
                 code: CtKeyCode::Char('a'),
                 ctrl: false,
+                shift: false,
             },
             KeyMatch {
                 code: CtKeyCode::Char('b'),
                 ctrl: false,
+                shift: false,
             },
         ];
         assert_eq!(key_group_label(&pair), "a, b");

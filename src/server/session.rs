@@ -44,6 +44,10 @@ const MIN_ROWS: u16 = 3;
 /// resize dispatch.
 const RESIZE_REPEAT: Duration = Duration::from_millis(500);
 
+/// The move-tab repeat deadline; restarted on each repeated move-tab
+/// dispatch, matching the resize submap's timing.
+const MOVE_REPEAT: Duration = Duration::from_millis(500);
+
 /// A session-level consequence the server must act on; everything else is
 /// handled inside the session.
 pub enum Effect {
@@ -259,6 +263,14 @@ pub struct Session {
     /// held pending after a resize dispatch, so a bare direction key
     /// resizes again; elapsing closes the submap.
     resize_repeat: Option<Instant>,
+    /// The move-tab repeat deadline: armed after a move-tab dispatch, so
+    /// a bare `H`/`J`/`K`/`L` moves the tab again without the prefix;
+    /// elapsing (or any other key) closes the window.
+    move_repeat: Option<Instant>,
+    /// The maximized window, rendered over the whole layout area while
+    /// set. Purely a view state: the layout tree is untouched, focus
+    /// leaving the window clears it, and it is never persisted.
+    maximized: Option<WindowId>,
     /// The open bottom-row prompt (ex command line or tab rename), if
     /// any.
     prompt: Option<Prompt>,
@@ -294,6 +306,8 @@ impl Session {
             focus: 0,
             chord: None,
             resize_repeat: None,
+            move_repeat: None,
+            maximized: None,
             prompt: None,
             keys,
             selection: None,
@@ -356,6 +370,8 @@ impl Session {
             focus,
             chord: None,
             resize_repeat: None,
+            move_repeat: None,
+            maximized: None,
             prompt: None,
             keys,
             selection: None,
@@ -440,20 +456,24 @@ impl Session {
             .any(|w| w.tabs.iter().any(|t| t.agent_pending_idle()))
     }
 
-    /// Whether the resize submap is held open by an armed repeat
-    /// deadline. The server wakes on a timer while one is, so the
-    /// deadline can close the submap.
-    pub fn has_pending_resize_repeat(&self) -> bool {
-        self.resize_repeat.is_some()
+    /// Whether a repeat deadline (resize submap or move-tab) is armed.
+    /// The server wakes on a timer while one is, so the deadline can
+    /// close its repeat window.
+    pub fn has_pending_repeat(&self) -> bool {
+        self.resize_repeat.is_some() || self.move_repeat.is_some()
     }
 
-    /// Close the resize submap once its repeat deadline elapses with no
-    /// keypress, requiring prefix+r again for the next resize.
-    pub fn tick_resize_repeat(&mut self, now: Instant) {
+    /// Close repeat windows whose deadline elapsed with no keypress: the
+    /// resize submap (requiring prefix+r again) and the move-tab window
+    /// (requiring the prefix again).
+    pub fn tick_repeats(&mut self, now: Instant) {
         if self.resize_repeat.is_some_and(|deadline| now >= deadline) {
             self.resize_repeat = None;
             self.chord = None;
             self.force_redraw = true;
+        }
+        if self.move_repeat.is_some_and(|deadline| now >= deadline) {
+            self.move_repeat = None;
         }
     }
 
@@ -494,10 +514,10 @@ impl Session {
             self.handle_prompt_key(key);
             return None;
         }
-        // An elapsed resize-repeat deadline has already closed the resize
-        // submap; the tick normally does this on time, but a key racing
-        // the timer must not land in a submap that should be gone.
-        self.tick_resize_repeat(Instant::now());
+        // An elapsed repeat deadline has already closed its repeat
+        // window; the tick normally does this on time, but a key racing
+        // the timer must not land in a window that should be gone.
+        self.tick_repeats(Instant::now());
         if let Some(mut path) = self.chord.take() {
             // Any key either dispatches (re-arming the deadline below) or
             // ends the sequence, so the armed deadline never outlives it.
@@ -536,6 +556,16 @@ impl Session {
                 // accumulated sequence, dispatching nothing and writing
                 // nothing to the PTY.
                 None => {}
+            }
+            return None;
+        }
+        // While the move-repeat deadline is armed, a bare `H`/`J`/`K`/`L`
+        // moves the tab again (a successful move re-arms the deadline);
+        // any other key is discarded — never reaching the PTY — and
+        // closes the window.
+        if self.move_repeat.take().is_some() {
+            if let Some(dir) = move_repeat_dir(key) {
+                return self.execute(Command::MoveTabDir(dir));
             }
             return None;
         }
@@ -607,7 +637,7 @@ impl Session {
                 let id = self.window_at(pos)?;
                 // Click-to-focus.
                 if self.focus != id {
-                    self.focus = id;
+                    self.set_focus(id);
                     self.force_redraw = true;
                 }
                 // A left click on a tab's indicator makes
@@ -689,7 +719,6 @@ impl Session {
                     return None;
                 }
                 // Focus, enter scroll mode, scroll 3 lines.
-                self.focus = id;
                 tab.enter_scroll_mode();
                 let delta = if mouse.kind == CtMouseKind::ScrollUp {
                     -3
@@ -702,6 +731,7 @@ impl Session {
                 if tab.scroll_by(delta) {
                     tab.exit_scroll_mode();
                 }
+                self.set_focus(id);
                 self.force_redraw = true;
             }
             _ => {}
@@ -710,6 +740,15 @@ impl Session {
     }
 
     fn window_at(&self, pos: Position) -> Option<WindowId> {
+        // While a window is maximized it is the only one on screen, so
+        // hidden windows' stale rectangles never take a click.
+        if let Some(id) = self.maximized {
+            return self
+                .windows
+                .get(&id)
+                .filter(|w| w.rect.contains(pos))
+                .map(|w| w.id);
+        }
         self.windows
             .values()
             .find(|w| w.rect.contains(pos))
@@ -775,9 +814,35 @@ impl Session {
                 layout::rebalance(&mut self.tree);
                 self.force_redraw = true;
             }
-            // Prefix+m then a direction moves the active
-            // tab into the adjacent window.
-            Command::MoveTabDir(dir) => self.move_tab_dir(dir),
+            // Prefix+H/J/K/L moves the active tab into the adjacent
+            // window; a successful move opens the repeat window so a bare
+            // direction key moves again. A press with no adjacent window
+            // arms nothing.
+            Command::MoveTabDir(dir) => {
+                if self.move_tab_dir(dir) {
+                    self.move_repeat = Some(Instant::now() + MOVE_REPEAT);
+                }
+            }
+            // Prefix+m then a direction key reverses the nearest
+            // enclosing split of that axis; no such ancestor leaves the
+            // tree untouched.
+            Command::Mirror(kind) => {
+                if layout::mirror(&mut self.tree, self.focus, kind) {
+                    self.force_redraw = true;
+                }
+            }
+            // Prefix+z toggles the focused window's maximized state.
+            Command::Maximize => {
+                self.maximized = (self.maximized != Some(self.focus)).then_some(self.focus);
+                self.force_redraw = true;
+            }
+            // Prefix+i flips the orientation of the split immediately
+            // containing the focused window; a lone window has none.
+            Command::Rotate => {
+                if layout::rotate(&mut self.tree, self.focus) {
+                    self.force_redraw = true;
+                }
+            }
             // Real detach, dispatched server-side.
             Command::Detach => return Some(Effect::Detach),
             // Switcher mode is the server's to run.
@@ -881,7 +946,11 @@ impl Session {
     }
 
     fn split(&mut self, kind: SplitKind) {
-        let rect = self.windows[&self.focus].rect;
+        // The tree's rectangle, not the window's — a maximized window's
+        // full-area override must not change what fits.
+        let Some(&(_, rect)) = self.layout_rects().iter().find(|(id, _)| *id == self.focus) else {
+            return;
+        };
         let (first, second, _) = layout::split_areas(kind, 0.5, rect);
         // Never create a window under 10 cols or 3 rows.
         for half in [first, second] {
@@ -900,7 +969,7 @@ impl Session {
         self.next_window_id += 1;
         self.windows.insert(id, win);
         layout::split_leaf(&mut self.tree, self.focus, kind, id);
-        self.focus = id;
+        self.set_focus(id);
         self.force_redraw = true;
     }
 
@@ -975,13 +1044,31 @@ impl Session {
         }
     }
 
+    /// Move focus to `id`, exiting the maximized state when focus leaves
+    /// the maximized window.
+    fn set_focus(&mut self, id: WindowId) {
+        self.focus = id;
+        if self.maximized.is_some_and(|m| m != id) {
+            self.maximized = None;
+        }
+    }
+
+    /// Every window's rectangle computed from the layout tree — the
+    /// geometry directional commands navigate by, unaffected by the
+    /// maximized window's full-area override.
+    fn layout_rects(&self) -> Vec<(WindowId, Rect)> {
+        layout::compute(&self.tree, tree_area(self.area)).0
+    }
+
     /// Move focus to the window spatially adjacent in `dir`;
     /// at a screen edge focus stays put.
     fn focus_dir(&mut self, dir: Dir) {
-        let rects: Vec<(WindowId, Rect)> = self.windows.values().map(|w| (w.id, w.rect)).collect();
-        let from = self.windows[&self.focus].rect;
+        let rects = self.layout_rects();
+        let Some(&(_, from)) = rects.iter().find(|(id, _)| *id == self.focus) else {
+            return;
+        };
         if let Some(id) = layout::spatial_neighbor(&rects, from, dir) {
-            self.focus = id;
+            self.set_focus(id);
             self.force_redraw = true;
         }
     }
@@ -990,13 +1077,16 @@ impl Session {
     /// window spatially adjacent in `dir`, appended as that window's active
     /// tab. Focus follows the
     /// moved tab, keeping exactly one focused window
-    /// whether or not the source window survives.
-    fn move_tab_dir(&mut self, dir: Dir) {
-        let rects: Vec<(WindowId, Rect)> = self.windows.values().map(|w| (w.id, w.rect)).collect();
-        let from = self.windows[&self.focus].rect;
+    /// whether or not the source window survives. Returns whether a tab
+    /// moved.
+    fn move_tab_dir(&mut self, dir: Dir) -> bool {
+        let rects = self.layout_rects();
+        let Some(&(_, from)) = rects.iter().find(|(id, _)| *id == self.focus) else {
+            return false;
+        };
         // No adjacent window — discard, move nothing.
         let Some(dest) = layout::spatial_neighbor(&rects, from, dir) else {
-            return;
+            return false;
         };
         let source = self.focus;
         let win = self
@@ -1017,7 +1107,7 @@ impl Session {
         // The tab renders into a new rectangle now.
         let content = dest_win.content_rect();
         dest_win.active_tab_mut().resize(content);
-        self.focus = dest;
+        self.set_focus(dest);
         if emptied {
             // A window left with no tabs collapses — the
             // sibling subtree inherits its space.
@@ -1028,6 +1118,7 @@ impl Session {
             }
         }
         self.force_redraw = true;
+        true
     }
 
     /// Terminate the focused window's child processes,
@@ -1099,11 +1190,12 @@ impl Session {
             return Some(Effect::Ended);
         }
         self.drop_selection_in(win_id);
-        // Refocus before the leaf disappears from the tree.
+        // Refocus before the leaf disappears from the tree; a maximized
+        // window collapsing this way also exits the maximized state.
         if self.focus == win_id {
             let ids = layout::leaves(&self.tree);
             let pos = ids.iter().position(|i| *i == win_id).unwrap_or(0);
-            self.focus = ids[(pos + 1) % ids.len()];
+            self.set_focus(ids[(pos + 1) % ids.len()]);
         }
         // The sibling subtree inherits the space.
         let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
@@ -1177,7 +1269,13 @@ impl Session {
     /// Compute this frame's window and tab bar geometry into `self.view`,
     /// reconciling every window's tabs with their rectangles.
     fn compute_view(&mut self) {
-        let (rects, separators) = layout::compute(&self.tree, tree_area(self.area));
+        // A maximized window takes the whole layout area by itself; the
+        // tree is untouched, so toggling back simply resumes computing
+        // from it. Hidden windows keep their engines as they were.
+        let (rects, separators) = match self.maximized {
+            Some(id) => (vec![(id, tree_area(self.area))], Vec::new()),
+            None => layout::compute(&self.tree, tree_area(self.area)),
+        };
         let mut chrome = Vec::with_capacity(rects.len());
         for (id, rect) in rects {
             let Some(win) = self.windows.get_mut(&id) else {
@@ -1311,15 +1409,21 @@ impl Session {
     /// geometry math or state mutation here.
     fn render_to_buffer(&self, buf: &mut Buffer) {
         // Each window confined to its own rectangle;
-        // the active tab's content below the tab bar.
+        // the active tab's content below the tab bar. While a window is
+        // maximized, it is the only one drawn.
         for win in self.windows.values() {
+            if self.maximized.is_some_and(|id| id != win.id) {
+                continue;
+            }
             render_tab(win.active_tab(), buf);
         }
         for chrome in &self.view.chrome {
             render_tab_bar(chrome, self.focus, buf, self.view.elapsed);
         }
-        // Highlight the selected text.
+        // Highlight the selected text, unless its window is hidden behind
+        // a maximized one.
         if let Some(sel) = &self.selection
+            && self.maximized.is_none_or(|id| id == sel.window)
             && let Some(win) = self.windows.get(&sel.window)
         {
             render_selection(sel, win.content_rect(), buf);
@@ -1507,6 +1611,23 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
                 }
             }
         }
+    }
+}
+
+/// The direction a key repeats a move-tab dispatch in while the
+/// move-repeat deadline is armed: the same shifted `H`/`J`/`K`/`L` or
+/// Shift-Arrow the prefixed bindings use, without the prefix.
+fn move_repeat_dir(key: KeyEvent) -> Option<Dir> {
+    let m = KeyMatch::from_event(key);
+    if m.ctrl {
+        return None;
+    }
+    match (m.code, m.shift) {
+        (CtKeyCode::Char('H'), _) | (CtKeyCode::Left, true) => Some(Dir::Left),
+        (CtKeyCode::Char('J'), _) | (CtKeyCode::Down, true) => Some(Dir::Down),
+        (CtKeyCode::Char('K'), _) | (CtKeyCode::Up, true) => Some(Dir::Up),
+        (CtKeyCode::Char('L'), _) | (CtKeyCode::Right, true) => Some(Dir::Right),
+        _ => None,
     }
 }
 

@@ -220,6 +220,20 @@ mod tests {
     }
 
     #[test]
+    fn shifted_arrows_keep_the_shift_modifier() {
+        // Shift-Arrow (CSI 1;2) must stay distinct from the bare arrow:
+        // the keybinding table binds focus to one and move-tab to the
+        // other.
+        let mut d = InputDecoder::default();
+        let evs = keys(&mut d, b"\x1b[1;2D");
+        assert_eq!(evs[0].code, CtKeyCode::Left);
+        assert!(evs[0].modifiers.contains(CtMods::SHIFT));
+        let evs = keys(&mut d, b"\x1b[D");
+        assert_eq!(evs[0].code, CtKeyCode::Left);
+        assert!(!evs[0].modifiers.contains(CtMods::SHIFT));
+    }
+
+    #[test]
     fn bs_and_del_both_decode_as_backspace() {
         // No binding distinguishes Ctrl-H from Backspace anymore; both bytes
         // pass through as Backspace, matching termwiz's own collapsing.

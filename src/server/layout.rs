@@ -228,6 +228,48 @@ pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -
     true
 }
 
+/// Reverse the two children of the nearest ancestor split of `kind`
+/// enclosing `focused` — the deepest such split on the path from the root
+/// to that leaf. The ratio stays with the position, so an uneven split's
+/// windows trade sizes as they trade places. Returns whether such a split
+/// exists.
+pub fn mirror(node: &mut Node, focused: WindowId, kind: SplitKind) -> bool {
+    let Node::Split(s) = node else { return false };
+    let child = if contains(&s.first, focused) {
+        &mut s.first
+    } else if contains(&s.second, focused) {
+        &mut s.second
+    } else {
+        return false;
+    };
+    if mirror(child, focused, kind) {
+        return true;
+    }
+    if s.kind == kind {
+        std::mem::swap(&mut s.first, &mut s.second);
+        return true;
+    }
+    false
+}
+
+/// Flip the orientation of the split immediately containing `focused` —
+/// the direct parent of that leaf. Returns whether the leaf has an
+/// enclosing split.
+pub fn rotate(node: &mut Node, focused: WindowId) -> bool {
+    let Node::Split(s) = node else { return false };
+    let is_parent = [&s.first, &s.second]
+        .into_iter()
+        .any(|child| matches!(child.as_ref(), Node::Leaf(id) if *id == focused));
+    if is_parent {
+        s.kind = match s.kind {
+            SplitKind::SideBySide => SplitKind::Stacked,
+            SplitKind::Stacked => SplitKind::SideBySide,
+        };
+        return true;
+    }
+    rotate(&mut s.first, focused) || rotate(&mut s.second, focused)
+}
+
 /// Reset every split in the tree to an even division between its two
 /// children.
 pub fn rebalance(node: &mut Node) {
@@ -370,6 +412,71 @@ mod tests {
         assert_ne!(compute(&tree, area()).0, compute(&even, area()).0);
         rebalance(&mut tree);
         assert_eq!(compute(&tree, area()).0, compute(&even, area()).0);
+    }
+
+    #[test]
+    fn mirror_reverses_the_nearest_split_of_its_axis() {
+        // 1 | (2 / 3): window 2's nearest horizontal split is the root;
+        // its nearest vertical split is the inner stack.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
+        assert!(mirror(&mut tree, 2, SplitKind::Stacked));
+        assert_eq!(leaves(&tree), vec![1, 3, 2]);
+        assert!(mirror(&mut tree, 2, SplitKind::SideBySide));
+        assert_eq!(leaves(&tree), vec![3, 2, 1]);
+        // No ancestor of the axis: window 1 now sits under the root
+        // horizontal split only.
+        assert!(!mirror(&mut tree, 1, SplitKind::Stacked));
+        assert_eq!(leaves(&tree), vec![3, 2, 1]);
+        // A lone leaf has no split at all.
+        assert!(!mirror(&mut Node::Leaf(1), 1, SplitKind::SideBySide));
+    }
+
+    #[test]
+    fn mirror_keeps_the_ratio_with_the_position() {
+        // An uneven split's larger share stays on its side; the windows
+        // trade sizes as they trade places.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        for _ in 0..5 {
+            assert!(resize_toward(&mut tree, area(), 1, Dir::Right));
+        }
+        let before: std::collections::HashMap<_, _> =
+            compute(&tree, area()).0.into_iter().collect();
+        assert!(mirror(&mut tree, 1, SplitKind::SideBySide));
+        let after: std::collections::HashMap<_, _> = compute(&tree, area()).0.into_iter().collect();
+        assert_eq!(before[&1].width, after[&2].width);
+        assert_eq!(before[&2].width, after[&1].width);
+    }
+
+    #[test]
+    fn rotate_flips_the_enclosing_split() {
+        // 1 | (2 / 3): window 3's parent is the inner stack; rotating from
+        // it turns the stack side-by-side and back.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
+        assert!(rotate(&mut tree, 3));
+        let Node::Split(s) = &tree else {
+            panic!("root is a split")
+        };
+        let Node::Split(inner) = s.second.as_ref() else {
+            panic!("inner is a split");
+        };
+        assert_eq!(inner.kind, SplitKind::SideBySide);
+        // The root split is untouched.
+        assert_eq!(s.kind, SplitKind::SideBySide);
+        assert!(rotate(&mut tree, 3));
+        let Node::Split(s) = &tree else {
+            panic!("root is a split")
+        };
+        let Node::Split(inner) = s.second.as_ref() else {
+            panic!("inner is a split");
+        };
+        assert_eq!(inner.kind, SplitKind::Stacked);
+        // A lone leaf has no orientation to flip.
+        assert!(!rotate(&mut Node::Leaf(1), 1));
     }
 
     #[test]

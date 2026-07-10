@@ -261,17 +261,14 @@ impl Server {
     }
 
     /// Whether the event loop should wake on a timer rather than block:
-    /// an idle debounce is waiting to commit, a resize submap's repeat
-    /// deadline is armed, an automatic save is pending, or a
+    /// an idle debounce is waiting to commit, a repeat deadline (resize
+    /// submap or move-tab) is armed, an automatic save is pending, or a
     /// session some client is viewing — attached or as a live switcher
     /// preview — has an animated status text to advance.
     fn needs_timed_tick(&self) -> bool {
         self.has_pending_idle()
             || self.save_deadline.is_some()
-            || self
-                .sessions
-                .values()
-                .any(|s| s.has_pending_resize_repeat())
+            || self.sessions.values().any(|s| s.has_pending_repeat())
             || self.clients.values().any(|c| {
                 if c.switcher.is_some() {
                     self.sessions.values().any(|s| s.has_animation())
@@ -284,12 +281,12 @@ impl Server {
     }
 
     /// Commit any idle debounces whose window elapsed, and close any
-    /// resize submap whose repeat deadline did.
+    /// repeat window whose deadline did.
     fn tick_agents(&mut self) {
         let now = std::time::Instant::now();
         for session in self.sessions.values_mut() {
             session.tick_agents(now);
-            session.tick_resize_repeat(now);
+            session.tick_repeats(now);
         }
     }
 
