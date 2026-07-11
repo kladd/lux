@@ -388,7 +388,8 @@ impl Session {
     /// window's tab list and active tab, each tab's working directory,
     /// and — for tabs identified as running Claude Code — a session
     /// reference to resume it by.
-    pub fn snapshot(&self) -> persist::SessionSnapshot {
+    pub fn snapshot(&mut self) -> persist::SessionSnapshot {
+        self.assign_claude_sessions();
         let windows = layout::leaves(&self.tree)
             .into_iter()
             .filter_map(|id| {
@@ -404,14 +405,9 @@ impl Session {
                                 .map(std::path::PathBuf::from)
                                 .unwrap_or_else(|| "/".into())
                         });
-                        let claude_session = tab
-                            .agent
-                            .is_some()
-                            .then(|| persist::claude_session_ref(&cwd))
-                            .flatten();
                         persist::TabSnapshot {
                             cwd,
-                            claude_session,
+                            claude_session: tab.claude_session.clone(),
                         }
                     })
                     .collect();
@@ -426,6 +422,49 @@ impl Session {
             name: self.name.clone(),
             tree: persist::capture_node(&self.tree),
             windows,
+        }
+    }
+
+    /// Give every Claude Code tab that doesn't yet know its session id a
+    /// distinct one, by matching each project directory's transcripts
+    /// (by creation time) against when each tab was first seen running
+    /// claude. Ids already owned — resumed tabs, earlier matches — are
+    /// never taken, so concurrent claude tabs in the same directory keep
+    /// distinct sessions instead of all saving the newest one. An
+    /// assignment sticks until that tab's claude exits.
+    fn assign_claude_sessions(&mut self) {
+        let mut claimed: std::collections::HashSet<String> = self
+            .windows
+            .values()
+            .flat_map(|w| w.tabs.iter().filter_map(|t| t.claude_session.clone()))
+            .collect();
+        // Unassigned claude tabs grouped by working directory, in
+        // first-seen order within each group.
+        let mut groups: std::collections::HashMap<
+            std::path::PathBuf,
+            Vec<(WindowId, usize, std::time::SystemTime)>,
+        > = std::collections::HashMap::new();
+        for (&wid, win) in &self.windows {
+            for (idx, tab) in win.tabs.iter().enumerate() {
+                if tab.agent.is_none() || tab.claude_session.is_some() {
+                    continue;
+                }
+                let (Some(since), Some(cwd)) = (tab.claude_since, tab.working_dir()) else {
+                    continue;
+                };
+                groups.entry(cwd).or_default().push((wid, idx, since));
+            }
+        }
+        for (cwd, mut tabs) in groups {
+            tabs.sort_by_key(|&(_, _, since)| since);
+            let transcripts = persist::claude_sessions(&cwd);
+            let since: Vec<std::time::SystemTime> = tabs.iter().map(|&(_, _, s)| s).collect();
+            let ids = persist::match_claude_sessions(&since, &transcripts, &mut claimed);
+            for (&(wid, idx, _), id) in tabs.iter().zip(ids) {
+                if let Some(win) = self.windows.get_mut(&wid) {
+                    win.tabs[idx].claude_session = id;
+                }
+            }
         }
     }
 
@@ -632,9 +671,8 @@ impl Session {
 
     pub fn handle_mouse(&mut self, mouse: CtMouseEvent) -> Option<Effect> {
         let pos = Position::new(mouse.column, mouse.row);
-        // Shift bypasses a program's mouse grab (the xterm/tmux
-        // convention), keeping selection, yank, and paste reachable
-        // inside mouse-aware programs.
+        // Shift bypasses a program's mouse grab, keeping selection,
+        // yank, and paste reachable inside mouse-aware programs.
         let shift = mouse.modifiers.contains(CtMods::SHIFT);
         match mouse.kind {
             CtMouseKind::Down(button) => {

@@ -1,8 +1,8 @@
 //! Session persistence: automatic JSON snapshots of every session's
 //! layout and each tab's working directory, restored at server startup
-//! unless the config disables it. Modeled on herdr's session persistence
-//! but narrower: no scrollback replay, and agent-session resume covers
-//! only Claude Code, the one agent lux detects.
+//! unless the config disables it. Deliberately narrow: no scrollback
+//! replay, and agent-session resume covers only Claude Code, the one
+//! agent lux detects.
 
 use std::path::{Path, PathBuf};
 
@@ -150,20 +150,27 @@ pub fn load() -> Option<StateSnapshot> {
     }
 }
 
-/// The newest Claude Code session id recorded for `cwd`. Claude Code
-/// stores each session's transcript as
-/// `~/.claude/projects/<encoded cwd>/<session id>.jsonl`; the most
-/// recently modified one belongs to the session running now. Lux reads
-/// this at save time because, unlike herdr, it has no hook channel over
-/// which Claude Code reports its session id.
-pub fn claude_session_ref(cwd: &Path) -> Option<String> {
-    let home = std::env::var_os("HOME")?;
+/// The Claude Code session transcripts recorded for `cwd`, as (session
+/// id, transcript creation time), oldest first. Claude Code stores each
+/// session's transcript as
+/// `~/.claude/projects/<encoded cwd>/<session id>.jsonl`, created when
+/// the session starts and kept through resumes, so a transcript's birth
+/// time identifies which running instance created it. Lux reads these
+/// files because it has no channel over which Claude Code reports its
+/// session id directly.
+pub fn claude_sessions(cwd: &Path) -> Vec<(String, std::time::SystemTime)> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
     let dir = PathBuf::from(home)
         .join(".claude")
         .join("projects")
         .join(encode_project_dir(cwd));
-    let mut newest: Option<(std::time::SystemTime, String)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "jsonl") {
             continue;
@@ -171,14 +178,53 @@ pub fn claude_session_ref(cwd: &Path) -> Option<String> {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+        // Filesystems without birth times fall back to mtime, degrading
+        // toward the old newest-file guess rather than dropping the tab.
+        let Ok(created) = entry
+            .metadata()
+            .and_then(|meta| meta.created().or_else(|_| meta.modified()))
+        else {
             continue;
         };
-        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-            newest = Some((modified, stem.to_string()));
-        }
+        sessions.push((stem.to_string(), created));
     }
-    newest.map(|(_, id)| id)
+    sessions.sort_by_key(|(_, created)| *created);
+    sessions
+}
+
+/// Slack for comparing a transcript's creation time against when lux
+/// first saw the tab running Claude Code: the transcript can appear
+/// slightly before detection (Claude writes it at startup, detection
+/// waits on the next frame).
+const CLAUDE_MATCH_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Match Claude Code tabs to session transcripts within one project
+/// directory: for each tab (by the time it was first seen running Claude
+/// Code, which must be ascending), the oldest unclaimed transcript
+/// created no earlier than the tab appeared. Each transcript is claimed
+/// at most once, transcripts predating every tab are never claimed, and
+/// a tab whose transcript hasn't appeared yet gets `None`. `claimed`
+/// holds ids already owned elsewhere (resumed tabs, earlier matches) and
+/// grows with each match.
+pub fn match_claude_sessions(
+    since: &[std::time::SystemTime],
+    transcripts: &[(String, std::time::SystemTime)],
+    claimed: &mut std::collections::HashSet<String>,
+) -> Vec<Option<String>> {
+    since
+        .iter()
+        .map(|seen| {
+            let earliest = seen
+                .checked_sub(CLAUDE_MATCH_SLACK)
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let id = transcripts
+                .iter()
+                .find(|(id, created)| *created >= earliest && !claimed.contains(id))
+                .map(|(id, _)| id.clone())?;
+            claimed.insert(id.clone());
+            Some(id)
+        })
+        .collect()
 }
 
 /// Claude Code's project-directory encoding: every character outside
@@ -255,6 +301,41 @@ mod tests {
             Some("abc-123")
         );
         assert_eq!(session.windows[1].tabs[0].cwd, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn transcript_matching_keeps_concurrent_tabs_distinct() {
+        use std::time::{Duration, SystemTime};
+        let t = |secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        // Three transcripts in one project: one from a long-closed
+        // session, then one per running claude tab, oldest first.
+        let transcripts = vec![
+            ("old".to_string(), t(100)),
+            ("first".to_string(), t(1000)),
+            ("second".to_string(), t(2000)),
+        ];
+        let mut claimed = std::collections::HashSet::new();
+        // Two tabs, first seen shortly after their transcripts appeared.
+        let ids = match_claude_sessions(&[t(1001), t(2001)], &transcripts, &mut claimed);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].as_deref(), Some("first"));
+        assert_eq!(ids[1].as_deref(), Some("second"));
+        // The stale transcript predates both tabs and is never claimed.
+        assert!(!claimed.contains("old"));
+
+        // An id already owned (a resumed tab) is skipped, and a tab
+        // whose transcript hasn't appeared yet gets nothing.
+        let mut claimed = std::collections::HashSet::from(["first".to_string()]);
+        let ids = match_claude_sessions(&[t(1001), t(9000)], &transcripts, &mut claimed);
+        assert_eq!(ids[0].as_deref(), Some("second"));
+        assert_eq!(ids[1], None);
+
+        // A transcript created moments before detection (claude writes
+        // it at startup; detection waits on the next frame) still
+        // matches through the slack.
+        let mut claimed = std::collections::HashSet::new();
+        let ids = match_claude_sessions(&[t(1001)], &[("first".into(), t(1000))], &mut claimed);
+        assert_eq!(ids[0].as_deref(), Some("first"));
     }
 
     #[test]

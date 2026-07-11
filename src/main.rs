@@ -17,13 +17,12 @@ fn main() {
     let code = match strs.as_slice() {
         // Create-and-attach a fresh session.
         [] => client::attach(Request::New(None)),
-        // Create named, failing on collision. tmux's verb
-        // name and alias are both accepted for compatibility with its CLI.
+        // Create named, failing on collision. The verb, its alias, and
+        // the bare flag are all accepted.
         ["-s", name] | ["new", "-s", name] | ["new-session", "-s", name] => {
             client::attach(Request::New(Some((*name).into())))
         }
-        // Attach to an existing session. Both verb forms
-        // accepted for the same reason.
+        // Attach to an existing session, same spellings.
         ["-t", name] | ["attach", "-t", name] | ["attach-session", "-t", name] => {
             client::attach(Request::Attach((*name).into()))
         }

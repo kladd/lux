@@ -44,8 +44,7 @@ pub enum Command {
     Rebalance,
     /// Open the rename prompt for the focused window's active tab.
     RenameTab,
-    /// Terminate every tab in the focused window
-    /// (tmux's `kill-pane`).
+    /// Terminate every tab in the focused window.
     CloseWindow,
 }
 
@@ -280,14 +279,11 @@ impl Default for KeyTable {
             shift_arrow(CtKeyCode::Down, Command::MoveTabDir(Dir::Down)),
             shift_arrow(CtKeyCode::Up, Command::MoveTabDir(Dir::Up)),
             shift_arrow(CtKeyCode::Right, Command::MoveTabDir(Dir::Right)),
-            // tmux's zoom key.
             cmd('z', Command::Maximize),
             cmd('i', Command::Rotate),
             // `=` evokes making the splits equal.
             cmd('=', Command::Rebalance),
-            // tmux's rename-window key.
             cmd(',', Command::RenameTab),
-            // tmux's kill-pane key.
             cmd('x', Command::CloseWindow),
             // Prefix+m enters the swap submap; the direction key picks
             // the spatially adjacent window the focused window trades
@@ -463,7 +459,7 @@ mod tests {
 
     #[test]
     fn maximize_and_rotate_are_bound() {
-        // z matches tmux's zoom key; i flips the enclosing split.
+        // z toggles maximize; i flips the enclosing split.
         let table = KeyTable::default();
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('z'), KeyModifiers::NONE)),
@@ -536,8 +532,8 @@ mod tests {
     }
 
     #[test]
-    fn rename_and_close_window_use_tmux_keys() {
-        // Comma matches tmux's rename-window, x its kill-pane.
+    fn rename_and_close_window_are_bound() {
+        // Comma renames the active tab; x closes the window.
         let table = KeyTable::default();
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char(','), KeyModifiers::NONE)),

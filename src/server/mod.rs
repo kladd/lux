@@ -318,7 +318,7 @@ impl Server {
     /// write when nothing changed since the last save.
     fn save_sessions(&mut self) {
         let snapshot = persist::StateSnapshot {
-            sessions: self.sessions.values().map(Session::snapshot).collect(),
+            sessions: self.sessions.values_mut().map(Session::snapshot).collect(),
         };
         let Ok(json) = serde_json::to_string_pretty(&snapshot) else {
             return;

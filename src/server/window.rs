@@ -213,6 +213,14 @@ pub struct Tab {
     scroll_top: Option<isize>,
     /// Present while the tab is identified as running Claude Code.
     pub agent: Option<Tracker>,
+    /// The Claude Code session id this tab's claude instance owns:
+    /// seeded when the tab was spawned as a resume (Claude Code keeps
+    /// the id across resumes), or assigned at save time by matching
+    /// transcript creation times. Cleared when claude exits.
+    pub claude_session: Option<String>,
+    /// When this tab was first seen running Claude Code; the matching
+    /// anchor for transcripts. Cleared when claude exits.
+    pub claude_since: Option<std::time::SystemTime>,
     master: Box<dyn MasterPty>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -239,7 +247,11 @@ impl Tab {
         session: &str,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
-        Self::spawn_argv(rect, cwd, &["claude", "--resume", session], tx)
+        let mut tab = Self::spawn_argv(rect, cwd, &["claude", "--resume", session], tx)?;
+        // The resumed instance keeps this id, so the tab's owner is known
+        // without transcript matching.
+        tab.claude_session = Some(session.to_string());
+        Ok(tab)
     }
 
     fn spawn_argv(
@@ -314,6 +326,8 @@ impl Tab {
             drawn_seqno: 0,
             scroll_top: None,
             agent: None,
+            claude_session: None,
+            claude_since: None,
             master: pair.master,
             child,
         })
@@ -353,14 +367,26 @@ impl Tab {
                 _ => false,
             }
         };
-        if !fg.is_some_and(|fg| fg.is_claude()) {
+        if !fg.as_ref().is_some_and(|fg| fg.is_claude()) {
             // Not Claude Code — no status text, drop
-            // any stale state.
+            // any stale state. Session identity is cleared only on a
+            // definite non-claude sighting (a later claude in this tab is
+            // a different session); an unreadable foreground (e.g.
+            // mid-exec) is transient and must not wipe it.
+            if fg.is_some() {
+                self.claude_session = None;
+                self.claude_since = None;
+            }
             return self.agent.take().is_some() || renamed;
         }
         let snapshot = agent::Snapshot::capture(&self.engine);
         let raw = agent::evaluate(&snapshot);
         let appeared = self.agent.is_none();
+        // First sighting of this claude instance; kept across tracker
+        // flicker so the transcript-matching anchor doesn't drift.
+        if self.claude_since.is_none() {
+            self.claude_since = Some(std::time::SystemTime::now());
+        }
         let tracker = self.agent.get_or_insert_default();
         let changed = tracker.observe(raw, std::time::Instant::now());
         appeared || changed || renamed
