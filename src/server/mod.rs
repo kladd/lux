@@ -136,6 +136,7 @@ pub fn run() -> i32 {
     let mut server = Server {
         sessions: BTreeMap::new(),
         clients: HashMap::new(),
+        attach_order: Vec::new(),
         keys,
         clipboard: arboard::Clipboard::new().ok(),
         next_session_id: 0,
@@ -213,7 +214,7 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
         Request::Kill => {
             let _ = tx.send(ServerEvent::Kill(stream));
         }
-        Request::New(_) | Request::Attach(_) => {
+        Request::New | Request::Session(_) | Request::Recent => {
             let mut fds = fds.into_iter();
             let (Some(stdin), Some(stdout)) = (fds.next(), fds.next()) else {
                 return;
@@ -254,6 +255,10 @@ struct Server {
     /// Creation-ordered, the order `ls` and the switcher present.
     sessions: BTreeMap<SessionId, Session>,
     clients: HashMap<ConnId, Client>,
+    /// Sessions in attachment order, most recent last — the fallback
+    /// targets for an attach with no name. Ended sessions are skipped on
+    /// lookup rather than eagerly pruned.
+    attach_order: Vec<SessionId>,
     keys: Arc<KeyTable>,
     clipboard: Option<arboard::Clipboard>,
     next_session_id: SessionId,
@@ -467,30 +472,18 @@ impl Server {
         let area = Rect::new(0, 0, size.width, size.height);
 
         let sid = match request {
-            // Bare connect creates an auto-named
-            // session.
-            Request::New(None) => self.create_session(None, area),
-            // Named create fails on collision.
-            Request::New(Some(name)) => {
-                if self.session_by_name(&name).is_some() {
-                    let _ = protocol::write_line(
-                        &mut stream,
-                        &format!("err session '{name}' already exists"),
-                    );
-                    return;
-                }
-                self.create_session(Some(name), area)
-            }
-            // Attach to the named session or fail.
-            Request::Attach(name) => match self.session_by_name(&name) {
+            // Bare connect creates an auto-named session.
+            Request::New => self.create_session(None, area),
+            // A name attaches to its session, or creates it.
+            Request::Session(name) => match self.session_by_name(&name) {
                 Some(sid) => Ok(sid),
-                None => {
-                    let _ = protocol::write_line(
-                        &mut stream,
-                        &format!("err no session named '{name}'"),
-                    );
-                    return;
-                }
+                None => self.create_session(Some(name), area),
+            },
+            // No target falls back to the most recently attached
+            // session, or starts fresh when there is none.
+            Request::Recent => match self.recent_session() {
+                Some(sid) => Ok(sid),
+                None => self.create_session(None, area),
             },
             _ => return,
         };
@@ -548,6 +541,7 @@ impl Server {
                 grid: None,
             },
         );
+        self.note_attached(sid);
     }
 
     fn create_session(&mut self, name: Option<String>, area: Rect) -> Result<SessionId, String> {
@@ -566,6 +560,21 @@ impl Server {
         self.next_session_id += 1;
         self.sessions.insert(sid, session);
         Ok(sid)
+    }
+
+    /// Record `sid` as the most recently attached session.
+    fn note_attached(&mut self, sid: SessionId) {
+        self.attach_order.retain(|&id| id != sid);
+        self.attach_order.push(sid);
+    }
+
+    /// The most recently attached session still running.
+    fn recent_session(&self) -> Option<SessionId> {
+        self.attach_order
+            .iter()
+            .rev()
+            .copied()
+            .find(|sid| self.sessions.contains_key(sid))
     }
 
     fn session_by_name(&self, name: &str) -> Option<SessionId> {
@@ -783,6 +792,7 @@ impl Server {
                         client.attached = target;
                     }
                 }
+                self.note_attached(target);
                 if let Some(session) = self.sessions.get_mut(&target) {
                     session.set_area(Rect::new(0, 0, size.width, size.height));
                     session.request_redraw();
@@ -850,6 +860,7 @@ impl Server {
                         client.attached = item.session;
                     }
                 }
+                self.note_attached(item.session);
                 if let Some(session) = self.sessions.get_mut(&item.session) {
                     session.focus_tab(item.window, item.tab);
                     session.set_area(area);

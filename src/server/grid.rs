@@ -22,10 +22,12 @@ use crate::server::{SessionId, clear_region};
 /// The pinned switcher entry's display name.
 pub const ENTRY_NAME: &str = "CLAUDECOM";
 
-/// Minimum size of a grid tile — enough to show a recognizable slice of
-/// a Claude Code tab, unlike the much smaller window-split floor.
-const TILE_MIN_COLS: u16 = 40;
-const TILE_MIN_ROWS: u16 = 10;
+/// Fixed size of every grid tile — enough to show a recognizable slice
+/// of a Claude Code tab. Tiles never grow past this to fill leftover
+/// screen space; deriving their shape from the screen made them taller
+/// and wider than reads well.
+const TILE_COLS: u16 = 60;
+const TILE_ROWS: u16 = 24;
 
 /// A client's view of the grid: the highlighted tile and the first
 /// visible tile row.
@@ -69,9 +71,8 @@ pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<GridItem> {
 }
 
 /// Tile geometry for `count` items in `area`: the largest number of
-/// equal-width columns and equal-height rows for which each tile is at
-/// least the minimum tile size, so a tile's shape derives from the
-/// screen alone. Excess items wrap into rows below; rows past the
+/// fixed-size tile columns that fit the screen width, leftover space
+/// left blank. Excess items wrap into rows below; rows past the
 /// screenful scroll.
 struct Layout {
     cols: usize,
@@ -84,19 +85,16 @@ struct Layout {
 }
 
 fn layout(area: Rect, count: usize) -> Option<Layout> {
-    if count == 0 || area.width < TILE_MIN_COLS || area.height < TILE_MIN_ROWS {
+    if count == 0 || area.width < TILE_COLS || area.height < TILE_ROWS {
         return None;
     }
-    let cols = (area.width / TILE_MIN_COLS) as usize;
-    let tile_w = area.width / cols as u16;
-    let fit = area.height / TILE_MIN_ROWS;
-    let tile_h = area.height / fit;
+    let cols = (area.width / TILE_COLS) as usize;
     let rows = count.div_ceil(cols);
-    let visible = (fit as usize).min(rows);
+    let visible = ((area.height / TILE_ROWS) as usize).min(rows);
     Some(Layout {
         cols,
-        tile_w,
-        tile_h,
+        tile_w: TILE_COLS,
+        tile_h: TILE_ROWS,
         rows,
         visible,
     })
@@ -220,13 +218,13 @@ fn draw_empty(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// One tile: the tab's bracketed status text and home session name on a
-/// top chrome row, the tail of the tab's live content below, cropped to
-/// the tile without touching the tab's real size. The rightmost cell
-/// stays blank so adjacent tiles' content doesn't run together. The
-/// highlighted tile is framed by a border, its chrome text sitting on
-/// the top edge like a title so the border can't collide with the
-/// status coloring.
+/// One tile: the tab's bracketed status text, home session name, and tab
+/// name on a top chrome row, the tail of the tab's live content below,
+/// cropped to the tile without touching the tab's real size. The
+/// rightmost cell stays blank so adjacent tiles' content doesn't run
+/// together. The highlighted tile is framed by a border, its chrome text
+/// sitting on the top edge like a title so the border can't collide with
+/// the status coloring.
 fn draw_tile(
     buf: &mut Buffer,
     rect: Rect,
@@ -309,6 +307,14 @@ fn draw_tile(
             break;
         }
     }
+    // The tab name after the session name, tmux-target style
+    // (`session:tab`), dimmer so the session name stays dominant.
+    put(&mut x, ':', base.fg(Color::DarkGray));
+    for ch in tab.name.chars() {
+        if !put(&mut x, ch, base.fg(Color::DarkGray)) {
+            break;
+        }
+    }
 }
 
 /// The highlight border's color, matching the switcher's highlight.
@@ -323,39 +329,40 @@ mod tests {
     }
 
     #[test]
-    fn tiles_derive_from_the_screen_alone() {
-        // 100×25 fits two 50-wide columns and two 12-high rows, however
-        // many items there are.
+    fn tiles_keep_their_fixed_size() {
+        // 150 wide fits two 60-wide columns; tiles stay 60×24 however
+        // much screen is left over and however many items there are.
         for count in [1, 3, 9] {
-            let l = layout(area(100, 25), count).unwrap();
-            assert_eq!((l.cols, l.tile_w, l.tile_h), (2, 50, 12));
+            let l = layout(area(150, 70), count).unwrap();
+            assert_eq!((l.cols, l.tile_w, l.tile_h), (2, 60, 24));
         }
-        // 200×50 fits five 40-wide columns and five 10-high rows.
-        let l = layout(area(200, 50), 3).unwrap();
-        assert_eq!((l.cols, l.tile_w, l.tile_h), (5, 40, 10));
-        // Smaller than one minimum tile lays out nothing.
-        assert!(layout(area(39, 24), 3).is_none());
-        assert!(layout(area(80, 9), 3).is_none());
-        assert!(layout(area(80, 24), 0).is_none());
+        // 300 wide fits five columns of the same fixed-size tiles.
+        let l = layout(area(300, 150), 3).unwrap();
+        assert_eq!((l.cols, l.tile_w, l.tile_h), (5, 60, 24));
+        // Smaller than one tile lays out nothing.
+        assert!(layout(area(59, 70), 3).is_none());
+        assert!(layout(area(120, 23), 3).is_none());
+        assert!(layout(area(120, 70), 0).is_none());
     }
 
     #[test]
     fn rows_wrap_the_overflow_and_cap_at_the_screenful() {
-        // Two columns: three items need two rows, both on screen.
-        let l = layout(area(100, 25), 3).unwrap();
+        // Two columns: three items need two rows, both fitting in 80
+        // screen rows.
+        let l = layout(area(150, 80), 3).unwrap();
         assert_eq!((l.rows, l.visible), (2, 2));
         // A single row of items shows just that row.
-        let l = layout(area(100, 25), 2).unwrap();
+        let l = layout(area(150, 80), 2).unwrap();
         assert_eq!((l.rows, l.visible), (1, 1));
-        // Ten items need five rows; only two fit.
-        let l = layout(area(100, 25), 10).unwrap();
-        assert_eq!((l.rows, l.visible), (5, 2));
+        // Ten items need five rows; only three fit.
+        let l = layout(area(150, 80), 10).unwrap();
+        assert_eq!((l.rows, l.visible), (5, 3));
     }
 
     #[test]
     fn navigation_moves_to_spatial_neighbors_and_holds_at_edges() {
         // 4 columns, 6 items: two rows, the second row partial.
-        let a = area(160, 24);
+        let a = area(240, 70);
         let mut s = GridState::default();
         navigate(&mut s, a, 6, Dir::Left);
         assert_eq!(s.highlight, 0, "left edge holds");
@@ -378,7 +385,7 @@ mod tests {
     #[test]
     fn scrolling_follows_the_highlight() {
         // 4 columns × 2 visible rows, 20 items: 5 rows.
-        let l = layout(area(160, 20), 20).unwrap();
+        let l = layout(area(240, 70), 20).unwrap();
         assert_eq!((l.cols, l.rows, l.visible), (4, 5, 2));
         let mut s = GridState::default();
         s.highlight = 19; // last row

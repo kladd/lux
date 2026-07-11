@@ -20,11 +20,15 @@ use sendfd::{RecvWithFd, SendWithFd};
 /// Client request line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Create a new session (optionally named) and attach.
+    /// Create a new auto-named session and attach. Carries fds.
+    New,
+    /// Attach to the named session, creating it first if no session has
+    /// that name. Carries fds.
+    Session(String),
+    /// Attach to the most recently attached session, or to a new
+    /// auto-named one if no session has ever been attached to.
     /// Carries fds.
-    New(Option<String>),
-    /// Attach to an existing named session. Carries fds.
-    Attach(String),
+    Recent,
     /// List session names.
     Ls,
     /// Terminate the server.
@@ -36,9 +40,9 @@ pub enum Request {
 impl Request {
     pub fn encode(&self) -> String {
         match self {
-            Request::New(None) => "new\n".into(),
-            Request::New(Some(name)) => format!("new {name}\n"),
-            Request::Attach(name) => format!("attach {name}\n"),
+            Request::New => "new\n".into(),
+            Request::Session(name) => format!("session {name}\n"),
+            Request::Recent => "recent\n".into(),
             Request::Ls => "ls\n".into(),
             Request::Kill => "kill\n".into(),
             Request::Resize => "resize\n".into(),
@@ -48,10 +52,10 @@ impl Request {
     pub fn decode(line: &str) -> Option<Self> {
         let line = line.strip_suffix('\n').unwrap_or(line);
         Some(match line.split_once(' ') {
-            Some(("new", name)) if !name.is_empty() => Request::New(Some(name.into())),
-            Some(("attach", name)) if !name.is_empty() => Request::Attach(name.into()),
+            Some(("session", name)) if !name.is_empty() => Request::Session(name.into()),
             None => match line {
-                "new" => Request::New(None),
+                "new" => Request::New,
+                "recent" => Request::Recent,
                 "ls" => Request::Ls,
                 "kill" => Request::Kill,
                 "resize" => Request::Resize,
@@ -139,9 +143,9 @@ mod tests {
     #[test]
     fn requests_round_trip() {
         for req in [
-            Request::New(None),
-            Request::New(Some("work".into())),
-            Request::Attach("work".into()),
+            Request::New,
+            Request::Session("work".into()),
+            Request::Recent,
             Request::Ls,
             Request::Kill,
             Request::Resize,
@@ -149,6 +153,6 @@ mod tests {
             assert_eq!(Request::decode(&req.encode()), Some(req));
         }
         assert_eq!(Request::decode("bogus\n"), None);
-        assert_eq!(Request::decode("new \n"), None);
+        assert_eq!(Request::decode("session \n"), None);
     }
 }

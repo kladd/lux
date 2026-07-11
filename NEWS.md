@@ -2,6 +2,19 @@
 
 ## 2026-07-11
 
+- `-s` and `-t` now both attach to the named session if it exists and
+  create it otherwise, instead of erroring on a collision or a missing
+  session.
+- Bare `attach`/`attach-session` attaches to the most recently attached
+  session, or creates a new auto-named one if nothing has been attached
+  to yet.
+- Bare `new`/`new-session` creates an auto-named session instead of
+  erroring.
+- CLAUDECOM grid tiles are now a fixed 60×24 instead of stretching to
+  fill the screen.
+- Each CLAUDECOM tile's header now shows the tab name after the session
+  name (`session:tab`).
+
 - `prefix+g` opens the CLAUDECOM grid directly, without going through the
   switcher.
 - The CLAUDECOM grid's highlighted tile is now marked by a border around
