@@ -823,14 +823,10 @@ impl Session {
                     self.move_repeat = Some(Instant::now() + MOVE_REPEAT);
                 }
             }
-            // Prefix+m then a direction key reverses the nearest
-            // enclosing split of that axis; no such ancestor leaves the
-            // tree untouched.
-            Command::Mirror(kind) => {
-                if layout::mirror(&mut self.tree, self.focus, kind) {
-                    self.force_redraw = true;
-                }
-            }
+            // Prefix+m then a direction key exchanges the focused window
+            // with the spatially adjacent one; at a screen edge the
+            // sequence is discarded.
+            Command::SwapDir(dir) => self.swap_dir(dir),
             // Prefix+z toggles the focused window's maximized state.
             Command::Maximize => {
                 self.maximized = (self.maximized != Some(self.focus)).then_some(self.focus);
@@ -1119,6 +1115,24 @@ impl Session {
         }
         self.force_redraw = true;
         true
+    }
+
+    /// Exchange the focused window with the window spatially adjacent in
+    /// `dir`; focus stays with the moved window. Both windows' PTYs and
+    /// engines resize to their new rectangles on the next frame's
+    /// reconcile.
+    fn swap_dir(&mut self, dir: Dir) {
+        let rects = self.layout_rects();
+        let Some(&(_, from)) = rects.iter().find(|(id, _)| *id == self.focus) else {
+            return;
+        };
+        // No adjacent window — discard, swap nothing.
+        let Some(other) = layout::spatial_neighbor(&rects, from, dir) else {
+            return;
+        };
+        if layout::swap_leaves(&mut self.tree, self.focus, other) {
+            self.force_redraw = true;
+        }
     }
 
     /// Terminate the focused window's child processes,

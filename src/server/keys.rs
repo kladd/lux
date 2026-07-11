@@ -4,7 +4,7 @@
 
 use ratatui::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers as CtMods};
 
-use crate::server::layout::{Dir, SplitKind};
+use crate::server::layout::Dir;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
@@ -32,9 +32,9 @@ pub enum Command {
     /// Move the focused window's active tab into the spatially adjacent
     /// window in this direction.
     MoveTabDir(Dir),
-    /// Reverse the two children of the nearest ancestor split of this
-    /// orientation enclosing the focused window.
-    Mirror(SplitKind),
+    /// Exchange the focused window with the window spatially adjacent
+    /// in this direction.
+    SwapDir(Dir),
     /// Toggle the focused window's maximized state.
     Maximize,
     /// Flip the orientation of the split immediately containing the
@@ -80,8 +80,10 @@ impl Command {
             Command::MoveTabDir(Dir::Down) => "move tab down",
             Command::MoveTabDir(Dir::Up) => "move tab up",
             Command::MoveTabDir(Dir::Right) => "move tab right",
-            Command::Mirror(SplitKind::SideBySide) => "mirror horizontally",
-            Command::Mirror(SplitKind::Stacked) => "mirror vertically",
+            Command::SwapDir(Dir::Left) => "swap window left",
+            Command::SwapDir(Dir::Down) => "swap window down",
+            Command::SwapDir(Dir::Up) => "swap window up",
+            Command::SwapDir(Dir::Right) => "swap window right",
             Command::Maximize => "maximize window",
             Command::Rotate => "rotate split",
             Command::Rebalance => "rebalance splits",
@@ -287,22 +289,22 @@ impl Default for KeyTable {
             cmd(',', Command::RenameTab),
             // tmux's kill-pane key.
             cmd('x', Command::CloseWindow),
-            // Prefix+m enters the mirror submap; the direction key picks
-            // the axis: h/l reverse the nearest horizontal split's
-            // children, j/k the nearest vertical split's.
+            // Prefix+m enters the swap submap; the direction key picks
+            // the spatially adjacent window the focused window trades
+            // places with.
             (
                 plain('m'),
                 KeyTrie::Node(KeyTrieNode {
-                    description: "mirror split",
+                    description: "swap window",
                     bindings: vec![
-                        cmd('h', Command::Mirror(SplitKind::SideBySide)),
-                        cmd('l', Command::Mirror(SplitKind::SideBySide)),
-                        arrow(CtKeyCode::Left, Command::Mirror(SplitKind::SideBySide)),
-                        arrow(CtKeyCode::Right, Command::Mirror(SplitKind::SideBySide)),
-                        cmd('j', Command::Mirror(SplitKind::Stacked)),
-                        cmd('k', Command::Mirror(SplitKind::Stacked)),
-                        arrow(CtKeyCode::Down, Command::Mirror(SplitKind::Stacked)),
-                        arrow(CtKeyCode::Up, Command::Mirror(SplitKind::Stacked)),
+                        cmd('h', Command::SwapDir(Dir::Left)),
+                        cmd('j', Command::SwapDir(Dir::Down)),
+                        cmd('k', Command::SwapDir(Dir::Up)),
+                        cmd('l', Command::SwapDir(Dir::Right)),
+                        arrow(CtKeyCode::Left, Command::SwapDir(Dir::Left)),
+                        arrow(CtKeyCode::Down, Command::SwapDir(Dir::Down)),
+                        arrow(CtKeyCode::Up, Command::SwapDir(Dir::Up)),
+                        arrow(CtKeyCode::Right, Command::SwapDir(Dir::Right)),
                     ],
                 }),
             ),
@@ -557,11 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn prefix_m_is_a_chord_node_of_directional_mirrors() {
+    fn prefix_m_is_a_chord_node_of_directional_swaps() {
         // M resolves to a node, not a command, and its submap binds the
-        // four vim directions plus their arrow alternates: h/l/Left/Right
-        // mirror the nearest horizontal split, j/k/Down/Up the nearest
-        // vertical one.
+        // four vim directions plus their arrow alternates, each swapping
+        // the focused window with its spatial neighbor on that side.
         let table = KeyTable::default();
         let plain = |c| KeyMatch {
             code: CtKeyCode::Char(c),
@@ -576,14 +577,14 @@ mod tests {
         let Some(KeyTrie::Node(node)) = table.root.get(plain('m')) else {
             panic!("m is not a chord node");
         };
-        assert_eq!(node.description, "mirror split");
-        for (c, code, kind) in [
-            ('h', CtKeyCode::Left, SplitKind::SideBySide),
-            ('l', CtKeyCode::Right, SplitKind::SideBySide),
-            ('j', CtKeyCode::Down, SplitKind::Stacked),
-            ('k', CtKeyCode::Up, SplitKind::Stacked),
+        assert_eq!(node.description, "swap window");
+        for (c, code, dir) in [
+            ('h', CtKeyCode::Left, Dir::Left),
+            ('j', CtKeyCode::Down, Dir::Down),
+            ('k', CtKeyCode::Up, Dir::Up),
+            ('l', CtKeyCode::Right, Dir::Right),
         ] {
-            let expect = Some(&KeyTrie::Command(Command::Mirror(kind)));
+            let expect = Some(&KeyTrie::Command(Command::SwapDir(dir)));
             assert_eq!(node.get(plain(c)), expect);
             assert_eq!(node.get(arrow(code)), expect);
         }
@@ -659,17 +660,19 @@ mod tests {
             shift: false,
         };
         let rows = table.node_at(&[m]).expect("m node").hints();
-        // The keys per axis share a description and collapse into one
-        // row each.
-        assert_eq!(rows.len(), 2);
-        assert!(rows.contains(&("h, l, Left, Right".to_string(), "mirror horizontally")));
-        assert!(rows.contains(&("j, k, Down, Up".to_string(), "mirror vertically")));
+        // Each direction's letter and arrow share a description and
+        // collapse into one row.
+        assert_eq!(rows.len(), 4);
+        assert!(rows.contains(&("h, Left".to_string(), "swap window left")));
+        assert!(rows.contains(&("j, Down".to_string(), "swap window down")));
+        assert!(rows.contains(&("k, Up".to_string(), "swap window up")));
+        assert!(rows.contains(&("l, Right".to_string(), "swap window right")));
         // The root's rows include the node entry itself.
         assert!(
             table
                 .root
                 .hints()
-                .contains(&("m".to_string(), "mirror split"))
+                .contains(&("m".to_string(), "swap window"))
         );
     }
 

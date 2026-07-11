@@ -228,28 +228,26 @@ pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -
     true
 }
 
-/// Reverse the two children of the nearest ancestor split of `kind`
-/// enclosing `focused` — the deepest such split on the path from the root
-/// to that leaf. The ratio stays with the position, so an uneven split's
-/// windows trade sizes as they trade places. Returns whether such a split
-/// exists.
-pub fn mirror(node: &mut Node, focused: WindowId, kind: SplitKind) -> bool {
-    let Node::Split(s) = node else { return false };
-    let child = if contains(&s.first, focused) {
-        &mut s.first
-    } else if contains(&s.second, focused) {
-        &mut s.second
-    } else {
+/// Exchange the tree positions of leaves `a` and `b`. Every split's kind
+/// and ratio stay put, so windows of different sizes trade sizes as they
+/// trade places. Returns whether both leaves exist.
+pub fn swap_leaves(node: &mut Node, a: WindowId, b: WindowId) -> bool {
+    fn exchange(node: &mut Node, a: WindowId, b: WindowId) {
+        match node {
+            Node::Leaf(id) if *id == a => *id = b,
+            Node::Leaf(id) if *id == b => *id = a,
+            Node::Leaf(_) => {}
+            Node::Split(s) => {
+                exchange(&mut s.first, a, b);
+                exchange(&mut s.second, a, b);
+            }
+        }
+    }
+    if a == b || !contains(node, a) || !contains(node, b) {
         return false;
-    };
-    if mirror(child, focused, kind) {
-        return true;
     }
-    if s.kind == kind {
-        std::mem::swap(&mut s.first, &mut s.second);
-        return true;
-    }
-    false
+    exchange(node, a, b);
+    true
 }
 
 /// Flip the orientation of the split immediately containing `focused` —
@@ -415,26 +413,24 @@ mod tests {
     }
 
     #[test]
-    fn mirror_reverses_the_nearest_split_of_its_axis() {
-        // 1 | (2 / 3): window 2's nearest horizontal split is the root;
-        // its nearest vertical split is the inner stack.
+    fn swap_exchanges_two_leaf_positions() {
+        // 1 | (2 / 3): swapping 1 and 3 leaves the splits alone and
+        // trades the leaves' places, even across subtrees.
         let mut tree = Node::Leaf(1);
         split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
         split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
-        assert!(mirror(&mut tree, 2, SplitKind::Stacked));
-        assert_eq!(leaves(&tree), vec![1, 3, 2]);
-        assert!(mirror(&mut tree, 2, SplitKind::SideBySide));
+        assert!(swap_leaves(&mut tree, 1, 3));
         assert_eq!(leaves(&tree), vec![3, 2, 1]);
-        // No ancestor of the axis: window 1 now sits under the root
-        // horizontal split only.
-        assert!(!mirror(&mut tree, 1, SplitKind::Stacked));
-        assert_eq!(leaves(&tree), vec![3, 2, 1]);
-        // A lone leaf has no split at all.
-        assert!(!mirror(&mut Node::Leaf(1), 1, SplitKind::SideBySide));
+        assert!(swap_leaves(&mut tree, 3, 2));
+        assert_eq!(leaves(&tree), vec![2, 3, 1]);
+        // A missing leaf or a self-swap changes nothing.
+        assert!(!swap_leaves(&mut tree, 1, 9));
+        assert!(!swap_leaves(&mut tree, 1, 1));
+        assert_eq!(leaves(&tree), vec![2, 3, 1]);
     }
 
     #[test]
-    fn mirror_keeps_the_ratio_with_the_position() {
+    fn swap_trades_sizes_with_positions() {
         // An uneven split's larger share stays on its side; the windows
         // trade sizes as they trade places.
         let mut tree = Node::Leaf(1);
@@ -444,7 +440,7 @@ mod tests {
         }
         let before: std::collections::HashMap<_, _> =
             compute(&tree, area()).0.into_iter().collect();
-        assert!(mirror(&mut tree, 1, SplitKind::SideBySide));
+        assert!(swap_leaves(&mut tree, 1, 2));
         let after: std::collections::HashMap<_, _> = compute(&tree, area()).0.into_iter().collect();
         assert_eq!(before[&1].width, after[&2].width);
         assert_eq!(before[&2].width, after[&1].width);

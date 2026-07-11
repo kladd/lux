@@ -46,7 +46,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `h` `j` `k` `l` | focus split left/down/up/right |
 | `H` `J` `K` `L` | move the active tab into the split left/down/up/right |
 | `r` then `h` `j` `k` `l` | resize split left/down/up/right (tap again within 500ms to keep resizing) |
-| `m` then `h`/`l` or `j`/`k` | mirror the enclosing split horizontally or vertically |
+| `m` then `h` `j` `k` `l` | swap the focused window with the adjacent window left/down/up/right |
 | `i` | rotate (flip the orientation of) the enclosing split |
 | `=` | rebalance every split to an even ratio |
 | `z` | maximize/zoom the focused window |
