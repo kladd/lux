@@ -632,6 +632,10 @@ impl Session {
 
     pub fn handle_mouse(&mut self, mouse: CtMouseEvent) -> Option<Effect> {
         let pos = Position::new(mouse.column, mouse.row);
+        // Shift bypasses a program's mouse grab (the xterm/tmux
+        // convention), keeping selection, yank, and paste reachable
+        // inside mouse-aware programs.
+        let shift = mouse.modifiers.contains(CtMods::SHIFT);
         match mouse.kind {
             CtMouseKind::Down(button) => {
                 let id = self.window_at(pos)?;
@@ -652,8 +656,8 @@ impl Session {
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
-                // The program owns the mouse.
-                if tab.engine.is_mouse_grabbed() {
+                // The program owns the mouse, unless Shift bypasses it.
+                if tab.engine.is_mouse_grabbed() && !shift {
                     forward_mouse(tab, &mouse, content);
                     return None;
                 }
@@ -697,12 +701,12 @@ impl Session {
                     self.force_redraw = true;
                 }
                 // Releases and motion still reach a
-                // grabbed program.
+                // grabbed program, unless Shift bypasses it.
                 let id = self.window_at(pos)?;
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
-                if tab.engine.is_mouse_grabbed() {
+                if tab.engine.is_mouse_grabbed() && !shift {
                     forward_mouse(tab, &mouse, content);
                 }
             }

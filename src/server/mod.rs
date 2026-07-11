@@ -70,6 +70,8 @@ pub enum ServerEvent {
     /// The client's stdin went quiet after input: resolve any bytes the
     /// decoder held back waiting for more (a partial paste marker).
     InputIdle(ConnId),
+    /// A tab's program set the clipboard via OSC 52.
+    ProgramCopy(TabId, String),
 }
 
 /// One attached client (at most one per session).
@@ -359,7 +361,8 @@ impl Server {
             ServerEvent::Ls(_)
             | ServerEvent::Kill(_)
             | ServerEvent::Resized(_)
-            | ServerEvent::ConnGone(_) => {}
+            | ServerEvent::ConnGone(_)
+            | ServerEvent::ProgramCopy(..) => {}
         }
         match event {
             ServerEvent::PtyOutput(tab, bytes) => {
@@ -423,6 +426,26 @@ impl Server {
             }
             ServerEvent::Input(conn, bytes) => self.client_input(conn, bytes),
             ServerEvent::InputIdle(conn) => self.client_input_idle(conn),
+            // A program inside a tab copied: put the text on the system
+            // clipboard and mirror it via OSC 52 to the terminal of the
+            // client attached to that tab's session, matching the yank
+            // path.
+            ServerEvent::ProgramCopy(tab, text) => {
+                if let Some(clipboard) = &mut self.clipboard {
+                    let _ = clipboard.set_text(text.clone());
+                }
+                let Some(sid) = self
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| s.has_tab(tab))
+                    .map(|(&sid, _)| sid)
+                else {
+                    return;
+                };
+                for client in self.clients.values_mut().filter(|c| c.attached == sid) {
+                    osc52_copy(&mut client.raw_out, &text);
+                }
+            }
         }
     }
 

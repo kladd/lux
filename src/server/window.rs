@@ -12,7 +12,9 @@ use anyhow::Context;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::layout::Rect;
 use wezterm_term::color::ColorPalette;
-use wezterm_term::{Terminal as Engine, TerminalConfiguration, TerminalSize};
+use wezterm_term::{
+    Clipboard, ClipboardSelection, Terminal as Engine, TerminalConfiguration, TerminalSize,
+};
 
 use crate::server::ServerEvent;
 use crate::server::agent::{self, Tracker};
@@ -30,6 +32,25 @@ struct LuxConfig;
 impl TerminalConfiguration for LuxConfig {
     fn color_palette(&self) -> ColorPalette {
         ColorPalette::default()
+    }
+}
+
+/// Routes a tab program's OSC 52 clipboard writes out of the engine to
+/// the server loop; without a hook the engine drops them silently.
+/// Clipboard queries never reach this hook — the engine discards them,
+/// so no program can read the clipboard.
+struct ClipboardRelay {
+    tab: TabId,
+    tx: Sender<ServerEvent>,
+}
+
+impl Clipboard for ClipboardRelay {
+    fn set_contents(&self, _: ClipboardSelection, data: Option<String>) -> anyhow::Result<()> {
+        // `None` clears the clipboard; there's nothing to relay.
+        if let Some(text) = data {
+            let _ = self.tx.send(ServerEvent::ProgramCopy(self.tab, text));
+        }
+        Ok(())
     }
 }
 
@@ -241,6 +262,7 @@ impl Tab {
 
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
+        let relay_tx = tx.clone();
 
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
@@ -263,13 +285,18 @@ impl Tab {
 
         // The engine writes encoded key input back through `writer` into
         // the PTY.
-        let engine = Engine::new(
+        let mut engine = Engine::new(
             term_size(rect),
             Arc::new(LuxConfig),
             "lux",
             env!("CARGO_PKG_VERSION"),
             Box::new(writer),
         );
+        let clipboard: Arc<dyn Clipboard> = Arc::new(ClipboardRelay {
+            tab: id,
+            tx: relay_tx,
+        });
+        engine.set_clipboard(&clipboard);
 
         // Until the first foreground read, the name is the spawned
         // command's.
@@ -477,5 +504,50 @@ mod tests {
         assert!(fg("claude", "node").is_claude());
         assert!(fg("node", "claude").is_claude());
         assert!(!fg("node", "node").is_claude());
+    }
+
+    #[test]
+    fn osc52_copies_reach_the_relay_and_queries_go_unanswered() {
+        use std::sync::Mutex;
+
+        // Captures what the engine writes back toward the program.
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let replies = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = Engine::new(
+            term_size(Rect::new(0, 0, 80, 24)),
+            Arc::new(LuxConfig),
+            "lux",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(SharedWriter(replies.clone())),
+        );
+        let clipboard: Arc<dyn Clipboard> = Arc::new(ClipboardRelay { tab: 7, tx });
+        engine.set_clipboard(&clipboard);
+
+        // A program's copy: OSC 52 with base64 content ("hello").
+        engine.advance_bytes(b"\x1b]52;c;aGVsbG8=\x07");
+        match rx.try_recv() {
+            Ok(ServerEvent::ProgramCopy(tab, text)) => {
+                assert_eq!(tab, 7);
+                assert_eq!(text, "hello");
+            }
+            _ => panic!("expected a ProgramCopy event"),
+        }
+
+        // A clipboard query is discarded: no event, and no reply handing
+        // the program the clipboard's contents.
+        engine.advance_bytes(b"\x1b]52;c;?\x07");
+        assert!(rx.try_recv().is_err());
+        assert!(replies.lock().unwrap().is_empty());
     }
 }
