@@ -56,6 +56,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit) |
 | `d` | detach from the session |
 | `s` | open the session switcher |
+| `g` | open the CLAUDECOM grid |
 | `:` | open the ex command line |
 
 Arrow keys work as alternates for `h`/`j`/`k`/`l` (and Shift-arrows for
@@ -74,6 +75,15 @@ Ex commands (typed after `:`, with autocomplete):
 Prefix+`s` opens the session switcher: a list of sessions with a live
 preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
 `Ctrl-n`/`Ctrl-p`; `Enter` attaches, `Esc` cancels.
+
+While any tab runs Claude Code, the switcher pins a **CLAUDECOM** entry at
+the top: a live, read-only grid with one tile per Claude Code tab across
+every session, each showing its status text, home session name, and the
+tail of its output. Prefix+`g` jumps straight to the grid without opening
+the switcher. Move the highlight with
+`h`/`j`/`k`/`l` or the arrow keys (overflow rows scroll with it); `Enter`
+jumps to the highlighted tab's home session, window, and tab; `q`/`Esc`
+returns to the switcher.
 
 ## Configuration
 

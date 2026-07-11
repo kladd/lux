@@ -55,6 +55,8 @@ pub enum Effect {
     Detach,
     /// Enter switcher mode for the driving client.
     OpenSwitcher,
+    /// Enter the CLAUDECOM grid for the driving client.
+    OpenGrid,
     /// Yanked text for the system clipboard.
     Copy(String),
     /// Paste the system clipboard into this session.
@@ -161,7 +163,7 @@ struct Chrome {
 /// The session status line's neutral background — xterm-256
 /// grey 235 (#262626), distinct from the default background without a
 /// hue.
-const CHROME_BG: Color = Color::Indexed(235);
+pub(crate) const CHROME_BG: Color = Color::Indexed(235);
 
 /// The local hostname, fixed for the server's lifetime.
 static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
@@ -543,6 +545,49 @@ impl Session {
         self.windows.len()
     }
 
+    /// Whether any tab is currently identified as running Claude Code.
+    pub fn has_claude_tab(&self) -> bool {
+        self.windows
+            .values()
+            .any(|w| w.tabs.iter().any(|t| t.agent.is_some()))
+    }
+
+    /// The tabs currently identified as running Claude Code, in window
+    /// layout order then tab order: each as its window id and position in
+    /// that window's tab list.
+    pub fn claude_tabs(&self) -> Vec<(WindowId, usize)> {
+        let mut out = Vec::new();
+        for id in layout::leaves(&self.tree) {
+            let Some(win) = self.windows.get(&id) else {
+                continue;
+            };
+            for (i, tab) in win.tabs.iter().enumerate() {
+                if tab.agent.is_some() {
+                    out.push((id, i));
+                }
+            }
+        }
+        out
+    }
+
+    /// The tab at `index` in window `window`'s tab list.
+    pub fn tab_at(&self, window: WindowId, index: usize) -> Option<&Tab> {
+        self.windows.get(&window)?.tabs.get(index)
+    }
+
+    /// Focus `window` and make its tab at `index` active.
+    pub fn focus_tab(&mut self, window: WindowId, index: usize) {
+        let Some(win) = self.windows.get_mut(&window) else {
+            return;
+        };
+        if index < win.tabs.len() && win.active != index {
+            win.active = index;
+            self.drop_selection_in(window);
+        }
+        self.set_focus(window);
+        self.force_redraw = true;
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Effect> {
         if key.kind == KeyEventKind::Release {
             return None;
@@ -885,6 +930,8 @@ impl Session {
             Command::Detach => return Some(Effect::Detach),
             // Switcher mode is the server's to run.
             Command::Switcher => return Some(Effect::OpenSwitcher),
+            // So is the grid.
+            Command::Grid => return Some(Effect::OpenGrid),
             Command::OpenEx => self.open_prompt(PromptKind::Ex, String::new()),
             // Prefix+, prompts for the active tab's new name.
             Command::RenameTab => {
@@ -1928,7 +1975,7 @@ fn convert_mods(mods: CtMods) -> KeyModifiers {
     out
 }
 
-fn cell_style(attrs: &CellAttributes) -> Style {
+pub(crate) fn cell_style(attrs: &CellAttributes) -> Style {
     let mut style = Style::default()
         .fg(cell_color(attrs.foreground()))
         .bg(cell_color(attrs.background()));

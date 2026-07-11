@@ -23,6 +23,8 @@ pub enum Command {
     Detach,
     /// Open the session switcher.
     Switcher,
+    /// Open the CLAUDECOM grid directly, skipping the switcher.
+    Grid,
     /// Open the ex command line.
     OpenEx,
     /// Enter scroll mode for the focused window's active tab.
@@ -65,6 +67,7 @@ impl Command {
             Command::OnlyWindow => "close other windows",
             Command::Detach => "detach from session",
             Command::Switcher => "session switcher",
+            Command::Grid => "CLAUDECOM grid",
             Command::OpenEx => "command line",
             Command::ScrollMode => "scroll mode",
             Command::FocusDir(Dir::Left) => "focus window left",
@@ -259,6 +262,7 @@ impl Default for KeyTable {
             cmd('o', Command::OnlyWindow),
             cmd('d', Command::Detach),
             cmd('s', Command::Switcher),
+            cmd('g', Command::Grid),
             cmd(':', Command::OpenEx),
             cmd('[', Command::ScrollMode),
             cmd('h', Command::FocusDir(Dir::Left)),
@@ -511,6 +515,15 @@ mod tests {
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('s'), KeyModifiers::NONE)),
             Some(Command::Switcher)
+        );
+    }
+
+    #[test]
+    fn grid_is_bound_to_g() {
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(Command::Grid)
         );
     }
 

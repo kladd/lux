@@ -9,6 +9,7 @@ pub mod agent;
 pub mod anim;
 pub mod config;
 pub mod ex;
+pub mod grid;
 pub mod input;
 pub mod keys;
 pub mod layout;
@@ -35,8 +36,10 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::protocol::{self, Request};
+use grid::GridState;
 use input::{DecodedInput, InputDecoder};
 use keys::KeyTable;
+use layout::Dir;
 use session::{Effect, Session};
 use term::FdBackend;
 use window::TabId;
@@ -88,6 +91,8 @@ struct Client {
     attached: SessionId,
     /// `Some(highlighted index)` while in switcher mode.
     switcher: Option<usize>,
+    /// `Some` while viewing the CLAUDECOM grid.
+    grid: Option<GridState>,
 }
 
 pub fn run() -> i32 {
@@ -275,7 +280,7 @@ impl Server {
             || self.save_deadline.is_some()
             || self.sessions.values().any(|s| s.has_pending_repeat())
             || self.clients.values().any(|c| {
-                if c.switcher.is_some() {
+                if c.switcher.is_some() || c.grid.is_some() {
                     self.sessions.values().any(|s| s.has_animation())
                 } else {
                     self.sessions
@@ -540,6 +545,7 @@ impl Server {
                 stdin_stop,
                 attached: sid,
                 switcher: None,
+                grid: None,
             },
         );
     }
@@ -595,12 +601,19 @@ impl Server {
             self.detach(conn);
         }
         // Clamp switcher highlights that pointed past the removed session.
-        let remaining = self.sessions.len();
+        let remaining = self.pinned_entries() + self.sessions.len();
         for client in self.clients.values_mut() {
             if let Some(highlight) = client.switcher.as_mut() {
                 *highlight = (*highlight).min(remaining.saturating_sub(1));
             }
         }
+    }
+
+    /// How many pinned entries precede the sessions in the switcher's
+    /// list: the CLAUDECOM entry while any tab anywhere is
+    /// identified as running Claude Code.
+    fn pinned_entries(&self) -> usize {
+        self.sessions.values().any(Session::has_claude_tab) as usize
     }
 
     fn client_input(&mut self, conn: ConnId, bytes: Vec<u8>) {
@@ -626,6 +639,10 @@ impl Server {
             let Some(client) = self.clients.get(&conn) else {
                 return;
             };
+            if client.grid.is_some() {
+                self.grid_input(conn, &event);
+                continue;
+            }
             if client.switcher.is_some() {
                 self.switcher_input(conn, &event);
                 continue;
@@ -653,9 +670,17 @@ impl Server {
             Effect::Detach => self.detach(conn),
             // Switcher mode is per-connection.
             Effect::OpenSwitcher => {
-                let highlight = self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
+                let highlight = self.pinned_entries()
+                    + self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
                 if let Some(client) = self.clients.get_mut(&conn) {
                     client.switcher = Some(highlight);
+                }
+            }
+            // The grid opens directly, without passing through the
+            // switcher.
+            Effect::OpenGrid => {
+                if let Some(client) = self.clients.get_mut(&conn) {
+                    client.grid = Some(GridState::default());
                 }
             }
             // Native clipboard plus OSC 52 so the client's
@@ -685,13 +710,17 @@ impl Server {
         let DecodedInput::Key(key) = event else {
             return;
         };
-        let count = self.sessions.len();
+        let pinned = self.pinned_entries();
+        let count = pinned + self.sessions.len();
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
         };
         let Some(highlight) = client.switcher else {
             return;
         };
+        // The pinned entry can disappear under an open switcher; a stale
+        // highlight clamps rather than pointing past the list.
+        let highlight = highlight.min(count.saturating_sub(1));
         let ctrl = key
             .modifiers
             .contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
@@ -726,10 +755,16 @@ impl Server {
                     session.request_redraw();
                 }
             }
-            // Re-attach the connection to the selection.
+            // Re-attach the connection to the selection; the pinned
+            // CLAUDECOM entry opens its grid instead of any
+            // session.
             CtKeyCode::Enter => {
                 client.switcher = None;
-                let Some(&target) = self.sessions.keys().nth(highlight) else {
+                if highlight < pinned {
+                    client.grid = Some(GridState::default());
+                    return;
+                }
+                let Some(&target) = self.sessions.keys().nth(highlight - pinned) else {
                     return;
                 };
                 let current = client.attached;
@@ -757,15 +792,85 @@ impl Server {
         }
     }
 
-    /// Draw every attached client that needs it: switcher frames render
-    /// each pass (their preview is live); attached
+    /// Input while viewing the CLAUDECOM grid: directional
+    /// keys move the highlight, Enter jumps to the highlighted tab's home
+    /// session, Escape or `q` returns to the switcher. Everything else —
+    /// mouse included — is discarded; nothing reaches any tab's PTY.
+    fn grid_input(&mut self, conn: ConnId, event: &DecodedInput) {
+        let DecodedInput::Key(key) = event else {
+            return;
+        };
+        let items = grid::items(&self.sessions);
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        let Some(state) = client.grid.as_mut() else {
+            return;
+        };
+        let size = term::fd_size(&client.raw_out);
+        let area = Rect::new(0, 0, size.width, size.height);
+        let dir = match key.code {
+            CtKeyCode::Char('h') | CtKeyCode::Left => Some(Dir::Left),
+            CtKeyCode::Char('j') | CtKeyCode::Down => Some(Dir::Down),
+            CtKeyCode::Char('k') | CtKeyCode::Up => Some(Dir::Up),
+            CtKeyCode::Char('l') | CtKeyCode::Right => Some(Dir::Right),
+            _ => None,
+        };
+        if let Some(dir) = dir {
+            grid::navigate(state, area, items.len(), dir);
+            return;
+        }
+        match key.code {
+            // Back to the switcher, highlight on the pinned entry.
+            CtKeyCode::Esc | CtKeyCode::Char('q') => {
+                client.grid = None;
+                client.switcher = Some(0);
+            }
+            // Jump to the highlighted tile's home session, focusing the
+            // window containing its tab and making that tab active.
+            CtKeyCode::Enter => {
+                let highlight = state.highlight.min(items.len().saturating_sub(1));
+                // An empty grid has nothing to select; stay on it.
+                let Some(&item) = items.get(highlight) else {
+                    return;
+                };
+                client.grid = None;
+                let current = client.attached;
+                if item.session != current {
+                    // Exclusive attachment.
+                    if let Some(other) = self
+                        .clients
+                        .iter()
+                        .find(|(c, cl)| **c != conn && cl.attached == item.session)
+                        .map(|(conn, _)| *conn)
+                    {
+                        self.detach(other);
+                    }
+                    if let Some(client) = self.clients.get_mut(&conn) {
+                        client.attached = item.session;
+                    }
+                }
+                if let Some(session) = self.sessions.get_mut(&item.session) {
+                    session.focus_tab(item.window, item.tab);
+                    session.set_area(area);
+                    session.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Draw every attached client that needs it: switcher and grid frames
+    /// render each pass (their content is live); attached
     /// sessions render when their state advanced.
     fn render_all(&mut self) {
         let Server {
             sessions, clients, ..
         } = self;
         for client in clients.values_mut() {
-            if let Some(highlight) = client.switcher {
+            if client.grid.is_some() {
+                render_grid(client, sessions);
+            } else if let Some(highlight) = client.switcher {
                 render_switcher(client, sessions, highlight);
             } else if let Some(session) = sessions.get_mut(&client.attached)
                 && session.needs_redraw()
@@ -776,18 +881,41 @@ impl Server {
     }
 }
 
-/// The switcher frame: session list on the left, live preview of the
-/// highlighted session on the right.
+/// The CLAUDECOM frame: the live grid over the whole
+/// viewport.
+fn render_grid(client: &mut Client, sessions: &BTreeMap<SessionId, Session>) {
+    let Client { grid, terminal, .. } = client;
+    let Some(state) = grid.as_mut() else {
+        return;
+    };
+    let _ = terminal.draw(|frame| {
+        let area = frame.area();
+        grid::render(frame.buffer_mut(), area, sessions, state);
+    });
+}
+
+/// The switcher frame: session list on the left — the pinned CLAUDECOM
+/// entry first while any Claude Code tab exists — and a live
+/// preview of the highlighted entry on the right.
 fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
     highlight: usize,
 ) {
-    let names: Vec<String> = sessions
-        .values()
-        .map(|s| format!("{} ({} windows)", s.name, s.window_count()))
-        .collect();
-    let highlighted_sid = sessions.keys().nth(highlight).copied();
+    let pinned = sessions.values().any(Session::has_claude_tab) as usize;
+    let mut names: Vec<String> = Vec::with_capacity(pinned + sessions.len());
+    if pinned > 0 {
+        names.push(grid::ENTRY_NAME.to_string());
+    }
+    names.extend(
+        sessions
+            .values()
+            .map(|s| format!("{} ({} windows)", s.name, s.window_count())),
+    );
+    let highlight = highlight.min(names.len().saturating_sub(1));
+    let highlighted_sid = highlight
+        .checked_sub(pinned)
+        .and_then(|i| sessions.keys().nth(i).copied());
     let _ = client.terminal.draw(|frame| {
         let area = frame.area();
         let buf = frame.buffer_mut();
@@ -830,14 +958,16 @@ fn render_switcher(
                 width: area.width - list_w - 1,
                 ..area
             };
-            if let Some(session) = highlighted_sid.and_then(|sid| sessions.get_mut(&sid)) {
+            if pinned > 0 && highlight == 0 {
+                grid::render_preview(buf, preview, sessions);
+            } else if let Some(session) = highlighted_sid.and_then(|sid| sessions.get_mut(&sid)) {
                 session.render_preview(buf, preview);
             }
         }
     });
 }
 
-fn clear_region(buf: &mut Buffer, area: Rect) {
+pub(crate) fn clear_region(buf: &mut Buffer, area: Rect) {
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
