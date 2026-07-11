@@ -9,7 +9,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -34,14 +36,20 @@ pub fn attach(request: Request) -> i32 {
 
     // Save the terminal's mode and go raw before passing
     // descriptors (enable_raw_mode saves the mode disable_raw_mode
-    // restores). The alt screen and mouse capture are
+    // restores). The alt screen, mouse capture, and bracketed paste are
     // also the client's to set up and tear down, so restore works even if
-    // the server died.
+    // the server died. Bracketed paste makes the terminal wrap pastes in
+    // markers instead of sending newlines as Enter keypresses.
     if enable_raw_mode().is_err() {
         eprintln!("lux: cannot enter raw mode");
         return 1;
     }
-    let _ = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    );
 
     // Pass stdin and stdout to the server.
     let fds = [std::io::stdin().as_raw_fd(), std::io::stdout().as_raw_fd()];
@@ -95,6 +103,7 @@ pub fn attach(request: Request) -> i32 {
 fn restore_terminal() {
     let _ = execute!(
         std::io::stdout(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
         cursor::Show

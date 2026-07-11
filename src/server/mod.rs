@@ -67,6 +67,9 @@ pub enum ServerEvent {
     ConnGone(ConnId),
     /// Raw bytes read from an attached client's stdin descriptor.
     Input(ConnId, Vec<u8>),
+    /// The client's stdin went quiet after input: resolve any bytes the
+    /// decoder held back waiting for more (a partial paste marker).
+    InputIdle(ConnId),
 }
 
 /// One attached client (at most one per session).
@@ -351,7 +354,8 @@ impl Server {
             ServerEvent::PtyOutput(..)
             | ServerEvent::PtyExited(_)
             | ServerEvent::Attach { .. }
-            | ServerEvent::Input(..) => self.mark_dirty(),
+            | ServerEvent::Input(..)
+            | ServerEvent::InputIdle(_) => self.mark_dirty(),
             ServerEvent::Ls(_)
             | ServerEvent::Kill(_)
             | ServerEvent::Resized(_)
@@ -418,6 +422,7 @@ impl Server {
                 self.detach(conn);
             }
             ServerEvent::Input(conn, bytes) => self.client_input(conn, bytes),
+            ServerEvent::InputIdle(conn) => self.client_input_idle(conn),
         }
     }
 
@@ -580,6 +585,20 @@ impl Server {
             return;
         };
         let events = client.decoder.decode(&bytes);
+        self.route_input(conn, events);
+    }
+
+    /// The stdin stream went idle: input the decoder held back as a
+    /// possible paste marker turned out to be ordinary keys.
+    fn client_input_idle(&mut self, conn: ConnId) {
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        let events = client.decoder.flush();
+        self.route_input(conn, events);
+    }
+
+    fn route_input(&mut self, conn: ConnId, events: Vec<DecodedInput>) {
         for event in events {
             let Some(client) = self.clients.get(&conn) else {
                 return;
@@ -817,6 +836,10 @@ fn spawn_stdin_reader(
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        // Whether input was sent since the stream last went quiet; the
+        // first poll timeout after a burst signals idle exactly once, so
+        // the decoder can resolve bytes it held waiting for more.
+        let mut busy = false;
         loop {
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -826,10 +849,18 @@ fn spawn_stdin_reader(
                 rustix::event::PollFlags::IN,
             )];
             match rustix::event::poll(&mut fds, 25) {
-                Ok(0) => continue,
+                Ok(0) => {
+                    if busy {
+                        busy = false;
+                        if tx.send(ServerEvent::InputIdle(conn)).is_err() {
+                            return;
+                        }
+                    }
+                }
                 Ok(_) => match rustix::io::read(&stdin, &mut buf) {
                     Ok(0) | Err(_) => return,
                     Ok(n) => {
+                        busy = true;
                         if tx
                             .send(ServerEvent::Input(conn, buf[..n].to_vec()))
                             .is_err()
