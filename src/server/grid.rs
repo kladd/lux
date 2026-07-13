@@ -15,12 +15,12 @@ use ratatui::widgets::{Block, Widget};
 
 use crate::server::anim::{self, Anim};
 use crate::server::layout::{Dir, WindowId};
-use crate::server::session::{CHROME_BG, Session, cell_style};
+use crate::server::session::{Session, cell_style};
 use crate::server::window::Tab;
 use crate::server::{SessionId, clear_region};
 
 /// The pinned switcher entry's display name.
-pub const ENTRY_NAME: &str = "CLAUDECOM";
+pub const ENTRY_NAME: &str = "*CLAUDECOM*";
 
 /// Fixed size of every grid tile — enough to show a recognizable slice
 /// of a Claude Code tab. Tiles never grow past this to fill leftover
@@ -236,7 +236,9 @@ fn draw_tile(
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    let base = Style::default().bg(CHROME_BG);
+    // Chrome carries no background of its own: the text, status coloring,
+    // and border glyphs sit on the terminal's default background.
+    let base = Style::default();
     for x in rect.left()..rect.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, rect.y)) {
             dst.set_char(' ');

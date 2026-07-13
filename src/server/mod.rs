@@ -139,6 +139,7 @@ pub fn run() -> i32 {
         attach_order: Vec::new(),
         keys,
         clipboard: arboard::Clipboard::new().ok(),
+        notify: config.notify,
         next_session_id: 0,
         save_deadline: None,
         last_saved: None,
@@ -261,6 +262,8 @@ struct Server {
     attach_order: Vec<SessionId>,
     keys: Arc<KeyTable>,
     clipboard: Option<arboard::Clipboard>,
+    /// Whether desktop notifications are enabled (config `notify`).
+    notify: bool,
     next_session_id: SessionId,
     /// When the pending automatic save runs; armed by any event that can
     /// change persisted state.
@@ -296,12 +299,48 @@ impl Server {
     }
 
     /// Commit any idle debounces whose window elapsed, and close any
-    /// repeat window whose deadline did.
+    /// repeat window whose deadline did. Agents landing in done raise
+    /// desktop notifications.
     fn tick_agents(&mut self) {
         let now = std::time::Instant::now();
+        let mut notices = Vec::new();
         for session in self.sessions.values_mut() {
-            session.tick_agents(now);
+            for notice in session.tick_agents(now) {
+                notices.push((session.name.clone(), notice));
+            }
             session.tick_repeats(now);
+        }
+        for (session, notice) in notices {
+            self.raise_notification(&session, &notice);
+        }
+    }
+
+    /// Raise a desktop notification for a Claude Code tab that reached
+    /// done or blocked: forward it as a plain OSC 9 escape to every
+    /// attached client's terminal — whichever terminal the user is
+    /// looking at displays it, even for a background session. With no
+    /// client attached the notification is discarded; there is no
+    /// history to hold it.
+    fn raise_notification(&mut self, session: &str, notice: &window::Notice) {
+        if !self.notify {
+            return;
+        }
+        let what = if notice.blocked {
+            "needs your input"
+        } else {
+            "is done"
+        };
+        let mut text = format!("{session}:{} {what}", notice.tab);
+        if let Some(summary) = &notice.summary {
+            text.push_str(": ");
+            text.push_str(summary);
+        }
+        // OSC string content must stay free of control bytes; a stray
+        // ESC or BEL in a name would cut the sequence short.
+        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        for client in self.clients.values_mut() {
+            let _ = write!(client.raw_out, "\x1b]9;{text}\x1b\\");
+            let _ = client.raw_out.flush();
         }
     }
 
@@ -377,7 +416,11 @@ impl Server {
         match event {
             ServerEvent::PtyOutput(tab, bytes) => {
                 if let Some(session) = self.sessions.values_mut().find(|s| s.has_tab(tab)) {
-                    session.pty_output(tab, &bytes);
+                    let notice = session.pty_output(tab, &bytes);
+                    let name = session.name.clone();
+                    if let Some(notice) = notice {
+                        self.raise_notification(&name, &notice);
+                    }
                 }
             }
             ServerEvent::PtyExited(tab) => {

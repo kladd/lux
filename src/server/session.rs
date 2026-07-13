@@ -34,7 +34,7 @@ use crate::server::keys::{Command, KeyMatch, KeyTable, KeyTrie};
 use crate::server::layout::{self, Dir, Node, Separator, SplitKind, WindowId};
 use crate::server::persist;
 use crate::server::term::FdBackend;
-use crate::server::window::{Tab, TabId, Window};
+use crate::server::window::{Notice, Tab, TabId, Window};
 
 /// Minimum window size a split may produce.
 const MIN_COLS: u16 = 10;
@@ -479,14 +479,16 @@ impl Session {
     /// Advance the owning engine with PTY output, whether or
     /// not that tab is currently visible, then re-derive the tab's name
     /// and re-evaluate agent detection against the new
-    /// content.
-    pub fn pty_output(&mut self, id: TabId, bytes: &[u8]) {
-        if let Some(tab) = self.find_tab_mut(id) {
-            tab.engine.advance_bytes(bytes);
-            if tab.refresh_identity() {
-                self.force_redraw = true;
-            }
+    /// content. Returns a notice when the tab's agent reached done or
+    /// blocked.
+    pub fn pty_output(&mut self, id: TabId, bytes: &[u8]) -> Option<Notice> {
+        let tab = self.find_tab_mut(id)?;
+        tab.engine.advance_bytes(bytes);
+        let (changed, notice) = tab.refresh_identity();
+        if changed {
+            self.force_redraw = true;
         }
+        notice
     }
 
     /// Any tab waiting out the idle debounce? The server
@@ -519,14 +521,19 @@ impl Session {
     }
 
     /// Commit idle debounces whose window elapsed without further output.
-    pub fn tick_agents(&mut self, now: std::time::Instant) {
+    /// Returns a notice per tab whose agent landed in done.
+    pub fn tick_agents(&mut self, now: std::time::Instant) -> Vec<Notice> {
+        let mut notices = Vec::new();
         for win in self.windows.values_mut() {
             for tab in &mut win.tabs {
-                if tab.tick_agent(now) {
+                let (changed, notice) = tab.tick_agent(now);
+                if changed {
                     self.force_redraw = true;
                 }
+                notices.extend(notice);
             }
         }
+        notices
     }
 
     /// Resize everything to the attached client's

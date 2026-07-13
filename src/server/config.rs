@@ -1,12 +1,13 @@
-//! Config file loading (Phase 6): a TOML file overriding the prefix key
-//! and the session-restore toggle. The keybinding table
-//! itself is hardcoded and non-configurable. No other settings, and no
-//! live reloading.
+//! Config file loading (Phase 6): a TOML file overriding the prefix key,
+//! the session-restore toggle, and the desktop-notification toggle. The
+//! keybinding table itself is hardcoded and non-configurable. No other
+//! settings, and no live reloading.
 //!
 //! ```toml
 //! # ~/.config/lux/config.toml
 //! prefix = "C-a"    # "C-" prefix means Ctrl is held
 //! restore = false   # skip restoring persisted sessions at startup
+//! notify = false    # no desktop notifications for Claude Code tabs
 //! ```
 //!
 //! The key spec is a single character, optionally prefixed with `C-`.
@@ -24,6 +25,9 @@ pub struct Config {
     /// Whether the server restores persisted session state at startup;
     /// saving is unconditional either way. Absent means restore.
     pub restore: bool,
+    /// Whether the server raises desktop notifications when a Claude
+    /// Code tab reaches done or blocked. Absent means notify.
+    pub notify: bool,
 }
 
 impl Default for Config {
@@ -31,6 +35,7 @@ impl Default for Config {
         Self {
             keys: KeyTable::default(),
             restore: true,
+            notify: true,
         }
     }
 }
@@ -83,6 +88,12 @@ fn from_toml(text: &str, origin: &str) -> Config {
         match value.as_bool() {
             Some(restore) => config.restore = restore,
             None => eprintln!("lux: {origin}: invalid restore value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("notify") {
+        match value.as_bool() {
+            Some(notify) => config.notify = notify,
+            None => eprintln!("lux: {origin}: invalid notify value {value}"),
         }
     }
     config
@@ -138,6 +149,16 @@ mod tests {
         assert!(from_toml("restore = true", "test").restore);
         // A non-boolean value keeps the default.
         assert!(from_toml("restore = \"no\"", "test").restore);
+    }
+
+    #[test]
+    fn notify_option_parses_and_defaults_on() {
+        // Absent means notify.
+        assert!(from_toml("prefix = \"C-a\"", "test").notify);
+        assert!(!from_toml("notify = false", "test").notify);
+        assert!(from_toml("notify = true", "test").notify);
+        // A non-boolean value keeps the default.
+        assert!(from_toml("notify = \"no\"", "test").notify);
     }
 
     #[test]

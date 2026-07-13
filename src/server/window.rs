@@ -4,8 +4,8 @@
 //! into the app's event channel.
 
 use std::io::Read;
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::Context;
@@ -13,11 +13,12 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 use ratatui::layout::Rect;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Clipboard, ClipboardSelection, Terminal as Engine, TerminalConfiguration, TerminalSize,
+    Alert, AlertHandler, Clipboard, ClipboardSelection, Terminal as Engine, TerminalConfiguration,
+    TerminalSize,
 };
 
 use crate::server::ServerEvent;
-use crate::server::agent::{self, Tracker};
+use crate::server::agent::{self, AgentState, Tracker};
 use crate::server::layout::WindowId;
 
 pub type TabId = usize;
@@ -52,6 +53,32 @@ impl Clipboard for ClipboardRelay {
         }
         Ok(())
     }
+}
+
+/// Captures a tab program's plain OSC 9 system-notification text (the
+/// engine's toast alert) into a slot the tab reads when it next raises a
+/// desktop notification. The OSC 9;4 progress sequence takes a different
+/// engine path and never lands here.
+struct NotificationRelay {
+    text: Arc<Mutex<Option<String>>>,
+}
+
+impl AlertHandler for NotificationRelay {
+    fn alert(&mut self, alert: Alert) {
+        if let Alert::ToastNotification { body, .. } = alert {
+            *self.text.lock().unwrap() = Some(body);
+        }
+    }
+}
+
+/// A tab's transition into done or blocked, surfaced upward so the server
+/// can raise a desktop notification: which tab by display name, which of
+/// the two states it reached, and the task summary its program offered,
+/// if any.
+pub struct Notice {
+    pub tab: String,
+    pub blocked: bool,
+    pub summary: Option<String>,
 }
 
 /// A leaf of the layout tree: one rectangle of screen space owning an
@@ -221,6 +248,11 @@ pub struct Tab {
     /// When this tab was first seen running Claude Code; the matching
     /// anchor for transcripts. Cleared when claude exits.
     pub claude_since: Option<std::time::SystemTime>,
+    /// The latest OSC 9 system-notification text the tab's program wrote,
+    /// shared with the engine's alert handler. Taken (once) when a desktop
+    /// notification is raised, so a later notification without a fresh
+    /// summary says nothing rather than repeating a stale one.
+    notify_text: Arc<Mutex<Option<String>>>,
     master: Box<dyn MasterPty>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -309,6 +341,10 @@ impl Tab {
             tx: relay_tx,
         });
         engine.set_clipboard(&clipboard);
+        let notify_text = Arc::new(Mutex::new(None));
+        engine.set_notification_handler(Box::new(NotificationRelay {
+            text: notify_text.clone(),
+        }));
 
         // Until the first foreground read, the name is the spawned
         // command's.
@@ -328,6 +364,7 @@ impl Tab {
             agent: None,
             claude_session: None,
             claude_since: None,
+            notify_text,
             master: pair.master,
             child,
         })
@@ -350,8 +387,8 @@ impl Tab {
     /// name from the foreground command and re-evaluate agent detection.
     /// Returns whether the displayed name or agent
     /// state (including the status text appearing or disappearing)
-    /// changed.
-    pub fn refresh_identity(&mut self) -> bool {
+    /// changed, plus a notice when the agent reached done or blocked.
+    pub fn refresh_identity(&mut self) -> (bool, Option<Notice>) {
         let fg = self.foreground();
         let renamed = if self.manual_name {
             // A manually renamed tab keeps its name.
@@ -377,7 +414,7 @@ impl Tab {
                 self.claude_session = None;
                 self.claude_since = None;
             }
-            return self.agent.take().is_some() || renamed;
+            return (self.agent.take().is_some() || renamed, None);
         }
         let snapshot = agent::Snapshot::capture(&self.engine);
         let raw = agent::evaluate(&snapshot);
@@ -388,8 +425,25 @@ impl Tab {
             self.claude_since = Some(std::time::SystemTime::now());
         }
         let tracker = self.agent.get_or_insert_default();
-        let changed = tracker.observe(raw, std::time::Instant::now());
-        appeared || changed || renamed
+        let entered = tracker.observe(raw, std::time::Instant::now());
+        let notice = self.notice_for(entered);
+        (appeared || entered.is_some() || renamed, notice)
+    }
+
+    /// The notice a just-entered displayed state warrants: a commit into
+    /// idle always lands as done, blocked is blocked, and working is
+    /// nobody's business.
+    fn notice_for(&mut self, entered: Option<AgentState>) -> Option<Notice> {
+        let blocked = match entered? {
+            AgentState::Idle => false,
+            AgentState::Blocked => true,
+            AgentState::Working => return None,
+        };
+        Some(Notice {
+            tab: self.name.clone(),
+            blocked,
+            summary: self.notify_text.lock().unwrap().take(),
+        })
     }
 
     /// The PTY foreground process group leader's identity, from /proc.
@@ -416,9 +470,12 @@ impl Tab {
     }
 
     /// Commit a pending idle debounce whose window has elapsed with no
-    /// further output; returns whether display changed.
-    pub fn tick_agent(&mut self, now: std::time::Instant) -> bool {
-        self.agent.as_mut().is_some_and(|t| t.tick(now))
+    /// further output; returns whether display changed, plus a notice
+    /// when the commit landed the agent in done.
+    pub fn tick_agent(&mut self, now: std::time::Instant) -> (bool, Option<Notice>) {
+        let entered = self.agent.as_mut().and_then(|t| t.tick(now));
+        let notice = self.notice_for(entered);
+        (entered.is_some(), notice)
     }
 
     pub fn agent_pending_idle(&self) -> bool {
@@ -575,5 +632,41 @@ mod tests {
         engine.advance_bytes(b"\x1b]52;c;?\x07");
         assert!(rx.try_recv().is_err());
         assert!(replies.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn plain_osc9_text_is_captured_and_progress_is_not() {
+        struct NullWriter;
+        impl std::io::Write for NullWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut engine = Engine::new(
+            term_size(Rect::new(0, 0, 80, 24)),
+            Arc::new(LuxConfig),
+            "lux",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(NullWriter),
+        );
+        let text = Arc::new(Mutex::new(None));
+        engine.set_notification_handler(Box::new(NotificationRelay { text: text.clone() }));
+
+        // The OSC 9;4 progress sequence is not notification text.
+        engine.advance_bytes(b"\x1b]9;4;1;40\x07");
+        assert_eq!(*text.lock().unwrap(), None);
+
+        // A plain OSC 9 lands in the slot; a later one replaces it.
+        engine.advance_bytes(b"\x1b]9;finished the refactor\x07");
+        assert_eq!(
+            text.lock().unwrap().as_deref(),
+            Some("finished the refactor")
+        );
+        engine.advance_bytes(b"\x1b]9;ran the tests\x1b\\");
+        assert_eq!(text.lock().unwrap().as_deref(), Some("ran the tests"));
     }
 }

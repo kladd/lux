@@ -212,43 +212,43 @@ impl Default for Tracker {
 }
 
 impl Tracker {
-    /// Fold a fresh evaluation in; returns whether the displayed state
-    /// changed. Transitions into idle are debounced and
+    /// Fold a fresh evaluation in; returns the newly displayed state when
+    /// it changed. Transitions into idle are debounced and
     /// cancelled if the evidence moves off idle first.
-    pub fn observe(&mut self, raw: AgentState, now: Instant) -> bool {
+    pub fn observe(&mut self, raw: AgentState, now: Instant) -> Option<AgentState> {
         if raw == self.displayed {
             self.pending_idle = None;
-            return false;
+            return None;
         }
         if raw == AgentState::Idle {
             match self.pending_idle {
                 Some(since) if now.duration_since(since) >= IDLE_DEBOUNCE => {
                     self.commit_idle();
-                    true
+                    Some(AgentState::Idle)
                 }
-                Some(_) => false,
+                Some(_) => None,
                 None => {
                     self.pending_idle = Some(now);
-                    false
+                    None
                 }
             }
         } else {
             // This also covers direct working↔blocked moves.
             self.pending_idle = None;
             self.displayed = raw;
-            true
+            Some(raw)
         }
     }
 
     /// Commit a pending idle whose debounce has elapsed with no further
-    /// output arriving; returns whether the displayed state changed.
-    pub fn tick(&mut self, now: Instant) -> bool {
+    /// output arriving; returns the newly displayed state when it changed.
+    pub fn tick(&mut self, now: Instant) -> Option<AgentState> {
         match self.pending_idle {
             Some(since) if now.duration_since(since) >= IDLE_DEBOUNCE => {
                 self.commit_idle();
-                true
+                Some(AgentState::Idle)
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -387,20 +387,32 @@ mod tests {
     fn idle_transition_debounces_and_cancels() {
         let mut t = Tracker::default();
         let t0 = Instant::now();
-        assert!(t.observe(AgentState::Working, t0));
+        assert_eq!(
+            t.observe(AgentState::Working, t0),
+            Some(AgentState::Working)
+        );
         // First idle result arms the debounce without changing display.
-        assert!(!t.observe(AgentState::Idle, t0));
+        assert_eq!(t.observe(AgentState::Idle, t0), None);
         assert!(t.pending());
         // Evidence moves back to working → cancelled.
-        assert!(!t.observe(AgentState::Working, t0 + Duration::from_millis(100)));
+        assert_eq!(
+            t.observe(AgentState::Working, t0 + Duration::from_millis(100)),
+            None
+        );
         assert!(!t.pending());
         assert_eq!(t.visual().text, "[working]");
         // Idle held past the debounce commits...
-        assert!(!t.observe(AgentState::Idle, t0 + Duration::from_millis(200)));
-        assert!(t.observe(
-            AgentState::Idle,
-            t0 + Duration::from_millis(200) + IDLE_DEBOUNCE
-        ));
+        assert_eq!(
+            t.observe(AgentState::Idle, t0 + Duration::from_millis(200)),
+            None
+        );
+        assert_eq!(
+            t.observe(
+                AgentState::Idle,
+                t0 + Duration::from_millis(200) + IDLE_DEBOUNCE
+            ),
+            Some(AgentState::Idle)
+        );
         // ...and lands as done (unseen) until marked seen.
         assert_eq!(t.visual().text, "[done]");
         t.mark_seen();
@@ -413,8 +425,8 @@ mod tests {
         let t0 = Instant::now();
         t.observe(AgentState::Working, t0);
         t.observe(AgentState::Idle, t0);
-        assert!(!t.tick(t0 + Duration::from_millis(100)));
-        assert!(t.tick(t0 + IDLE_DEBOUNCE));
+        assert_eq!(t.tick(t0 + Duration::from_millis(100)), None);
+        assert_eq!(t.tick(t0 + IDLE_DEBOUNCE), Some(AgentState::Idle));
         assert_eq!(t.visual().text, "[done]");
     }
 }
