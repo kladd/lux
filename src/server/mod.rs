@@ -677,6 +677,35 @@ impl Server {
                     session.paste_text(&text);
                 }
             }
+            // Create a session (like the CLI's `new-session`) and move
+            // this client onto it. A name that collides is ignored.
+            Effect::NewSession(name) => {
+                if let Some(session_name) = &name {
+                    if self.session_by_name(session_name).is_some() {
+                        // Session name already exists
+                        return;
+                    }
+                }
+                // Read the client's drawable size before any mutable
+                // borrow of `self` (create_session needs `&mut self`).
+                let Some(client) = self.clients.get(&conn) else {
+                    return;
+                };
+                let size = term::fd_size(&client.raw_out);
+                let area = Rect::new(0, 0, size.width, size.height);
+                let Ok(new_sid) = self.create_session(name, area) else {
+                    return;
+                };
+                // Brand new, so no other client can hold it: point this
+                // client at it and hand the session its drawable area.
+                if let Some(client) = self.clients.get_mut(&conn) {
+                    client.attached = new_sid;
+                }
+                if let Some(session) = self.sessions.get_mut(&new_sid) {
+                    session.set_area(area);
+                    session.request_redraw();
+                }
+            }
             Effect::Ended => self.end_session(sid),
         }
     }

@@ -61,6 +61,7 @@ pub enum Effect {
     Paste,
     /// The last window's last tab exited.
     Ended,
+    NewSession(Option<String>),
 }
 
 /// A drag selection over one window's content, in
@@ -550,8 +551,7 @@ impl Session {
         // While a prompt is open, every key press edits
         // it instead of reaching the focused window's PTY.
         if self.prompt.is_some() {
-            self.handle_prompt_key(key);
-            return None;
+            return self.handle_prompt_key(key);
         }
         // An elapsed repeat deadline has already closed its repeat
         // window; the tick normally does this on time, but a key racing
@@ -916,12 +916,13 @@ impl Session {
         self.force_redraw = true;
     }
 
-    fn handle_prompt_key(&mut self, key: KeyEvent) {
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> Option<Effect> {
         self.force_redraw = true;
         match key.code {
             // Close without executing anything.
             CtKeyCode::Esc => {
                 self.prompt = None;
+                None
             }
             // Commit (or discard) and close.
             CtKeyCode::Enter => {
@@ -929,11 +930,21 @@ impl Session {
                 let text = prompt.text();
                 match prompt.kind {
                     PromptKind::Ex => match ex::parse(&text) {
-                        Some(ExCommand::SplitSideBySide) => self.split(SplitKind::SideBySide),
-                        Some(ExCommand::SplitStacked) => self.split(SplitKind::Stacked),
-                        Some(ExCommand::Write(path)) => self.write_tab_content(&path),
+                        Some(ExCommand::SplitSideBySide) => {
+                            self.split(SplitKind::SideBySide);
+                            None
+                        }
+                        Some(ExCommand::SplitStacked) => {
+                            self.split(SplitKind::Stacked);
+                            None
+                        }
+                        Some(ExCommand::Write(path)) => {
+                            self.write_tab_content(&path);
+                            None
+                        }
+                        Some(ExCommand::NewSession(name)) => return Some(Effect::NewSession(name)),
                         // Unrecognized text closes with no action.
-                        None => {}
+                        None => None,
                     },
                     PromptKind::Rename => {
                         let win = self
@@ -941,6 +952,7 @@ impl Session {
                             .get_mut(&self.focus)
                             .expect("focused window exists");
                         win.active_tab_mut().set_name(text);
+                        None
                     }
                 }
             }
@@ -949,6 +961,7 @@ impl Session {
             _ => {
                 let prompt = self.prompt.as_mut().expect("prompt is open");
                 prompt.textarea.input(tui_textarea::Input::from(key));
+                None
             }
         }
     }
