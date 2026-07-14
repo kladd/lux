@@ -1,40 +1,49 @@
 //! The CLAUDECOM grid: a pinned, non-attachable session
-//! switcher entry showing a live, read-only tile for every tab across
+//! switcher entry showing a live tile for every tab across
 //! every session currently identified as running Claude Code. The grid
-//! owns no layout tree, windows, or PTYs — each tile crops an existing
-//! tab's live engine content without touching that tab's real size, and
-//! selecting a tile re-attaches the client to the tab's home session.
+//! owns no layout tree, windows, or PTYs — each tile resizes an existing
+//! tab's engine and PTY to its own interior so the content reflows to
+//! fit rather than showing a garbled crop; the next direct render in the
+//! tab's home window reconciles it back to its real size. Capturing a
+//! tile routes input to the tab it shows.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Widget};
+use ratatui::style::{Color, Modifier, Style};
 
 use crate::server::anim::{self, Anim};
 use crate::server::layout::{Dir, WindowId};
 use crate::server::session::{Session, cell_style};
-use crate::server::window::Tab;
+use crate::server::window::{Tab, TabId};
 use crate::server::{SessionId, clear_region};
 
 /// The pinned switcher entry's display name.
 pub const ENTRY_NAME: &str = "*CLAUDECOM*";
 
-/// Fixed size of every grid tile — enough to show a recognizable slice
-/// of a Claude Code tab. Tiles never grow past this to fill leftover
-/// screen space; deriving their shape from the screen made them taller
-/// and wider than reads well.
-const TILE_COLS: u16 = 60;
+/// Every tile is this many rows tall and at least this many columns
+/// wide — enough to show a recognizable slice of a Claude Code tab.
+/// Deriving tile height from the screen made tiles taller than reads
+/// well; width, unlike height, grows past the minimum to consume
+/// whatever the packed columns leave unused.
+const MIN_TILE_COLS: u16 = 60;
 const TILE_ROWS: u16 = 24;
 
-/// A client's view of the grid: the highlighted tile and the first
-/// visible tile row.
+/// A client's view of the grid: the highlighted tile, the first visible
+/// tile row, and the captured tab, if any.
 #[derive(Clone, Copy, Default)]
 pub struct GridState {
     pub highlight: usize,
     scroll: usize,
+    /// The tab whose tile is in capture mode: key presses are routed to
+    /// its PTY instead of grid navigation.
+    pub capture: Option<TabId>,
+    /// A prefix key held back pending its follow-up, which selects a
+    /// grid command (exit capture, switcher, finder) or discards the
+    /// sequence; in capture mode the prefix never reaches the tab.
+    pub pending_prefix: bool,
 }
 
 /// One tile's target: a Claude Code tab addressed by its home session,
@@ -71,12 +80,15 @@ pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<GridItem> {
 }
 
 /// Tile geometry for `count` items in `area`: the largest number of
-/// fixed-size tile columns that fit the screen width, leftover space
-/// left blank. Excess items wrap into rows below; rows past the
-/// screenful scroll.
+/// minimum-width tile columns that fit the screen width, every tile
+/// widened evenly to consume the remaining width. Excess items wrap
+/// into rows below; rows past the screenful scroll.
 struct Layout {
     cols: usize,
+    /// Base tile width; the first `wide` columns are one cell wider so
+    /// the columns consume the full width.
     tile_w: u16,
+    wide: usize,
     tile_h: u16,
     /// Tile rows the items need in total.
     rows: usize,
@@ -84,16 +96,29 @@ struct Layout {
     visible: usize,
 }
 
+impl Layout {
+    /// The rectangle of the tile at grid column `col`, visible row `row`.
+    fn tile_rect(&self, area: Rect, col: usize, row: usize) -> Rect {
+        Rect::new(
+            area.x + col as u16 * self.tile_w + col.min(self.wide) as u16,
+            area.y + row as u16 * self.tile_h,
+            self.tile_w + (col < self.wide) as u16,
+            self.tile_h,
+        )
+    }
+}
+
 fn layout(area: Rect, count: usize) -> Option<Layout> {
-    if count == 0 || area.width < TILE_COLS || area.height < TILE_ROWS {
+    if count == 0 || area.width < MIN_TILE_COLS || area.height < TILE_ROWS {
         return None;
     }
-    let cols = (area.width / TILE_COLS) as usize;
+    let cols = (area.width / MIN_TILE_COLS) as usize;
     let rows = count.div_ceil(cols);
     let visible = ((area.height / TILE_ROWS) as usize).min(rows);
     Some(Layout {
         cols,
-        tile_w: TILE_COLS,
+        tile_w: area.width / cols as u16,
+        wide: (area.width % cols as u16) as usize,
         tile_h: TILE_ROWS,
         rows,
         visible,
@@ -132,7 +157,7 @@ fn ensure_visible(state: &mut GridState, l: &Layout) {
 pub fn render(
     buf: &mut Buffer,
     area: Rect,
-    sessions: &BTreeMap<SessionId, Session>,
+    sessions: &mut BTreeMap<SessionId, Session>,
     state: &mut GridState,
 ) {
     let items = items(sessions);
@@ -148,23 +173,25 @@ pub fn render(
         &items,
         Some(state.highlight),
         state.scroll,
+        state.capture,
     );
 }
 
-/// Render the grid with no highlight or scroll, for the session
-/// switcher's preview pane.
-pub fn render_preview(buf: &mut Buffer, area: Rect, sessions: &BTreeMap<SessionId, Session>) {
+/// Render the grid with no highlight, scroll, or capture, for the
+/// session switcher's preview pane.
+pub fn render_preview(buf: &mut Buffer, area: Rect, sessions: &mut BTreeMap<SessionId, Session>) {
     let items = items(sessions);
-    draw(buf, area, sessions, &items, None, 0);
+    draw(buf, area, sessions, &items, None, 0, None);
 }
 
 fn draw(
     buf: &mut Buffer,
     area: Rect,
-    sessions: &BTreeMap<SessionId, Session>,
+    sessions: &mut BTreeMap<SessionId, Session>,
     items: &[GridItem],
     highlight: Option<usize>,
     scroll: usize,
+    capture: Option<TabId>,
 ) {
     clear_region(buf, area);
     if items.is_empty() {
@@ -183,19 +210,40 @@ fn draw(
         if row >= scroll + l.visible {
             break;
         }
-        let rect = Rect::new(
-            area.x + (i % l.cols) as u16 * l.tile_w,
-            area.y + (row - scroll) as u16 * l.tile_h,
-            l.tile_w,
-            l.tile_h,
+        let rect = l.tile_rect(area, i % l.cols, row - scroll);
+        let Some(session) = sessions.get_mut(&item.session) else {
+            continue;
+        };
+        let name = session.name.clone();
+        let Some(tab) = session.tab_at_mut(item.window, item.tab) else {
+            continue;
+        };
+        // Reflow the tab to the tile's interior so its content fits the
+        // tile instead of showing a garbled crop of the full-size layout;
+        // the home window's reconcile restores the real size on the next
+        // direct render.
+        let inner = Rect::new(
+            rect.x + 1,
+            rect.y + 1,
+            rect.width.saturating_sub(2),
+            rect.height.saturating_sub(2),
         );
-        let Some(session) = sessions.get(&item.session) else {
-            continue;
-        };
-        let Some(tab) = session.tab_at(item.window, item.tab) else {
-            continue;
-        };
-        draw_tile(buf, rect, &session.name, tab, highlight == Some(i), elapsed);
+        if inner.width > 0
+            && inner.height > 0
+            && (tab.rect.width, tab.rect.height) != (inner.width, inner.height)
+        {
+            tab.resize(inner);
+        }
+        let captured = capture == Some(tab.id);
+        draw_tile(
+            buf,
+            rect,
+            &name,
+            tab,
+            highlight == Some(i),
+            captured,
+            elapsed,
+        );
     }
 }
 
@@ -218,65 +266,71 @@ fn draw_empty(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// One tile: the tab's bracketed status text, home session name, and tab
-/// name on a top chrome row, the tail of the tab's live content below,
-/// cropped to the tile without touching the tab's real size. The
-/// rightmost cell stays blank so adjacent tiles' content doesn't run
-/// together. The highlighted tile is framed by a border, its chrome text
-/// sitting on the top edge like a title so the border can't collide with
-/// the status coloring.
+/// Render the tail of `tab`'s live content — where fresh output lands —
+/// cropped into `area`, without touching the tab's real size.
+pub fn render_tail(buf: &mut Buffer, area: Rect, tab: &Tab) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let screen = tab.engine.screen();
+    let live_rows = screen.physical_rows as i64;
+    let range = screen.phys_range(&((live_rows - area.height as i64).max(0)..live_rows));
+    for (y, line) in screen.lines_in_phys_range(range).iter().enumerate() {
+        if y >= area.height as usize {
+            break;
+        }
+        for cell in line.visible_cells() {
+            let cx = cell.cell_index();
+            if cx >= area.width as usize {
+                break;
+            }
+            let pos = Position::new(area.x + cx as u16, area.y + y as u16);
+            if let Some(dst) = buf.cell_mut(pos) {
+                dst.set_symbol(cell.str());
+                dst.set_style(cell_style(cell.attrs()));
+            }
+        }
+    }
+}
+
+/// One tile: a border colored to match the tab's status (its animation
+/// carried onto the border, so working shimmers and blocked breathes at
+/// tile size), the tail of the tab's live content inside, and the tab's
+/// bracketed status text, home session name, and tab name drawn over the
+/// top edge like a title. The highlighted tile's border is double-lined,
+/// marking the highlight through line weight so it collides with neither
+/// the status coloring nor the border color; a captured tile carries a
+/// right-aligned label on top of that, since capture is entered on the
+/// highlighted tile and the border alone can't tell the two apart.
 fn draw_tile(
     buf: &mut Buffer,
     rect: Rect,
     session: &str,
     tab: &Tab,
     highlighted: bool,
+    captured: bool,
     elapsed: Duration,
 ) {
-    if rect.width == 0 || rect.height == 0 {
+    if rect.width < 2 || rect.height < 2 {
         return;
     }
-    // Chrome carries no background of its own: the text, status coloring,
-    // and border glyphs sit on the terminal's default background.
+    let (color, border_anim) =
+        tab.agent
+            .as_ref()
+            .map_or((Color::DarkGray, Anim::None), |tracker| {
+                let visual = tracker.visual();
+                (visual.color, visual.anim)
+            });
+    draw_border(buf, rect, highlighted, color, border_anim, elapsed);
+    render_tail(
+        buf,
+        Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2),
+        tab,
+    );
+    // Chrome text over the top edge, inside the corner, on the
+    // terminal's default background.
     let base = Style::default();
-    for x in rect.left()..rect.right() {
-        if let Some(dst) = buf.cell_mut(Position::new(x, rect.y)) {
-            dst.set_char(' ');
-            dst.set_style(base);
-        }
-    }
-    let content_h = rect.height - 1;
-    let content_w = rect.width.saturating_sub(1);
-    if content_h > 0 && content_w > 0 {
-        // The tail of the live view, where fresh output lands.
-        let screen = tab.engine.screen();
-        let live_rows = screen.physical_rows as i64;
-        let range = screen.phys_range(&((live_rows - content_h as i64).max(0)..live_rows));
-        for (y, line) in screen.lines_in_phys_range(range).iter().enumerate() {
-            if y >= content_h as usize {
-                break;
-            }
-            for cell in line.visible_cells() {
-                let cx = cell.cell_index();
-                if cx >= content_w as usize {
-                    break;
-                }
-                let pos = Position::new(rect.x + cx as u16, rect.y + 1 + y as u16);
-                if let Some(dst) = buf.cell_mut(pos) {
-                    dst.set_symbol(cell.str());
-                    dst.set_style(cell_style(cell.attrs()));
-                }
-            }
-        }
-    }
-    if highlighted {
-        Block::bordered()
-            .border_style(base.fg(HIGHLIGHT))
-            .render(rect, buf);
-    }
-    // Chrome text last, over the highlighted tile's top edge, starting
-    // inside its corner.
-    let mut x = rect.x + highlighted as u16;
+    let mut x = rect.x + 1;
     let mut put = |x: &mut u16, ch: char, style: Style| -> bool {
         if *x + 1 >= rect.right() {
             return false;
@@ -317,10 +371,76 @@ fn draw_tile(
             break;
         }
     }
+    // The capture-mode label, right-aligned on the top edge inside the
+    // corner, mirroring the tab bar's scroll label; cyan so it collides
+    // with no agent-status color.
+    if captured {
+        let label = " capture ";
+        let len = label.chars().count() as u16;
+        if rect.width >= len + 2 {
+            let style = Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::REVERSED);
+            let start = rect.right() - 1 - len;
+            for (i, ch) in label.chars().enumerate() {
+                if let Some(dst) = buf.cell_mut(Position::new(start + i as u16, rect.y)) {
+                    dst.set_char(ch);
+                    dst.set_style(style);
+                }
+            }
+        }
+    }
 }
 
-/// The highlight border's color, matching the switcher's highlight.
-const HIGHLIGHT: Color = Color::Green;
+/// Draw a tile's border in `color`, double-lined when highlighted. The
+/// status animation is applied per border cell, indexed clockwise around
+/// the perimeter so a shimmer band sweeps the tile's edge.
+fn draw_border(
+    buf: &mut Buffer,
+    rect: Rect,
+    double: bool,
+    color: Color,
+    border_anim: Anim,
+    elapsed: Duration,
+) {
+    let (h, v, tl, tr, bl, br) = if double {
+        ('═', '║', '╔', '╗', '╚', '╝')
+    } else {
+        ('─', '│', '┌', '┐', '└', '┘')
+    };
+    let (left, right) = (rect.left(), rect.right() - 1);
+    let (top, bottom) = (rect.top(), rect.bottom() - 1);
+    let horizontal = |x: u16, y: u16| {
+        let ch = match (x == left, x == right, y == top) {
+            (true, _, true) => tl,
+            (_, true, true) => tr,
+            (true, _, false) => bl,
+            (_, true, false) => br,
+            _ => h,
+        };
+        (x, y, ch)
+    };
+    // The perimeter walked clockwise from the top-left corner; corners
+    // belong to the horizontal edges.
+    let cells: Vec<(u16, u16, char)> = (left..=right)
+        .map(|x| horizontal(x, top))
+        .chain((top + 1..bottom).map(|y| (right, y, v)))
+        .chain((left..=right).rev().map(|x| horizontal(x, bottom)))
+        .chain((top + 1..bottom).rev().map(|y| (left, y, v)))
+        .collect();
+    let len = cells.len();
+    for (i, (x, y, ch)) in cells.into_iter().enumerate() {
+        let color = match border_anim {
+            Anim::None => color,
+            Anim::Shimmer => anim::shimmer(color, i, len, elapsed),
+            Anim::Breathe => anim::breathe(color, elapsed),
+        };
+        if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
+            dst.set_char(ch);
+            dst.set_style(Style::default().fg(color));
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -331,20 +451,37 @@ mod tests {
     }
 
     #[test]
-    fn tiles_keep_their_fixed_size() {
-        // 150 wide fits two 60-wide columns; tiles stay 60×24 however
-        // much screen is left over and however many items there are.
+    fn columns_pack_at_minimum_width_and_tiles_grow_to_fill() {
+        // 150 wide fits two minimum-width columns; each tile widens to
+        // 75 so no width is left over. Height stays fixed at 24, and
+        // neither depends on the item count.
         for count in [1, 3, 9] {
             let l = layout(area(150, 70), count).unwrap();
-            assert_eq!((l.cols, l.tile_w, l.tile_h), (2, 60, 24));
+            assert_eq!((l.cols, l.tile_w, l.wide, l.tile_h), (2, 75, 0, 24));
         }
-        // 300 wide fits five columns of the same fixed-size tiles.
+        // 300 wide fits five columns exactly at the minimum width.
         let l = layout(area(300, 150), 3).unwrap();
-        assert_eq!((l.cols, l.tile_w, l.tile_h), (5, 60, 24));
-        // Smaller than one tile lays out nothing.
+        assert_eq!((l.cols, l.tile_w, l.wide), (5, 60, 0));
+        // Smaller than one minimum tile lays out nothing.
         assert!(layout(area(59, 70), 3).is_none());
         assert!(layout(area(120, 23), 3).is_none());
         assert!(layout(area(120, 70), 0).is_none());
+    }
+
+    #[test]
+    fn leftover_width_spreads_across_the_columns() {
+        // 131 wide: two columns, base width 65, the first one cell
+        // wider — the tiles consume all 131 columns between them.
+        let l = layout(area(131, 70), 4).unwrap();
+        assert_eq!((l.cols, l.tile_w, l.wide), (2, 65, 1));
+        let a = area(131, 70);
+        let first = l.tile_rect(a, 0, 0);
+        let second = l.tile_rect(a, 1, 0);
+        assert_eq!((first.x, first.width), (0, 66));
+        assert_eq!((second.x, second.width), (66, 65));
+        assert_eq!(second.right(), 131);
+        // The second row sits one tile height down.
+        assert_eq!(l.tile_rect(a, 0, 1).y, 24);
     }
 
     #[test]
@@ -396,5 +533,38 @@ mod tests {
         s.highlight = 0;
         ensure_visible(&mut s, &l);
         assert_eq!(s.scroll, 0, "and back up");
+    }
+
+    #[test]
+    fn border_cells_cover_the_perimeter_once() {
+        // Every border cell drawn exactly once, corners included, for
+        // both line weights.
+        for double in [false, true] {
+            let rect = Rect::new(2, 1, 6, 4);
+            let mut buf = Buffer::empty(Rect::new(0, 0, 12, 8));
+            draw_border(
+                &mut buf,
+                rect,
+                double,
+                Color::Red,
+                Anim::None,
+                Duration::ZERO,
+            );
+            let (tl, tr, bl, br) = if double {
+                ("╔", "╗", "╚", "╝")
+            } else {
+                ("┌", "┐", "└", "┘")
+            };
+            assert_eq!(buf.cell(Position::new(2, 1)).unwrap().symbol(), tl);
+            assert_eq!(buf.cell(Position::new(7, 1)).unwrap().symbol(), tr);
+            assert_eq!(buf.cell(Position::new(2, 4)).unwrap().symbol(), bl);
+            assert_eq!(buf.cell(Position::new(7, 4)).unwrap().symbol(), br);
+            // Edges take the status color; the interior is untouched.
+            assert_eq!(
+                buf.cell(Position::new(4, 1)).unwrap().style().fg,
+                Some(Color::Red)
+            );
+            assert_eq!(buf.cell(Position::new(4, 2)).unwrap().symbol(), " ");
+        }
     }
 }

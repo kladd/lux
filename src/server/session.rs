@@ -57,6 +57,11 @@ pub enum Effect {
     OpenSwitcher,
     /// Enter the CLAUDECOM grid for the driving client.
     OpenGrid,
+    /// Enter fuzzy tab-find mode for the driving client.
+    OpenFinder,
+    /// Create a session — named, or auto-named when `None` — and attach
+    /// the driving client to it.
+    NewSession(Option<String>),
     /// Yanked text for the system clipboard.
     Copy(String),
     /// Paste the system clipboard into this session.
@@ -577,9 +582,53 @@ impl Session {
         out
     }
 
+    /// Every tab in window layout order then tab order, each as its
+    /// window id and position in that window's tab list.
+    pub fn all_tabs(&self) -> Vec<(WindowId, usize)> {
+        let mut out = Vec::new();
+        for id in layout::leaves(&self.tree) {
+            let Some(win) = self.windows.get(&id) else {
+                continue;
+            };
+            out.extend((0..win.tabs.len()).map(|i| (id, i)));
+        }
+        out
+    }
+
     /// The tab at `index` in window `window`'s tab list.
     pub fn tab_at(&self, window: WindowId, index: usize) -> Option<&Tab> {
         self.windows.get(&window)?.tabs.get(index)
+    }
+
+    /// Mutable access to that same tab, for views that resize it to their
+    /// own geometry (the CLAUDECOM grid's tiles).
+    pub fn tab_at_mut(&mut self, window: WindowId, index: usize) -> Option<&mut Tab> {
+        self.windows.get_mut(&window)?.tabs.get_mut(index)
+    }
+
+    /// Encode `key` to the PTY of the tab at `index` in window `window`,
+    /// regardless of focus — the delivery path for a tab captured from
+    /// the CLAUDECOM grid.
+    pub fn key_to_tab(&mut self, window: WindowId, index: usize, key: KeyEvent) {
+        if let Some((code, mods)) = map_key(key)
+            && let Some(win) = self.windows.get_mut(&window)
+            && let Some(tab) = win.tabs.get_mut(index)
+        {
+            let _ = tab.engine.key_down(code, mods);
+        }
+    }
+
+    /// Write pasted text to that same tab's PTY, honoring bracketed
+    /// paste.
+    pub fn paste_to_tab(&mut self, window: WindowId, index: usize, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(win) = self.windows.get_mut(&window)
+            && let Some(tab) = win.tabs.get_mut(index)
+        {
+            let _ = tab.engine.send_paste(text);
+        }
     }
 
     /// Focus `window` and make its tab at `index` active.
@@ -602,8 +651,7 @@ impl Session {
         // While a prompt is open, every key press edits
         // it instead of reaching the focused window's PTY.
         if self.prompt.is_some() {
-            self.handle_prompt_key(key);
-            return None;
+            return self.handle_prompt_key(key);
         }
         // An elapsed repeat deadline has already closed its repeat
         // window; the tick normally does this on time, but a key racing
@@ -939,6 +987,8 @@ impl Session {
             Command::Switcher => return Some(Effect::OpenSwitcher),
             // So is the grid.
             Command::Grid => return Some(Effect::OpenGrid),
+            // And the fuzzy tab finder.
+            Command::FindTab => return Some(Effect::OpenFinder),
             Command::OpenEx => self.open_prompt(PromptKind::Ex, String::new()),
             // Prefix+, prompts for the active tab's new name.
             Command::RenameTab => {
@@ -970,7 +1020,7 @@ impl Session {
         self.force_redraw = true;
     }
 
-    fn handle_prompt_key(&mut self, key: KeyEvent) {
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> Option<Effect> {
         self.force_redraw = true;
         match key.code {
             // Close without executing anything.
@@ -986,6 +1036,9 @@ impl Session {
                         Some(ExCommand::SplitSideBySide) => self.split(SplitKind::SideBySide),
                         Some(ExCommand::SplitStacked) => self.split(SplitKind::Stacked),
                         Some(ExCommand::Write(path)) => self.write_tab_content(&path),
+                        Some(ExCommand::NewSession(name)) => {
+                            return Some(Effect::NewSession(name));
+                        }
                         // Unrecognized text closes with no action.
                         None => {}
                     },
@@ -1005,6 +1058,7 @@ impl Session {
                 prompt.textarea.input(tui_textarea::Input::from(key));
             }
         }
+        None
     }
 
     /// Write the focused window's active tab's entire terminal content,

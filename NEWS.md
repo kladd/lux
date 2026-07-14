@@ -1,5 +1,28 @@
 # News
 
+## 2026-07-13
+
+- Added a fuzzy tab finder (`prefix+f`): a bordered popover floating over
+  your session narrows every tab across every session by name as you
+  type, with a live preview of the highlighted match; Enter jumps to that
+  tab, Ctrl-p/Ctrl-n or the arrows move the highlight.
+- CLAUDECOM tiles are now a fixed 24 rows tall, widen evenly to fill the
+  screen, and carry borders colored (and animated) by each tab's status,
+  with a double-line border marking the highlight.
+- CLAUDECOM tiles and the finder's preview resize the shown tab to fit,
+  so its content reflows legibly instead of showing a crop of the
+  full-size layout; a tab snaps back to its real size when viewed in its
+  home window.
+- Enter on a CLAUDECOM tile captures it for typing into the tab in place,
+  marked with a `capture` label; the prefix key always leads a command
+  there — `prefix+g` or `prefix+Esc` returns to the grid — and never
+  reaches the tab.
+- Leaving CLAUDECOM: Escape/`q` returns to your session, `g` jumps to the
+  highlighted tile's tab in its home session, and `prefix+s`/`prefix+f`
+  open the switcher or finder directly, from navigation or capture mode.
+- Added `:new`/`:new-session [name]` ex commands to create and attach a
+  session from inside lux; a name already in use is silently ignored.
+
 ## 2026-07-12
 
 - Added desktop notifications when a Claude Code tab in any session
@@ -8,10 +31,10 @@
 
 ## 2026-07-11
 
-- `-s`/`-t` and bare `attach`/`new` now attach-or-create a session by name
-  instead of erroring on a missing or duplicate one.
 - Added CLAUDECOM, a live overview of every Claude Code tab across
   sessions, reachable from the switcher or `prefix+g`.
+- `-s`/`-t` and bare `attach`/`new` now attach-or-create a session by name
+  instead of erroring on a missing or duplicate one.
 - `prefix+m` plus a direction key now swaps the focused window with its
   spatially adjacent neighbor, replacing the old split-mirroring behavior.
 - Multi-line pastes are delivered as a single bracketed paste instead of a

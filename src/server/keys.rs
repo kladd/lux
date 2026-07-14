@@ -25,6 +25,8 @@ pub enum Command {
     Switcher,
     /// Open the CLAUDECOM grid directly, skipping the switcher.
     Grid,
+    /// Open the fuzzy tab finder.
+    FindTab,
     /// Open the ex command line.
     OpenEx,
     /// Enter scroll mode for the focused window's active tab.
@@ -68,6 +70,7 @@ impl Command {
             Command::Detach => "detach from session",
             Command::Switcher => "session switcher",
             Command::Grid => "CLAUDECOM grid",
+            Command::FindTab => "find tab",
             Command::OpenEx => "command line",
             Command::ScrollMode => "scroll mode",
             Command::FocusDir(Dir::Left) => "focus window left",
@@ -263,6 +266,7 @@ impl Default for KeyTable {
             cmd('d', Command::Detach),
             cmd('s', Command::Switcher),
             cmd('g', Command::Grid),
+            cmd('f', Command::FindTab),
             cmd(':', Command::OpenEx),
             cmd('[', Command::ScrollMode),
             cmd('h', Command::FocusDir(Dir::Left)),
@@ -524,6 +528,15 @@ mod tests {
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('g'), KeyModifiers::NONE)),
             Some(Command::Grid)
+        );
+    }
+
+    #[test]
+    fn find_tab_is_bound_to_f() {
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('f'), KeyModifiers::NONE)),
+            Some(Command::FindTab)
         );
     }
 

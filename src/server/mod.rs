@@ -9,6 +9,7 @@ pub mod agent;
 pub mod anim;
 pub mod config;
 pub mod ex;
+pub mod find;
 pub mod grid;
 pub mod input;
 pub mod keys;
@@ -31,14 +32,16 @@ use std::thread;
 
 use ratatui::Terminal;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::KeyCode as CtKeyCode;
+use ratatui::crossterm::event::{
+    KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers as CtMods,
+};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::protocol::{self, Request};
 use grid::GridState;
 use input::{DecodedInput, InputDecoder};
-use keys::KeyTable;
+use keys::{KeyMatch, KeyTable};
 use layout::Dir;
 use session::{Effect, Session};
 use term::FdBackend;
@@ -77,6 +80,13 @@ pub enum ServerEvent {
     ProgramCopy(TabId, String),
 }
 
+/// Where a captured grid tab's prefix command sent the connection, when
+/// it left the grid.
+enum GridExit {
+    Switcher,
+    Finder,
+}
+
 /// One attached client (at most one per session).
 struct Client {
     control: UnixStream,
@@ -93,6 +103,8 @@ struct Client {
     switcher: Option<usize>,
     /// `Some` while viewing the CLAUDECOM grid.
     grid: Option<GridState>,
+    /// `Some` while in fuzzy tab-find mode.
+    finder: Option<find::FinderState>,
 }
 
 pub fn run() -> i32 {
@@ -582,6 +594,7 @@ impl Server {
                 attached: sid,
                 switcher: None,
                 grid: None,
+                finder: None,
             },
         );
         self.note_attached(sid);
@@ -691,6 +704,10 @@ impl Server {
             let Some(client) = self.clients.get(&conn) else {
                 return;
             };
+            if client.finder.is_some() {
+                self.finder_input(conn, &event);
+                continue;
+            }
             if client.grid.is_some() {
                 self.grid_input(conn, &event);
                 continue;
@@ -721,13 +738,7 @@ impl Server {
         match effect {
             Effect::Detach => self.detach(conn),
             // Switcher mode is per-connection.
-            Effect::OpenSwitcher => {
-                let highlight = self.pinned_entries()
-                    + self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
-                if let Some(client) = self.clients.get_mut(&conn) {
-                    client.switcher = Some(highlight);
-                }
-            }
+            Effect::OpenSwitcher => self.open_switcher(conn),
             // The grid opens directly, without passing through the
             // switcher.
             Effect::OpenGrid => {
@@ -735,6 +746,9 @@ impl Server {
                     client.grid = Some(GridState::default());
                 }
             }
+            // So does the fuzzy tab finder.
+            Effect::OpenFinder => self.open_finder(conn),
+            Effect::NewSession(name) => self.new_session_for(conn, name),
             // Native clipboard plus OSC 52 so the client's
             // terminal (or an outer multiplexer/SSH hop) mirrors it.
             Effect::Copy(text) => {
@@ -845,23 +859,233 @@ impl Server {
         }
     }
 
-    /// Input while viewing the CLAUDECOM grid: directional
-    /// keys move the highlight, Enter jumps to the highlighted tab's home
-    /// session, Escape or `q` returns to the switcher. Everything else —
-    /// mouse included — is discarded; nothing reaches any tab's PTY.
-    fn grid_input(&mut self, conn: ConnId, event: &DecodedInput) {
+    /// Input while the fuzzy tab finder is open: Ctrl-p/Up and Ctrl-n/Down
+    /// move the highlighted match with wrap, Enter attaches to the
+    /// highlighted match's tab, Escape closes without changing which
+    /// session the connection is attached to, and every other key edits
+    /// the query, re-narrowing the matched list.
+    fn finder_input(&mut self, conn: ConnId, event: &DecodedInput) {
         let DecodedInput::Key(key) = event else {
             return;
         };
-        let items = grid::items(&self.sessions);
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let items = find::items(&self.sessions);
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
         };
-        let Some(state) = client.grid.as_mut() else {
+        let Some(state) = client.finder.as_mut() else {
+            return;
+        };
+        let matched = find::matches(&items, &state.query());
+        let count = matched.len();
+        let highlight = state.highlight.min(count.saturating_sub(1));
+        let ctrl = key.modifiers.contains(CtMods::CONTROL);
+        let up = key.code == CtKeyCode::Up || (ctrl && key.code == CtKeyCode::Char('p'));
+        let down = key.code == CtKeyCode::Down || (ctrl && key.code == CtKeyCode::Char('n'));
+        if up && count > 0 {
+            state.highlight = highlight.checked_sub(1).unwrap_or(count - 1);
+            return;
+        }
+        if down && count > 0 {
+            state.highlight = (highlight + 1) % count;
+            return;
+        }
+        match key.code {
+            // Back out without changing attachment.
+            CtKeyCode::Esc => {
+                client.finder = None;
+                let sid = client.attached;
+                if let Some(session) = self.sessions.get_mut(&sid) {
+                    session.request_redraw();
+                }
+            }
+            // Attach to the highlighted match's home session, focused on
+            // its tab. With nothing matched there is nothing to select.
+            CtKeyCode::Enter => {
+                let Some(&idx) = matched.get(highlight) else {
+                    return;
+                };
+                let item = &items[idx];
+                let (sid, window, tab) = (item.session, item.window, item.tab);
+                client.finder = None;
+                self.attach_to_tab(conn, sid, window, tab);
+            }
+            // Everything else edits the query. The highlight follows the
+            // match it was on through the re-narrowed list; a match that
+            // narrowed away resets it to the top one.
+            _ => {
+                let followed = matched.get(highlight).map(|&i| items[i].id);
+                state.textarea.input(tui_textarea::Input::from(*key));
+                let matched = find::matches(&items, &state.query());
+                state.highlight = followed
+                    .and_then(|id| matched.iter().position(|&i| items[i].id == id))
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    /// Re-attach `conn` to `sid`, focused on `window`'s tab at `index`:
+    /// attachment stays exclusive, is recorded as most recent, and the
+    /// session takes the client's terminal size.
+    fn attach_to_tab(
+        &mut self,
+        conn: ConnId,
+        sid: SessionId,
+        window: layout::WindowId,
+        index: usize,
+    ) {
+        let Some(client) = self.clients.get(&conn) else {
+            return;
+        };
+        let size = term::fd_size(&client.raw_out);
+        if client.attached != sid {
+            if let Some(other) = self
+                .clients
+                .iter()
+                .find(|(c, cl)| **c != conn && cl.attached == sid)
+                .map(|(conn, _)| *conn)
+            {
+                self.detach(other);
+            }
+            if let Some(client) = self.clients.get_mut(&conn) {
+                client.attached = sid;
+            }
+        }
+        self.note_attached(sid);
+        if let Some(session) = self.sessions.get_mut(&sid) {
+            session.focus_tab(window, index);
+            session.set_area(Rect::new(0, 0, size.width, size.height));
+            session.request_redraw();
+        }
+    }
+
+    /// Enter switcher mode for `conn`, leaving the grid if it was open;
+    /// the highlight starts on the connection's attached session.
+    fn open_switcher(&mut self, conn: ConnId) {
+        let Some(client) = self.clients.get(&conn) else {
+            return;
+        };
+        let sid = client.attached;
+        let highlight =
+            self.pinned_entries() + self.sessions.keys().position(|&id| id == sid).unwrap_or(0);
+        if let Some(client) = self.clients.get_mut(&conn) {
+            client.grid = None;
+            client.switcher = Some(highlight);
+        }
+    }
+
+    /// Enter fuzzy tab-find mode for `conn`, leaving the grid if it was
+    /// open. The attached session's content is snapshotted here as the
+    /// finder's backdrop — the content behind the floating window stays
+    /// as it was at entry, so the finder's preview is the only view
+    /// resizing tabs while it is open.
+    fn open_finder(&mut self, conn: ConnId) {
+        let Some(client) = self.clients.get(&conn) else {
             return;
         };
         let size = term::fd_size(&client.raw_out);
         let area = Rect::new(0, 0, size.width, size.height);
+        let attached = client.attached;
+        let mut backdrop = Buffer::empty(area);
+        if let Some(session) = self.sessions.get_mut(&attached) {
+            session.render_preview(&mut backdrop, area);
+        }
+        if let Some(client) = self.clients.get_mut(&conn) {
+            client.grid = None;
+            client.finder = Some(find::FinderState::new(backdrop));
+        }
+    }
+
+    /// Create a session — named, or auto-named when `name` is `None` —
+    /// and attach `conn` to it. A name already in use closes with no
+    /// other action, mirroring the ex command line's silent-discard
+    /// handling.
+    fn new_session_for(&mut self, conn: ConnId, name: Option<String>) {
+        if let Some(name) = &name
+            && self.session_by_name(name).is_some()
+        {
+            return;
+        }
+        let Some(client) = self.clients.get(&conn) else {
+            return;
+        };
+        let size = term::fd_size(&client.raw_out);
+        let area = Rect::new(0, 0, size.width, size.height);
+        let Ok(sid) = self.create_session(name, area) else {
+            return;
+        };
+        if let Some(client) = self.clients.get_mut(&conn) {
+            client.attached = sid;
+        }
+        self.note_attached(sid);
+        if let Some(session) = self.sessions.get_mut(&sid) {
+            session.request_redraw();
+        }
+    }
+
+    /// Input while viewing the CLAUDECOM grid. Outside capture mode grid
+    /// items are non-interactive: directional keys move the highlight,
+    /// Enter enters capture mode for the highlighted tile's tab, `g`
+    /// attaches to the highlighted tile's tab in its home session,
+    /// Escape or `q` leaves the grid and resumes the session this
+    /// connection stayed attached to underneath it, the prefix key leads
+    /// `s` (switcher) or `f` (finder), and everything else — mouse
+    /// included — is discarded; nothing reaches any tab's PTY.
+    fn grid_input(&mut self, conn: ConnId, event: &DecodedInput) {
+        let Some(mut state) = self.clients.get(&conn).and_then(|c| c.grid) else {
+            return;
+        };
+        let items = grid::items(&self.sessions);
+        // A captured tab owns the input. The tab can leave the grid (its
+        // process exited or stopped being Claude Code); capture ends
+        // with it and the event falls through to grid navigation.
+        if let Some(id) = state.capture {
+            let target = items.iter().copied().find(|item| {
+                self.sessions
+                    .get(&item.session)
+                    .and_then(|s| s.tab_at(item.window, item.tab))
+                    .is_some_and(|t| t.id == id)
+            });
+            if let Some(item) = target {
+                match self.capture_input(&mut state, item, event) {
+                    None => self.store_grid_state(conn, state),
+                    Some(GridExit::Switcher) => self.open_switcher(conn),
+                    Some(GridExit::Finder) => self.open_finder(conn),
+                }
+                return;
+            }
+            state.capture = None;
+            state.pending_prefix = false;
+        }
+        let DecodedInput::Key(key) = event else {
+            self.store_grid_state(conn, state);
+            return;
+        };
+        if key.kind == KeyEventKind::Release {
+            self.store_grid_state(conn, state);
+            return;
+        }
+        // A pending prefix resolves to the switcher or finder shortcut;
+        // any other follow-up discards both keys, mirroring the
+        // unrecognized-sequence handling everywhere else.
+        if state.pending_prefix {
+            state.pending_prefix = false;
+            if plain_char(key, 's') {
+                self.open_switcher(conn);
+            } else if plain_char(key, 'f') {
+                self.open_finder(conn);
+            } else {
+                self.store_grid_state(conn, state);
+            }
+            return;
+        }
+        if self.keys.is_prefix(*key) {
+            state.pending_prefix = true;
+            self.store_grid_state(conn, state);
+            return;
+        }
         let dir = match key.code {
             CtKeyCode::Char('h') | CtKeyCode::Left => Some(Dir::Left),
             CtKeyCode::Char('j') | CtKeyCode::Down => Some(Dir::Down),
@@ -870,47 +1094,108 @@ impl Server {
             _ => None,
         };
         if let Some(dir) = dir {
-            grid::navigate(state, area, items.len(), dir);
+            if let Some(client) = self.clients.get(&conn) {
+                let size = term::fd_size(&client.raw_out);
+                let area = Rect::new(0, 0, size.width, size.height);
+                grid::navigate(&mut state, area, items.len(), dir);
+            }
+            self.store_grid_state(conn, state);
             return;
         }
         match key.code {
-            // Back to the switcher, highlight on the pinned entry.
+            // Leave the grid, resuming the session the connection was
+            // attached to before opening it — attachment never changed
+            // while the grid rendered over it.
             CtKeyCode::Esc | CtKeyCode::Char('q') => {
-                client.grid = None;
-                client.switcher = Some(0);
-            }
-            // Jump to the highlighted tile's home session, focusing the
-            // window containing its tab and making that tab active.
-            CtKeyCode::Enter => {
-                let highlight = state.highlight.min(items.len().saturating_sub(1));
-                // An empty grid has nothing to select; stay on it.
-                let Some(&item) = items.get(highlight) else {
+                let Some(client) = self.clients.get_mut(&conn) else {
                     return;
                 };
                 client.grid = None;
-                let current = client.attached;
-                if item.session != current {
-                    // Exclusive attachment.
-                    if let Some(other) = self
-                        .clients
-                        .iter()
-                        .find(|(c, cl)| **c != conn && cl.attached == item.session)
-                        .map(|(conn, _)| *conn)
-                    {
-                        self.detach(other);
-                    }
-                    if let Some(client) = self.clients.get_mut(&conn) {
-                        client.attached = item.session;
-                    }
-                }
-                self.note_attached(item.session);
-                if let Some(session) = self.sessions.get_mut(&item.session) {
-                    session.focus_tab(item.window, item.tab);
-                    session.set_area(area);
+                let sid = client.attached;
+                if let Some(session) = self.sessions.get_mut(&sid) {
                     session.request_redraw();
                 }
             }
-            _ => {}
+            // Capture the highlighted tile's tab for direct interaction
+            // in place. An empty grid has nothing to capture.
+            CtKeyCode::Enter => {
+                let highlight = state.highlight.min(items.len().saturating_sub(1));
+                if let Some(item) = items.get(highlight)
+                    && let Some(tab) = self
+                        .sessions
+                        .get(&item.session)
+                        .and_then(|s| s.tab_at(item.window, item.tab))
+                {
+                    state.capture = Some(tab.id);
+                    state.pending_prefix = false;
+                }
+                self.store_grid_state(conn, state);
+            }
+            // Attach to the highlighted tile's tab in its home session —
+            // `g` inverts prefix+g's "go to the grid" sense. An empty
+            // grid has nowhere to go.
+            CtKeyCode::Char('g') => {
+                let highlight = state.highlight.min(items.len().saturating_sub(1));
+                let Some(item) = items.get(highlight).copied() else {
+                    self.store_grid_state(conn, state);
+                    return;
+                };
+                if let Some(client) = self.clients.get_mut(&conn) {
+                    client.grid = None;
+                }
+                self.attach_to_tab(conn, item.session, item.window, item.tab);
+            }
+            _ => self.store_grid_state(conn, state),
+        }
+    }
+
+    /// One input event for a captured grid tab: key presses are routed
+    /// to its PTY, except that the prefix key always leads a command
+    /// rather than ever reaching the tab raw — `g` or Escape exits
+    /// capture back to grid navigation, `s` and `f` leave the grid for
+    /// the switcher or finder (the returned `GridExit`), and any other
+    /// follow-up discards both keys. Pastes reach the tab; mouse input
+    /// is discarded.
+    fn capture_input(
+        &mut self,
+        state: &mut GridState,
+        item: grid::GridItem,
+        event: &DecodedInput,
+    ) -> Option<GridExit> {
+        let session = self.sessions.get_mut(&item.session)?;
+        match event {
+            DecodedInput::Key(key) => {
+                if key.kind == KeyEventKind::Release {
+                    return None;
+                }
+                if state.pending_prefix {
+                    state.pending_prefix = false;
+                    if key.code == CtKeyCode::Esc || plain_char(key, 'g') {
+                        state.capture = None;
+                    } else if plain_char(key, 's') {
+                        return Some(GridExit::Switcher);
+                    } else if plain_char(key, 'f') {
+                        return Some(GridExit::Finder);
+                    }
+                    return None;
+                }
+                if self.keys.is_prefix(*key) {
+                    state.pending_prefix = true;
+                    return None;
+                }
+                session.key_to_tab(item.window, item.tab, *key);
+            }
+            DecodedInput::Paste(text) => session.paste_to_tab(item.window, item.tab, text),
+            DecodedInput::Mouse(_) => {}
+        }
+        None
+    }
+
+    /// Write a grid state copy back to the connection's open grid, if it
+    /// is still open.
+    fn store_grid_state(&mut self, conn: ConnId, state: GridState) {
+        if let Some(grid) = self.clients.get_mut(&conn).and_then(|c| c.grid.as_mut()) {
+            *grid = state;
         }
     }
 
@@ -922,7 +1207,9 @@ impl Server {
             sessions, clients, ..
         } = self;
         for client in clients.values_mut() {
-            if client.grid.is_some() {
+            if client.finder.is_some() {
+                render_finder(client, sessions);
+            } else if client.grid.is_some() {
                 render_grid(client, sessions);
             } else if let Some(highlight) = client.switcher {
                 render_switcher(client, sessions, highlight);
@@ -935,9 +1222,37 @@ impl Server {
     }
 }
 
+/// The fuzzy tab finder frame: the backdrop snapshotted at entry — the
+/// content as it was before the finder opened — with the finder's
+/// floating window rendered over its center.
+fn render_finder(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>) {
+    let Client {
+        finder, terminal, ..
+    } = client;
+    let Some(state) = finder.as_ref() else {
+        return;
+    };
+    let _ = terminal.draw(|frame| {
+        let area = frame.area();
+        let buf = frame.buffer_mut();
+        let backdrop = state.backdrop.area();
+        for y in 0..area.height.min(backdrop.height) {
+            for x in 0..area.width.min(backdrop.width) {
+                if let (Some(dst), Some(src)) = (
+                    buf.cell_mut(Position::new(area.x + x, area.y + y)),
+                    state.backdrop.cell(Position::new(x, y)),
+                ) {
+                    *dst = src.clone();
+                }
+            }
+        }
+        find::render(buf, area, sessions, state);
+    });
+}
+
 /// The CLAUDECOM frame: the live grid over the whole
 /// viewport.
-fn render_grid(client: &mut Client, sessions: &BTreeMap<SessionId, Session>) {
+fn render_grid(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>) {
     let Client { grid, terminal, .. } = client;
     let Some(state) = grid.as_mut() else {
         return;
@@ -1080,6 +1395,16 @@ fn spawn_stdin_reader(
             }
         }
     });
+}
+
+/// Whether `key` is the unmodified character `ch`.
+fn plain_char(key: &KeyEvent, ch: char) -> bool {
+    KeyMatch::from_event(*key)
+        == KeyMatch {
+            code: CtKeyCode::Char(ch),
+            ctrl: false,
+            shift: false,
+        }
 }
 
 /// OSC 52 written straight to the client's terminal.
