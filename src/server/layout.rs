@@ -2,7 +2,7 @@
 //! can give each session/screen its own tree. Pure geometry
 //! and tree surgery; no PTY or rendering concerns.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 pub type WindowId = usize;
 
@@ -226,6 +226,126 @@ pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -
     let new_first = (first_size + delta).clamp(1.0, f64::from(avail - 1));
     s.ratio = new_first / f64::from(avail);
     true
+}
+
+/// One step from a split to a child; a path of these addresses a split
+/// stably while its ratio changes during a drag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    First,
+    Second,
+}
+
+/// The split whose draggable boundary lies under `pos`, as the path from
+/// the root plus the split's kind: the separator column of a side-by-side
+/// split, or the top row of a stacked split's lower half (the lower
+/// window's tab bar). A parent's boundary wins where a child's crosses it.
+pub fn boundary_at(node: &Node, area: Rect, pos: Position) -> Option<(Vec<Side>, SplitKind)> {
+    let mut path = Vec::new();
+    let mut node = node;
+    let mut area = area;
+    loop {
+        let Node::Split(s) = node else { return None };
+        let (first, second, sep) = split_areas(s.kind, s.ratio, area);
+        let hit = match s.kind {
+            SplitKind::SideBySide => sep.contains(pos),
+            SplitKind::Stacked => second.height > 0 && pos.y == second.y && area.contains(pos),
+        };
+        if hit {
+            return Some((path, s.kind));
+        }
+        (node, area) = if first.contains(pos) {
+            path.push(Side::First);
+            (s.first.as_ref(), first)
+        } else if second.contains(pos) {
+            path.push(Side::Second);
+            (s.second.as_ref(), second)
+        } else {
+            return None;
+        };
+    }
+}
+
+/// Drag the boundary of the split at `path` toward the screen position
+/// `to`, one cell at a time, stopping where any window would shrink below
+/// `min` (columns, rows); a window already below the minimum may only
+/// grow. Returns whether the boundary moved.
+pub fn drag_boundary(
+    node: &mut Node,
+    area: Rect,
+    path: &[Side],
+    to: Position,
+    min: (u16, u16),
+) -> bool {
+    let mut node = node;
+    let mut area = area;
+    for side in path {
+        let Node::Split(s) = node else { return false };
+        let (first, second, _) = split_areas(s.kind, s.ratio, area);
+        (node, area) = match side {
+            Side::First => (s.first.as_mut(), first),
+            Side::Second => (s.second.as_mut(), second),
+        };
+    }
+    let Node::Split(s) = node else { return false };
+    let avail = match s.kind {
+        SplitKind::SideBySide => area.width.saturating_sub(1),
+        SplitKind::Stacked => area.height,
+    };
+    if avail < 2 {
+        return false;
+    }
+    // The boundary sits at the first half's far edge.
+    let target = match s.kind {
+        SplitKind::SideBySide => to.x.saturating_sub(area.x),
+        SplitKind::Stacked => to.y.saturating_sub(area.y),
+    }
+    .clamp(1, avail - 1);
+    let mut size = (f64::from(avail) * s.ratio)
+        .round()
+        .clamp(1.0, f64::from(avail - 1)) as u16;
+    let mut moved = false;
+    while size != target {
+        let next = if target > size { size + 1 } else { size - 1 };
+        let before = subtree_rects(s, area);
+        let prev_ratio = s.ratio;
+        s.ratio = f64::from(next) / f64::from(avail);
+        if !step_fits(&before, &subtree_rects(s, area), min) {
+            s.ratio = prev_ratio;
+            break;
+        }
+        size = next;
+        moved = true;
+    }
+    moved
+}
+
+/// Every window rectangle under one split, at its current ratio.
+fn subtree_rects(s: &Split, area: Rect) -> Vec<(WindowId, Rect)> {
+    let (first, second, _) = split_areas(s.kind, s.ratio, area);
+    let mut rects = Vec::new();
+    let mut seps = Vec::new();
+    walk(&s.first, first, &mut rects, &mut seps);
+    walk(&s.second, second, &mut rects, &mut seps);
+    rects
+}
+
+/// Whether a boundary step leaves every window at or above the minimum in
+/// each dimension — or at least no smaller than it already was.
+fn step_fits(
+    before: &[(WindowId, Rect)],
+    after: &[(WindowId, Rect)],
+    (min_cols, min_rows): (u16, u16),
+) -> bool {
+    after.iter().all(|&(id, rect)| {
+        let old = before
+            .iter()
+            .find(|(before_id, _)| *before_id == id)
+            .map(|&(_, r)| r)
+            .unwrap_or(rect);
+        (rect.width >= min_cols || rect.width >= old.width)
+            && (rect.height >= min_rows || rect.height >= old.height)
+    })
 }
 
 /// Exchange the tree positions of leaves `a` and `b`. Every split's kind
@@ -473,6 +593,127 @@ mod tests {
         assert_eq!(inner.kind, SplitKind::Stacked);
         // A lone leaf has no orientation to flip.
         assert!(!rotate(&mut Node::Leaf(1), 1));
+    }
+
+    #[test]
+    fn boundary_at_finds_separators_and_stacked_rows() {
+        // 1 | (2 / 3): the root's separator column and the inner stacked
+        // boundary at window 3's tab bar row.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
+        let (rects, seps) = compute(&tree, area());
+        let sep = seps[0].rect;
+        assert_eq!(
+            boundary_at(&tree, area(), Position::new(sep.x, 5)),
+            Some((vec![], SplitKind::SideBySide))
+        );
+        let three = rects.iter().find(|(id, _)| *id == 3).unwrap().1;
+        assert_eq!(
+            boundary_at(&tree, area(), Position::new(three.x + 1, three.y)),
+            Some((vec![Side::Second], SplitKind::Stacked))
+        );
+        // Window content is no boundary.
+        assert_eq!(boundary_at(&tree, area(), Position::new(1, 1)), None);
+    }
+
+    #[test]
+    fn parent_boundary_wins_where_a_child_boundary_crosses_it() {
+        // 1 / (2 | 3): the lower half's top row contains the inner
+        // separator's first cell; the stacked boundary claims it.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::Stacked, 2);
+        split_leaf(&mut tree, 2, SplitKind::SideBySide, 3);
+        let (_, seps) = compute(&tree, area());
+        let sep = seps[0].rect;
+        assert_eq!(
+            boundary_at(&tree, area(), Position::new(sep.x, sep.y)),
+            Some((vec![], SplitKind::Stacked))
+        );
+        // Below the top row the separator is its own boundary.
+        assert_eq!(
+            boundary_at(&tree, area(), Position::new(sep.x, sep.y + 1)),
+            Some((vec![Side::Second], SplitKind::SideBySide))
+        );
+    }
+
+    #[test]
+    fn drag_moves_the_boundary_to_the_mouse() {
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        assert!(drag_boundary(
+            &mut tree,
+            area(),
+            &[],
+            Position::new(30, 5),
+            (10, 3)
+        ));
+        let (rects, seps) = compute(&tree, area());
+        assert_eq!(seps[0].rect.x, 30);
+        assert_eq!(rects[0].1.width, 30);
+    }
+
+    #[test]
+    fn drag_stops_at_the_minimum_window_size() {
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        // Dragging far past the floor stops where the left window
+        // reaches the minimum width.
+        assert!(drag_boundary(
+            &mut tree,
+            area(),
+            &[],
+            Position::new(0, 5),
+            (10, 3)
+        ));
+        assert_eq!(compute(&tree, area()).0[0].1.width, 10);
+        // Already at the floor: nothing moves.
+        assert!(!drag_boundary(
+            &mut tree,
+            area(),
+            &[],
+            Position::new(0, 5),
+            (10, 3)
+        ));
+        // Stacked: the lower window stops at the minimum height.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::Stacked, 2);
+        assert!(drag_boundary(
+            &mut tree,
+            area(),
+            &[],
+            Position::new(5, 24),
+            (10, 3)
+        ));
+        assert_eq!(compute(&tree, area()).0[1].1.height, 3);
+    }
+
+    #[test]
+    fn drag_never_shrinks_a_window_already_below_minimum() {
+        // Keyboard resize can push a window below the drag floor; the
+        // drag may not shrink it further but may still grow it.
+        let mut tree = Node::Leaf(1);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        for _ in 0..30 {
+            resize_toward(&mut tree, area(), 1, Dir::Right);
+        }
+        assert!(compute(&tree, area()).0[1].1.width < 10);
+        // Toward the too-narrow window: no movement.
+        assert!(!drag_boundary(
+            &mut tree,
+            area(),
+            &[],
+            Position::new(79, 5),
+            (10, 3)
+        ));
+        // Away from it: the boundary moves freely.
+        assert!(drag_boundary(
+            &mut tree,
+            area(),
+            &[],
+            Position::new(40, 5),
+            (10, 3)
+        ));
     }
 
     #[test]

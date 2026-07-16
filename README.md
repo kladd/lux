@@ -24,13 +24,18 @@ cargo install --path .
 
 ```sh
 lux                    # create and attach to a new session
-lux -s <name>          # create a named session (fails if it exists)
+lux -s <name>          # attach to a session by name, creating it if needed
 lux new-session -s <name>
-lux -t <name>          # attach to an existing session
+lux -t <name>          # same; -t is kept for tmux muscle memory
 lux attach -t <name>
+lux attach             # reattach to the most recently attached session
 lux ls                 # list sessions
 lux kill-server        # stop the server and all sessions
 ```
+
+Sessions are saved automatically and restored when the server next
+starts, resuming Claude Code sessions in their tabs (disable with
+`restore = false`, see Configuration).
 
 ### Navigating and manipulating windows
 
@@ -57,6 +62,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `d` | detach from the session |
 | `s` | open the session switcher |
 | `g` | open the CLAUDECOM grid |
+| `f` | open the fuzzy tab finder |
 | `:` | open the ex command line |
 
 Arrow keys work as alternates for `h`/`j`/`k`/`l` (and Shift-arrows for
@@ -69,6 +75,9 @@ Ex commands (typed after `:`, with autocomplete):
 - `:w <path>` — write the tab's entire content, scrollback included, to a
   file (a leading `~/` expands to your home directory; relative paths
   resolve against the server's working directory)
+- `:new [name]` / `:new-session [name]` — create a session (auto-named
+  without an argument) and attach to it; a name already in use does
+  nothing
 
 ### Navigating sessions
 
@@ -76,25 +85,41 @@ Prefix+`s` opens the session switcher: a list of sessions with a live
 preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
 `Ctrl-n`/`Ctrl-p`; `Enter` attaches, `Esc` cancels.
 
-While any tab runs Claude Code, the switcher pins a **CLAUDECOM** entry at
-the top: a live, read-only grid with one tile per Claude Code tab across
-every session, each showing its status text, home session name, and the
-tail of its output. Prefix+`g` jumps straight to the grid without opening
-the switcher. Move the highlight with
-`h`/`j`/`k`/`l` or the arrow keys (overflow rows scroll with it); `Enter`
-jumps to the highlighted tab's home session, window, and tab; `q`/`Esc`
-returns to the switcher.
+Prefix+`f` opens the fuzzy tab finder: a popover floating over your
+session that lists every tab across every session, narrowing as you type
+a query, with a live preview of the highlighted match. Move the highlight
+with `Ctrl-n`/`Ctrl-p` or the arrow keys; `Enter` jumps to the
+highlighted tab's home session, window, and tab; `Esc` cancels.
+
+### CLAUDECOM
+
+While any tab runs Claude Code, the switcher pins a **CLAUDECOM** entry
+at the top: a live grid with one tile per Claude Code tab across every
+session, each showing its status text, home session name, tab name, and
+its content resized to fit the tile. Prefix+`g` jumps straight to the
+grid without opening the switcher.
+
+In the grid: move the highlight with `h`/`j`/`k`/`l` or the arrow keys
+(overflow rows scroll with it); `Enter` captures the highlighted tile for
+typing into its tab in place (marked with a `capture` label — prefix+`g`
+or prefix+`Esc` returns to grid navigation); `g` jumps to the highlighted
+tab's home session, window, and tab; prefix+`s` and prefix+`f` open the
+switcher or finder directly; `q`/`Esc` returns to the session you came
+from.
 
 ## Configuration
 
 Lux reads `$XDG_CONFIG_HOME/lux/config.toml` (falling back to
 `~/.config/lux/config.toml`) at startup. A missing file is fine; a malformed
-one falls back to defaults with an error printed to stderr. The prefix key
-is the only setting; the keybinding table itself is not configurable:
+one falls back to defaults with an error printed to stderr. The keybinding
+table itself is not configurable:
 
 ```toml
 # ~/.config/lux/config.toml
-prefix = "C-a"   # "C-" prefix means Ctrl is held
+prefix = "C-a"   # "C-" prefix means Ctrl is held (default: C-b)
+restore = false  # skip restoring persisted sessions at startup
+notify = false   # no desktop notifications for Claude Code tabs
 ```
 
-The key spec is a single character, optionally prefixed with `C-` for Ctrl.
+The prefix key spec is a single character, optionally prefixed with `C-`
+for Ctrl.

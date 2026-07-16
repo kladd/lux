@@ -1,5 +1,12 @@
 # News
 
+## 2026-07-16
+
+- Window boundaries can now be resized by dragging them with the mouse —
+  grab a vertical separator or a lower window's tab bar row — and the
+  mouse pointer shows a matching resize shape when hovering a draggable
+  boundary (in terminals that support pointer shapes).
+
 ## 2026-07-13
 
 - Added a fuzzy tab finder (`prefix+f`): a bordered popover floating over

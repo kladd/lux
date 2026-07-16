@@ -105,6 +105,9 @@ struct Client {
     grid: Option<GridState>,
     /// `Some` while in fuzzy tab-find mode.
     finder: Option<find::FinderState>,
+    /// The pointer shape last written to the client's terminal (an OSC
+    /// 22 name), so hover updates only write changes.
+    pointer: &'static str,
 }
 
 pub fn run() -> i32 {
@@ -595,6 +598,7 @@ impl Server {
                 switcher: None,
                 grid: None,
                 finder: None,
+                pointer: "default",
             },
         );
         self.note_attached(sid);
@@ -766,6 +770,16 @@ impl Server {
                 };
                 if let Some(session) = self.sessions.get_mut(&sid) {
                     session.paste_text(&text);
+                }
+            }
+            // Written only on change, so plain mouse motion doesn't spam
+            // escape sequences at the client's terminal.
+            Effect::Pointer(shape) => {
+                if let Some(client) = self.clients.get_mut(&conn)
+                    && client.pointer != shape
+                {
+                    client.pointer = shape;
+                    let _ = write!(client.raw_out, "\x1b]22;{shape}\x1b\\");
                 }
             }
             Effect::Ended => self.end_session(sid),

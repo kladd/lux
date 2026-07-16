@@ -101,6 +101,9 @@ pub fn attach(request: Request) -> i32 {
 }
 
 fn restore_terminal() {
+    // The server may have set a resize pointer shape (the boundary hover
+    // cue); put the default back before leaving.
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b]22;default\x1b\\");
     let _ = execute!(
         std::io::stdout(),
         DisableBracketedPaste,

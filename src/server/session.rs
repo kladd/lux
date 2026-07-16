@@ -31,7 +31,7 @@ use crate::server::agent;
 use crate::server::anim::{self, Anim};
 use crate::server::ex::{self, ExCommand};
 use crate::server::keys::{Command, KeyMatch, KeyTable, KeyTrie};
-use crate::server::layout::{self, Dir, Node, Separator, SplitKind, WindowId};
+use crate::server::layout::{self, Dir, Node, Separator, Side, SplitKind, WindowId};
 use crate::server::persist;
 use crate::server::term::FdBackend;
 use crate::server::window::{Notice, Tab, TabId, Window};
@@ -66,8 +66,19 @@ pub enum Effect {
     Copy(String),
     /// Paste the system clipboard into this session.
     Paste,
+    /// Set the client terminal's mouse pointer shape (an OSC 22 name).
+    Pointer(&'static str),
     /// The last window's last tab exited.
     Ended,
+}
+
+/// An in-progress mouse drag of a split boundary.
+struct BorderDrag {
+    /// Path from the layout tree's root to the dragged split.
+    path: Vec<Side>,
+    /// Whether any drag motion arrived; a press released without motion
+    /// is a click on the chrome underneath.
+    moved: bool,
 }
 
 /// A drag selection over one window's content, in
@@ -285,6 +296,8 @@ pub struct Session {
     keys: Arc<KeyTable>,
     /// The current drag selection, if any.
     selection: Option<Selection>,
+    /// The boundary drag in progress, if any.
+    border_drag: Option<BorderDrag>,
     view: View,
     area: Rect,
     /// The clock text as of the last computed view.
@@ -318,6 +331,7 @@ impl Session {
             prompt: None,
             keys,
             selection: None,
+            border_drag: None,
             view: View::default(),
             area,
             clock: String::new(),
@@ -382,6 +396,7 @@ impl Session {
             prompt: None,
             keys,
             selection: None,
+            border_drag: None,
             view: View::default(),
             area,
             clock: String::new(),
@@ -774,8 +789,27 @@ impl Session {
         // Shift bypasses a program's mouse grab, keeping selection,
         // yank, and paste reachable inside mouse-aware programs.
         let shift = mouse.modifiers.contains(CtMods::SHIFT);
+        // An active boundary drag consumes every mouse event until the
+        // button is released.
+        if self.border_drag.is_some() {
+            return self.drag_border(&mouse, pos);
+        }
         match mouse.kind {
             CtMouseKind::Down(button) => {
+                // A left press on a draggable boundary — a separator
+                // column, or the tab bar row bordering the window above —
+                // starts a boundary drag. Boundaries are lux chrome, so
+                // the press never reaches a mouse-grabbed program; click
+                // behavior on the row underneath happens on release when
+                // no drag follows.
+                if button == CtMouseButton::Left
+                    && self.maximized.is_none()
+                    && let Some((path, _)) =
+                        layout::boundary_at(&self.tree, tree_area(self.area), pos)
+                {
+                    self.border_drag = Some(BorderDrag { path, moved: false });
+                    return None;
+                }
                 let id = self.window_at(pos)?;
                 // Click-to-focus.
                 if self.focus != id {
@@ -840,12 +874,17 @@ impl Session {
                 }
                 // Releases and motion still reach a
                 // grabbed program, unless Shift bypasses it.
-                let id = self.window_at(pos)?;
-                let win = self.windows.get_mut(&id).expect("window exists");
-                let content = win.content_rect();
-                let tab = win.active_tab_mut();
-                if tab.engine.is_mouse_grabbed() && !shift {
-                    forward_mouse(tab, &mouse, content);
+                if let Some(id) = self.window_at(pos) {
+                    let win = self.windows.get_mut(&id).expect("window exists");
+                    let content = win.content_rect();
+                    let tab = win.active_tab_mut();
+                    if tab.engine.is_mouse_grabbed() && !shift {
+                        forward_mouse(tab, &mouse, content);
+                    }
+                }
+                // Hovering a draggable boundary shows a resize pointer.
+                if mouse.kind == CtMouseKind::Moved {
+                    return Some(Effect::Pointer(self.pointer_shape(pos)));
                 }
             }
             CtMouseKind::ScrollUp | CtMouseKind::ScrollDown => {
@@ -879,6 +918,59 @@ impl Session {
             _ => {}
         }
         None
+    }
+
+    /// Continue or finish the boundary drag in progress: motion moves the
+    /// boundary to track the mouse, stopping at the minimum window size;
+    /// a release without motion is a plain click on the chrome
+    /// underneath (focus, tab select).
+    fn drag_border(&mut self, mouse: &CtMouseEvent, pos: Position) -> Option<Effect> {
+        let drag = self.border_drag.as_mut().expect("drag in progress");
+        match mouse.kind {
+            CtMouseKind::Drag(CtMouseButton::Left) => {
+                drag.moved = true;
+                let path = drag.path.clone();
+                if layout::drag_boundary(
+                    &mut self.tree,
+                    tree_area(self.area),
+                    &path,
+                    pos,
+                    (MIN_COLS, MIN_ROWS),
+                ) {
+                    self.force_redraw = true;
+                }
+            }
+            CtMouseKind::Up(CtMouseButton::Left) => {
+                let moved = drag.moved;
+                self.border_drag = None;
+                if !moved && let Some(id) = self.window_at(pos) {
+                    if self.focus != id {
+                        self.set_focus(id);
+                        self.force_redraw = true;
+                    }
+                    if let Some(index) = self.tab_badge_at(id, pos) {
+                        self.select_tab(index);
+                    }
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The mouse pointer shape for `pos`: a resize shape over a draggable
+    /// boundary, matching the axis the boundary moves on, and the default
+    /// anywhere else. Shapes are OSC 22 names; terminals without
+    /// pointer-shape support ignore the sequence.
+    fn pointer_shape(&self, pos: Position) -> &'static str {
+        if self.maximized.is_some() {
+            return "default";
+        }
+        match layout::boundary_at(&self.tree, tree_area(self.area), pos) {
+            Some((_, SplitKind::SideBySide)) => "ew-resize",
+            Some((_, SplitKind::Stacked)) => "ns-resize",
+            None => "default",
+        }
     }
 
     fn window_at(&self, pos: Position) -> Option<WindowId> {
