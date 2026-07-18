@@ -129,6 +129,30 @@ pub fn ls() -> i32 {
     0
 }
 
+/// Terminate one named session; errors if no server runs or session not found.
+pub fn kill_session(name: &str) -> i32 {
+    let Some(mut stream) = connect_existing() else {
+        return 1;
+    };
+    if protocol::write_line(&mut stream, Request::KillSession(name.into()).encode().trim_end())
+        .is_err()
+    {
+        eprintln!("lux: server connection failed");
+        return 1;
+    }
+    match protocol::read_line(&mut stream) {
+        Ok(Some(line)) if line == "ok" => 0,
+        Ok(Some(line)) => {
+            eprintln!("lux: {}", line.strip_prefix("err ").unwrap_or(&line));
+            1
+        }
+        _ => {
+            eprintln!("lux: server closed the connection");
+            1
+        }
+    }
+}
+
 /// Terminate the server; errors if none runs.
 pub fn kill_server() -> i32 {
     let Some(mut stream) = connect_existing() else {

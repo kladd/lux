@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-pub const COMMANDS: &[&str] = &["new", "new-session", "sp", "vs", "w"];
+pub const COMMANDS: &[&str] = &["kill-session", "new", "new-session", "rename-session", "sp", "vs", "w"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExCommand {
@@ -18,6 +18,11 @@ pub enum ExCommand {
     /// `new`/`new-session [name]`: create a session — named, or
     /// auto-named when no name is given — and attach to it.
     NewSession(Option<String>),
+    /// `rename-session <name>`: rename the current session.
+    RenameSession(String),
+    /// `kill-session [name]`: kill a named session, or the current one if
+    /// no name is given.
+    KillSession(Option<String>),
 }
 
 /// Parse the command line's text on Enter. `None` means unrecognized —
@@ -27,9 +32,16 @@ pub fn parse(text: &str) -> Option<ExCommand> {
         "vs" => Some(ExCommand::SplitSideBySide),
         "sp" => Some(ExCommand::SplitStacked),
         "new" | "new-session" => Some(ExCommand::NewSession(None)),
+        "kill-session" => Some(ExCommand::KillSession(None)),
         _ => {
             if let Some(name) = arg(text, "new").or_else(|| arg(text, "new-session")) {
                 return Some(ExCommand::NewSession(Some(name.to_string())));
+            }
+            if let Some(name) = arg(text, "rename-session") {
+                return Some(ExCommand::RenameSession(name.to_string()));
+            }
+            if let Some(name) = arg(text, "kill-session") {
+                return Some(ExCommand::KillSession(Some(name.to_string())));
             }
             let path = text.strip_prefix("w ")?.trim();
             if path.is_empty() {
@@ -102,9 +114,14 @@ mod tests {
 
     #[test]
     fn suggestions_narrow_with_the_text() {
-        assert_eq!(suggestions(""), vec!["new", "new-session", "sp", "vs", "w"]);
+        assert_eq!(
+            suggestions(""),
+            vec!["kill-session", "new", "new-session", "rename-session", "sp", "vs", "w"]
+        );
         assert_eq!(suggestions("v"), vec!["vs"]);
         assert_eq!(suggestions("new"), vec!["new", "new-session"]);
+        assert_eq!(suggestions("rename"), vec!["rename-session"]);
+        assert_eq!(suggestions("kill"), vec!["kill-session"]);
         assert_eq!(suggestions("w"), vec!["w"]);
         assert_eq!(suggestions("w /tmp"), Vec::<&str>::new());
         assert_eq!(suggestions("x"), Vec::<&str>::new());

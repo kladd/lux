@@ -33,6 +33,8 @@ pub enum Request {
     Ls,
     /// Terminate the server.
     Kill,
+    /// Terminate one named session.
+    KillSession(String),
     /// The attached client's terminal was resized.
     Resize,
 }
@@ -45,6 +47,7 @@ impl Request {
             Request::Recent => "recent\n".into(),
             Request::Ls => "ls\n".into(),
             Request::Kill => "kill\n".into(),
+            Request::KillSession(name) => format!("kill-session {name}\n"),
             Request::Resize => "resize\n".into(),
         }
     }
@@ -53,6 +56,9 @@ impl Request {
         let line = line.strip_suffix('\n').unwrap_or(line);
         Some(match line.split_once(' ') {
             Some(("session", name)) if !name.is_empty() => Request::Session(name.into()),
+            Some(("kill-session", name)) if !name.is_empty() => {
+                Request::KillSession(name.into())
+            }
             None => match line {
                 "new" => Request::New,
                 "recent" => Request::Recent,
@@ -148,6 +154,7 @@ mod tests {
             Request::Recent,
             Request::Ls,
             Request::Kill,
+            Request::KillSession("work".into()),
             Request::Resize,
         ] {
             assert_eq!(Request::decode(&req.encode()), Some(req));

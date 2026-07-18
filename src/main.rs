@@ -27,15 +27,17 @@ fn main() {
         ["-t", name] | ["attach", "-t", name] | ["attach-session", "-t", name] => {
             client::attach(Request::Session((*name).into()))
         }
-        // A bare `attach` verb goes back to the most recently attached
-        // session, or starts fresh if nothing has been attached to.
-        ["attach"] | ["attach-session"] => client::attach(Request::Recent),
+        // A bare `attach` verb (or the shorthand `a`) goes back to the
+        // most recently attached session, or starts fresh if nothing has
+        // been attached to.
+        ["a"] | ["attach"] | ["attach-session"] => client::attach(Request::Recent),
         ["ls"] => client::ls(),
+        ["kill-session", "-t", name] => client::kill_session(name),
         ["kill-server"] => client::kill_server(),
         ["__server"] => server::run(),
         _ => {
             eprintln!(
-                "usage: lux [[new|new-session] [-s <name>] | [attach|attach-session] [-t <name>] | ls | kill-server]"
+                "usage: lux [[new|new-session] [-s <name>] | [a|attach|attach-session] [-t <name>] | ls | kill-session -t <name> | kill-server]"
             );
             2
         }
