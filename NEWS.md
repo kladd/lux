@@ -1,5 +1,12 @@
 # News
 
+## 2026-07-19
+
+- The focused window's tab bar rule now animates in its active tab's
+  status color.
+- Tabs running Codex are now detected and their state (working, blocked,
+  idle) classified from Codex's window title and on-screen prompts.
+
 ## 2026-07-16
 
 - Window boundaries can now be resized by dragging them with the mouse —

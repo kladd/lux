@@ -174,6 +174,10 @@ struct Chrome {
     tabs: Vec<TabBadge>,
     /// Whether the active tab is in scroll mode.
     scroll: bool,
+    /// The active tab's status animation and status color, carried onto
+    /// the bar's rule while the window is focused.
+    rule_anim: Anim,
+    rule_color: Color,
 }
 
 /// The session status line's neutral background — xterm-256
@@ -1552,7 +1556,7 @@ impl Session {
             // rule lead-in, then per badge " i:name", the
             // agent text when present, and the trailing separator space.
             let mut next_x = bar.x.saturating_add(2).min(bar.right());
-            let tabs = win
+            let tabs: Vec<TabBadge> = win
                 .tabs
                 .iter()
                 .enumerate()
@@ -1573,11 +1577,19 @@ impl Session {
                     }
                 })
                 .collect();
+            let (rule_anim, rule_color) = tabs
+                .get(active)
+                .and_then(|badge| badge.agent.as_ref())
+                .map_or((Anim::None, Color::Reset), |visual| {
+                    (visual.anim, visual.color)
+                });
             chrome.push(Chrome {
                 window: id,
                 tab_bar: bar,
                 tabs,
                 scroll: win.active_tab().scroll_mode(),
+                rule_anim,
+                rule_color,
             });
         }
         self.clock = clock_now();
@@ -1787,15 +1799,32 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
     };
     // One thin rule weight; brightness signals focus.
     // Focused inherits the terminal's default foreground rather than
-    // hardcoding white.
-    let rule = Style::default().fg(if focused {
-        Color::Reset
-    } else {
-        Color::DarkGray
-    });
+    // hardcoding white. The focused bar's rule also carries the active
+    // tab's status animation in its status color — working shimmers,
+    // blocked breathes — indexed by bar position so the effect sweeps
+    // the whole width.
+    let rule_at = |x: u16| -> Style {
+        let base = if focused {
+            Color::Reset
+        } else {
+            Color::DarkGray
+        };
+        let color = match (focused, chrome.rule_anim) {
+            (false, _) | (_, Anim::None) => base,
+            (true, Anim::Shimmer) => anim::shimmer(
+                chrome.rule_color,
+                (x - bar.x) as usize,
+                bar.width as usize,
+                elapsed,
+            ),
+            (true, Anim::Breathe) => anim::breathe(chrome.rule_color, elapsed),
+        };
+        Style::default().fg(color)
+    };
     // Two cells of rule anchor the bar's left edge.
     for _ in 0..2 {
-        if !put(&mut x, '─', rule) {
+        let style = rule_at(x);
+        if !put(&mut x, '─', style) {
             return;
         }
     }
@@ -1846,7 +1875,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
     while x < bar.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, bar.y)) {
             dst.set_symbol("─");
-            dst.set_style(rule);
+            dst.set_style(rule_at(x));
         }
         x += 1;
     }

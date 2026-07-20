@@ -1,8 +1,8 @@
-//! Claude Code agent detection (Phase 9): hardcoded, priority-ordered
-//! rules gated by nested `all`/`any`/`not` combinators over
-//! `contains`/`regex` matchers, evaluated against a tab's visible screen
-//! text and OSC title/progress signals. The configurable TOML delivery
-//! mechanism is deliberately absent.
+//! Agent detection: hardcoded, priority-ordered rules per agent, gated
+//! by nested `all`/`any`/`not` combinators over `contains`/`regex`
+//! matchers, evaluated against a tab's visible screen text and OSC
+//! title/progress signals. The configurable TOML delivery mechanism is
+//! deliberately absent.
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -23,6 +23,13 @@ pub enum AgentState {
     Idle,
     Working,
     Blocked,
+}
+
+/// The agents lux can identify, each with its own rule set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgentKind {
+    Claude,
+    Codex,
 }
 
 /// The evidence a rule matches against: the tab's
@@ -118,7 +125,7 @@ fn regex(patterns: &[&str]) -> Gate {
 
 /// The hardcoded Claude Code rule set, evaluated against
 /// the current snapshot on every new PTY output.
-static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     vec![
         // Permission/confirmation prompts: Claude Code is waiting on the
         // user.
@@ -174,11 +181,53 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     ]
 });
 
-/// Evaluate every rule; the highest-priority match wins,
-/// ties favoring the earliest declared. No match at all means idle.
-pub fn evaluate(snapshot: &Snapshot) -> AgentState {
+/// The hardcoded Codex rule set. Codex signals state through its OSC
+/// window title — a braille spinner while working, "Action Required"
+/// when waiting on the user — with on-screen confirmation prompts
+/// covering waits the title hasn't caught up to. A title with none of
+/// those markers, or no matching evidence at all, falls through to the
+/// idle default in `evaluate`.
+static CODEX_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+    vec![
+        Rule {
+            state: AgentState::Blocked,
+            priority: 1100,
+            source: Source::OscTitle,
+            gate: contains(&["action required"]),
+        },
+        Rule {
+            state: AgentState::Working,
+            priority: 1050,
+            source: Source::OscTitle,
+            gate: regex(&["^[\u{2800}-\u{28FF}]"]),
+        },
+        Rule {
+            state: AgentState::Blocked,
+            priority: 900,
+            source: Source::Screen,
+            gate: Gate {
+                any: vec![
+                    contains(&["press enter to confirm"]),
+                    contains(&["enter to submit"]),
+                    contains(&["allow command?"]),
+                    contains(&["[y/n]"]),
+                ],
+                ..Default::default()
+            },
+        },
+    ]
+});
+
+/// Evaluate every rule in the agent's rule set; the highest-priority
+/// match wins, ties favoring the earliest declared. No match at all
+/// means idle.
+pub fn evaluate(kind: AgentKind, snapshot: &Snapshot) -> AgentState {
+    let rules = match kind {
+        AgentKind::Claude => &CLAUDE_RULES,
+        AgentKind::Codex => &CODEX_RULES,
+    };
     let mut best: Option<&Rule> = None;
-    for rule in RULES.iter() {
+    for rule in rules.iter() {
         let text = match rule.source {
             Source::Screen => &snapshot.screen,
             Source::OscTitle => &snapshot.title,
@@ -305,7 +354,7 @@ mod tests {
     #[test]
     fn no_evidence_is_idle() {
         assert_eq!(
-            evaluate(&snap("$ ls\nfoo bar\n", "bash", "none")),
+            evaluate(AgentKind::Claude, &snap("$ ls\nfoo bar\n", "bash", "none")),
             AgentState::Idle
         );
     }
@@ -313,26 +362,35 @@ mod tests {
     #[test]
     fn interrupt_hint_is_working() {
         let s = snap("✶ Herding… (esc to interrupt)\n", "", "none");
-        assert_eq!(evaluate(&s), AgentState::Working);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
     }
 
     #[test]
     fn spinner_title_is_working() {
-        assert_eq!(evaluate(&snap("", "⠹ claude", "none")), AgentState::Working);
-        assert_eq!(evaluate(&snap("", "claude", "none")), AgentState::Idle);
+        assert_eq!(
+            evaluate(AgentKind::Claude, &snap("", "⠹ claude", "none")),
+            AgentState::Working
+        );
+        assert_eq!(
+            evaluate(AgentKind::Claude, &snap("", "claude", "none")),
+            AgentState::Idle
+        );
     }
 
     #[test]
     fn progress_is_working() {
         assert_eq!(
-            evaluate(&snap("", "", "percentage:40")),
+            evaluate(AgentKind::Claude, &snap("", "", "percentage:40")),
             AgentState::Working
         );
         assert_eq!(
-            evaluate(&snap("", "", "indeterminate")),
+            evaluate(AgentKind::Claude, &snap("", "", "indeterminate")),
             AgentState::Working
         );
-        assert_eq!(evaluate(&snap("", "", "none")), AgentState::Idle);
+        assert_eq!(
+            evaluate(AgentKind::Claude, &snap("", "", "none")),
+            AgentState::Idle
+        );
     }
 
     #[test]
@@ -343,7 +401,7 @@ mod tests {
             "⠹ claude",
             "none",
         );
-        assert_eq!(evaluate(&s), AgentState::Blocked);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
     }
 
     #[test]
@@ -355,14 +413,64 @@ mod tests {
             "claude",
             "none",
         );
-        assert_eq!(evaluate(&s), AgentState::Blocked);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
         // The selector outranks leftover working evidence, like the
         // phrase rules do.
         let s = snap("Pick one\n❯ 1. Yes\n(esc to interrupt)\n", "", "none");
-        assert_eq!(evaluate(&s), AgentState::Blocked);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
         // A numbered list without the selector is ordinary output.
         let s = snap("1. serde\n2. nanoserde\n", "claude", "none");
-        assert_eq!(evaluate(&s), AgentState::Idle);
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn codex_spinner_title_is_working() {
+        let s = snap("", "⠋ Running command", "none");
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Working);
+    }
+
+    #[test]
+    fn codex_action_required_title_is_blocked() {
+        let s = snap("", "Action Required — approve command", "none");
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Blocked);
+        // Blocked outranks a spinner in the same title.
+        let s = snap("", "⠋ Action Required", "none");
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Blocked);
+    }
+
+    #[test]
+    fn codex_confirmation_prompt_is_blocked() {
+        for prompt in [
+            "Press Enter to confirm or Esc to cancel\n",
+            "Enter to submit answer\n",
+            "Allow command? \n",
+            "Continue? [y/n]\n",
+        ] {
+            let s = snap(prompt, "codex", "none");
+            assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Blocked);
+        }
+    }
+
+    #[test]
+    fn codex_plain_title_is_idle() {
+        // A title without the working or blocked markers, or no
+        // evidence at all, reads as idle.
+        let s = snap("$ codex\n", "codex — ~/src/lux", "none");
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Idle);
+        assert_eq!(
+            evaluate(AgentKind::Codex, &snap("", "", "none")),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn codex_rules_do_not_leak_into_claude() {
+        // Claude Code's evidence means nothing to a Codex tab, and
+        // Codex's blocked title means nothing to a Claude Code tab.
+        let s = snap("(esc to interrupt)\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Idle);
+        let s = snap("", "Action Required", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
     }
 
     #[test]
