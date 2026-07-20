@@ -67,6 +67,8 @@ pub enum ServerEvent {
     Ls(UnixStream),
     /// `kill-server` over a fresh connection.
     Kill(UnixStream),
+    /// `kill-session` over a fresh connection.
+    KillSession(UnixStream, String),
     /// The client relayed a SIGWINCH.
     Resized(ConnId),
     /// The control connection ended, for any reason.
@@ -229,6 +231,9 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
         }
         Request::Kill => {
             let _ = tx.send(ServerEvent::Kill(stream));
+        }
+        Request::KillSession(name) => {
+            let _ = tx.send(ServerEvent::KillSession(stream, name));
         }
         Request::New | Request::Session(_) | Request::Recent => {
             let mut fds = fds.into_iter();
@@ -424,6 +429,7 @@ impl Server {
             | ServerEvent::InputIdle(_) => self.mark_dirty(),
             ServerEvent::Ls(_)
             | ServerEvent::Kill(_)
+            | ServerEvent::KillSession(..)
             | ServerEvent::Resized(_)
             | ServerEvent::ConnGone(_)
             | ServerEvent::ProgramCopy(..) => {}
@@ -474,6 +480,20 @@ impl Server {
                 }
                 let _ = std::fs::remove_file(protocol::socket_path());
                 std::process::exit(0);
+            }
+            ServerEvent::KillSession(mut stream, name) => {
+                match self.session_by_name(&name) {
+                    Some(sid) => {
+                        self.end_session(sid);
+                        let _ = protocol::write_line(&mut stream, "ok");
+                    }
+                    None => {
+                        let _ = protocol::write_line(
+                            &mut stream,
+                            &format!("err no session named '{name}'"),
+                        );
+                    }
+                }
             }
             ServerEvent::Resized(conn) => {
                 // Read the real dimensions from the
@@ -753,6 +773,21 @@ impl Server {
             // So does the fuzzy tab finder.
             Effect::OpenFinder => self.open_finder(conn),
             Effect::NewSession(name) => self.new_session_for(conn, name),
+            Effect::RenameSession(name) => {
+                if let Some(session) = self.sessions.get_mut(&sid) {
+                    session.name = name;
+                    session.request_redraw();
+                }
+            }
+            Effect::KillSession(name) => {
+                let target = match name {
+                    Some(n) => self.session_by_name(&n),
+                    None => Some(sid),
+                };
+                if let Some(target_sid) = target {
+                    self.end_session(target_sid);
+                }
+            }
             // Native clipboard plus OSC 52 so the client's
             // terminal (or an outer multiplexer/SSH hop) mirrors it.
             Effect::Copy(text) => {

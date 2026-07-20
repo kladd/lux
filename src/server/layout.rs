@@ -248,7 +248,16 @@ pub fn boundary_at(node: &Node, area: Rect, pos: Position) -> Option<(Vec<Side>,
         let Node::Split(s) = node else { return None };
         let (first, second, sep) = split_areas(s.kind, s.ratio, area);
         let hit = match s.kind {
-            SplitKind::SideBySide => sep.contains(pos),
+            SplitKind::SideBySide => {
+                // Widen the hit zone by one cell on each side so the
+                // separator doesn't have to be clicked pixel-perfectly.
+                let hit_zone = Rect {
+                    x: sep.x.saturating_sub(1),
+                    width: (sep.width + 2).min(area.width),
+                    ..sep
+                };
+                hit_zone.contains(pos) && area.contains(pos)
+            }
             SplitKind::Stacked => second.height > 0 && pos.y == second.y && area.contains(pos),
         };
         if hit {

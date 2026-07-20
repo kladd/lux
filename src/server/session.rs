@@ -62,6 +62,10 @@ pub enum Effect {
     /// Create a session — named, or auto-named when `None` — and attach
     /// the driving client to it.
     NewSession(Option<String>),
+    /// Rename the current session.
+    RenameSession(String),
+    /// Kill a named session, or the current one if `None`.
+    KillSession(Option<String>),
     /// Yanked text for the system clipboard.
     Copy(String),
     /// Paste the system clipboard into this session.
@@ -1134,6 +1138,12 @@ impl Session {
                         Some(ExCommand::Write(path)) => self.write_tab_content(&path),
                         Some(ExCommand::NewSession(name)) => {
                             return Some(Effect::NewSession(name));
+                        }
+                        Some(ExCommand::RenameSession(name)) => {
+                            return Some(Effect::RenameSession(name));
+                        }
+                        Some(ExCommand::KillSession(name)) => {
+                            return Some(Effect::KillSession(name));
                         }
                         // Unrecognized text closes with no action.
                         None => {}
