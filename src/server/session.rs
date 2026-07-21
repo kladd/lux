@@ -158,6 +158,18 @@ fn wz_button(button: CtMouseButton) -> wezterm_term::MouseButton {
     }
 }
 
+/// A clickable window control in a tab bar's control group.
+#[derive(Clone, Copy)]
+enum Control {
+    Minimize,
+    Maximize,
+    Exit,
+}
+
+/// Width of the tab bar's control group: minimize, maximize/restore, and
+/// exit glyphs, each led by one space.
+const CONTROLS_WIDTH: u16 = 6;
+
 /// One tab's indicator in the bar: whether it's the active tab, its
 /// display name, plus its bracketed status text when the tab
 /// runs Claude Code.
@@ -182,6 +194,19 @@ struct Chrome {
     /// the bar's rule while the window is focused.
     rule_anim: Anim,
     rule_color: Color,
+    /// The six-cell control group at the bar's right edge; absent when
+    /// the bar is too narrow to hold it.
+    controls: Option<Rect>,
+    /// Whether the window is maximized; its maximize control renders as
+    /// a restore icon.
+    maximized: bool,
+}
+
+/// A minimized window's clickable title in the session status line.
+struct MinimizedTitle {
+    id: WindowId,
+    name: String,
+    span: std::ops::Range<u16>,
 }
 
 /// The session status line's neutral background — xterm-256
@@ -202,6 +227,9 @@ static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 struct StatusChrome {
     row: Rect,
     name: String,
+    /// Minimized windows' clickable titles, right of the session name,
+    /// in minimize order.
+    minimized: Vec<MinimizedTitle>,
     host: String,
     clock: String,
 }
@@ -297,6 +325,10 @@ pub struct Session {
     /// set. Purely a view state: the layout tree is untouched, focus
     /// leaving the window clears it, and it is never persisted.
     maximized: Option<WindowId>,
+    /// Minimized windows in minimize order: removed from the layout tree
+    /// with their processes still running, each shown as a clickable
+    /// title in the session status line.
+    minimized: Vec<WindowId>,
     /// The open bottom-row prompt (ex command line or tab rename), if
     /// any.
     prompt: Option<Prompt>,
@@ -336,6 +368,7 @@ impl Session {
             resize_repeat: None,
             move_repeat: None,
             maximized: None,
+            minimized: Vec::new(),
             prompt: None,
             keys,
             selection: None,
@@ -401,6 +434,7 @@ impl Session {
             resize_repeat: None,
             move_repeat: None,
             maximized: None,
+            minimized: Vec::new(),
             prompt: None,
             keys,
             selection: None,
@@ -804,6 +838,14 @@ impl Session {
         }
         match mouse.kind {
             CtMouseKind::Down(button) => {
+                // A left click on a minimized window's title in the
+                // status line restores it.
+                if button == CtMouseButton::Left
+                    && let Some(id) = self.minimized_title_at(pos)
+                {
+                    self.restore_window(id);
+                    return None;
+                }
                 // A left press on a draggable boundary — a separator
                 // column, or the tab bar row bordering the window above —
                 // starts a boundary drag. Boundaries are lux chrome, so
@@ -824,9 +866,17 @@ impl Session {
                     self.set_focus(id);
                     self.force_redraw = true;
                 }
+                // A left click on the bar's window controls minimizes,
+                // toggles maximize, or closes. The bar is lux chrome, so
+                // the click never reaches a mouse-grabbed program.
+                if button == CtMouseButton::Left
+                    && let Some(control) = self.control_at(id, pos)
+                {
+                    self.click_control(id, control);
+                    return None;
+                }
                 // A left click on a tab's indicator makes
-                // that tab active. The bar is lux chrome, so the click
-                // never reaches a mouse-grabbed program.
+                // that tab active.
                 if button == CtMouseButton::Left
                     && let Some(index) = self.tab_badge_at(id, pos)
                 {
@@ -956,7 +1006,9 @@ impl Session {
                         self.set_focus(id);
                         self.force_redraw = true;
                     }
-                    if let Some(index) = self.tab_badge_at(id, pos) {
+                    if let Some(control) = self.control_at(id, pos) {
+                        self.click_control(id, control);
+                    } else if let Some(index) = self.tab_badge_at(id, pos) {
                         self.select_tab(index);
                     }
                 }
@@ -993,7 +1045,8 @@ impl Session {
         }
         self.windows
             .values()
-            .find(|w| w.rect.contains(pos))
+            // A minimized window's stale rectangle never takes a click.
+            .find(|w| w.rect.contains(pos) && !self.minimized.contains(&w.id))
             .map(|w| w.id)
     }
 
@@ -1288,6 +1341,140 @@ impl Session {
         chrome.tabs.iter().position(|b| b.span.contains(&pos.x))
     }
 
+    /// The control under `pos` in window `id`'s tab bar, from the last
+    /// computed view's geometry. Each control's click target is its
+    /// glyph cell plus the space leading it.
+    fn control_at(&self, id: WindowId, pos: Position) -> Option<Control> {
+        let chrome = self.view.chrome.iter().find(|c| c.window == id)?;
+        let controls = chrome.controls?;
+        if !controls.contains(pos) {
+            return None;
+        }
+        Some(match (pos.x - controls.x) / 2 {
+            0 => Control::Minimize,
+            1 => Control::Maximize,
+            _ => Control::Exit,
+        })
+    }
+
+    /// The minimized window whose status-line title is under `pos`, from
+    /// the last computed view's geometry.
+    fn minimized_title_at(&self, pos: Position) -> Option<WindowId> {
+        let status = self.view.status.as_ref()?;
+        if pos.y != status.row.y {
+            return None;
+        }
+        status
+            .minimized
+            .iter()
+            .find(|t| t.span.contains(&pos.x))
+            .map(|t| t.id)
+    }
+
+    /// The minimized windows' status-line titles: each window's active
+    /// tab's display name, in minimize order, laid out after `x` with
+    /// the status line's two-space separation.
+    fn minimized_titles(&self, row: Rect, mut x: u16) -> Vec<MinimizedTitle> {
+        let mut titles = Vec::new();
+        for &id in &self.minimized {
+            let Some(win) = self.windows.get(&id) else {
+                continue;
+            };
+            let name = win.active_tab().name.clone();
+            let start = x.saturating_add(2).min(row.right());
+            let end = start
+                .saturating_add(name.chars().count() as u16)
+                .min(row.right());
+            x = end;
+            titles.push(MinimizedTitle {
+                id,
+                name,
+                span: start..end,
+            });
+        }
+        titles
+    }
+
+    /// Apply a clicked window control.
+    fn click_control(&mut self, id: WindowId, control: Control) {
+        match control {
+            Control::Minimize => self.minimize_window(id),
+            // Same toggle as prefix+z.
+            Control::Maximize => {
+                self.maximized = (self.maximized != Some(id)).then_some(id);
+                self.force_redraw = true;
+            }
+            // Same close as prefix+x, scoped to the clicked window; the
+            // exit events collapse it through the ordinary removal path.
+            Control::Exit => self.kill_window(id),
+        }
+    }
+
+    /// Remove window `id` from the layout tree, giving its space to its
+    /// sibling, with its tabs' processes left running; the window
+    /// reappears as a clickable title in the session status line. A lone
+    /// window has nowhere to give its space, so the click is discarded.
+    fn minimize_window(&mut self, id: WindowId) {
+        let ids = layout::leaves(&self.tree);
+        if ids.len() <= 1 || !ids.contains(&id) {
+            return;
+        }
+        // A minimized window can no longer fill the layout area.
+        if self.maximized == Some(id) {
+            self.maximized = None;
+        }
+        self.drop_selection_in(id);
+        if self.focus == id {
+            let pos = ids.iter().position(|i| *i == id).unwrap_or(0);
+            self.set_focus(ids[(pos + 1) % ids.len()]);
+        }
+        let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
+        if let Some(tree) = layout::remove_leaf(tree, id) {
+            self.tree = tree;
+        }
+        self.minimized.push(id);
+        self.force_redraw = true;
+    }
+
+    /// Reinsert minimized window `id` by splitting the focused window —
+    /// side by side if it is wider than it is tall, stacked otherwise —
+    /// and focusing the restored window. A restore that would violate
+    /// the minimum window size fails silently, leaving the window
+    /// minimized.
+    fn restore_window(&mut self, id: WindowId) {
+        let Some(pos) = self.minimized.iter().position(|m| *m == id) else {
+            return;
+        };
+        let Some(&(_, rect)) = self.layout_rects().iter().find(|(w, _)| *w == self.focus) else {
+            return;
+        };
+        let kind = if rect.width > rect.height {
+            SplitKind::SideBySide
+        } else {
+            SplitKind::Stacked
+        };
+        let (first, second, _) = layout::split_areas(kind, 0.5, rect);
+        for half in [first, second] {
+            if half.width < MIN_COLS || half.height < MIN_ROWS {
+                return;
+            }
+        }
+        self.minimized.remove(pos);
+        layout::split_leaf(&mut self.tree, self.focus, kind, id);
+        self.set_focus(id);
+        self.force_redraw = true;
+    }
+
+    /// Terminate every tab's child process in window `id`, with no
+    /// confirmation.
+    fn kill_window(&mut self, id: WindowId) {
+        if let Some(win) = self.windows.get_mut(&id) {
+            for tab in &mut win.tabs {
+                tab.kill();
+            }
+        }
+    }
+
     /// A selection describes cells of the window's currently visible tab;
     /// drop it when that content is replaced or the window goes away.
     fn drop_selection_in(&mut self, window: WindowId) {
@@ -1395,13 +1582,7 @@ impl Session {
     /// with no confirmation; the resulting exit events collapse the
     /// window through the ordinary removal path.
     fn close_window(&mut self) {
-        let win = self
-            .windows
-            .get_mut(&self.focus)
-            .expect("focused window exists");
-        for tab in &mut win.tabs {
-            tab.kill();
-        }
+        self.kill_window(self.focus);
     }
 
     /// Vim's "only" — terminate every other window's
@@ -1460,10 +1641,27 @@ impl Session {
             return Some(Effect::Ended);
         }
         self.drop_selection_in(win_id);
+        // A minimized window collapsing just drops its status-line
+        // title; the layout tree never held it.
+        if let Some(pos) = self.minimized.iter().position(|m| *m == win_id) {
+            self.minimized.remove(pos);
+            self.force_redraw = true;
+            return None;
+        }
+        let ids = layout::leaves(&self.tree);
+        // The last on-screen window collapsed while minimized windows
+        // keep running; the oldest minimized window takes the whole
+        // tree rather than the session ending under it.
+        if ids == [win_id] {
+            let restored = self.minimized.remove(0);
+            self.tree = Node::Leaf(restored);
+            self.set_focus(restored);
+            self.force_redraw = true;
+            return None;
+        }
         // Refocus before the leaf disappears from the tree; a maximized
         // window collapsing this way also exits the maximized state.
         if self.focus == win_id {
-            let ids = layout::leaves(&self.tree);
             let pos = ids.iter().position(|i| *i == win_id).unwrap_or(0);
             self.set_focus(ids[(pos + 1) % ids.len()]);
         }
@@ -1482,6 +1680,10 @@ impl Session {
             || self.clock != clock_now()
             || self.has_animation()
             || self.windows.values().any(|w| {
+                // A minimized window's output draws nothing.
+                if self.minimized.contains(&w.id) {
+                    return false;
+                }
                 let tab = w.active_tab();
                 tab.engine.current_seqno() != tab.drawn_seqno
             })
@@ -1492,11 +1694,12 @@ impl Session {
     /// animation advances without waiting on PTY output.
     pub fn has_animation(&self) -> bool {
         self.windows.values().any(|w| {
-            w.tabs.iter().any(|t| {
-                t.agent
-                    .as_ref()
-                    .is_some_and(|a| a.visual().anim != Anim::None)
-            })
+            !self.minimized.contains(&w.id)
+                && w.tabs.iter().any(|t| {
+                    t.agent
+                        .as_ref()
+                        .is_some_and(|a| a.visual().anim != Anim::None)
+                })
         })
     }
 
@@ -1562,10 +1765,16 @@ impl Session {
             }
             let active = win.active;
             let bar = win.tab_bar_rect();
+            // The right-edge control group, when the bar can hold it
+            // beyond the two-cell rule lead-in.
+            let controls = (bar.height > 0 && bar.width >= CONTROLS_WIDTH + 2)
+                .then(|| Rect::new(bar.right() - CONTROLS_WIDTH, bar.y, CONTROLS_WIDTH, 1));
+            let badges_end = controls.map_or(bar.right(), |c| c.x);
             // Badge spans track render_tab_bar's layout: the two-cell
             // rule lead-in, then per badge " i:name", the
-            // agent text when present, and the trailing separator space.
-            let mut next_x = bar.x.saturating_add(2).min(bar.right());
+            // agent text when present, and the trailing separator space,
+            // stopping short of the controls.
+            let mut next_x = bar.x.saturating_add(2).min(badges_end);
             let tabs: Vec<TabBadge> = win
                 .tabs
                 .iter()
@@ -1578,7 +1787,7 @@ impl Session {
                     }
                     width += 1;
                     let start = next_x;
-                    next_x = next_x.saturating_add(width).min(bar.right());
+                    next_x = next_x.saturating_add(width).min(badges_end);
                     TabBadge {
                         active: i == active,
                         name: tab.name.clone(),
@@ -1600,15 +1809,23 @@ impl Session {
                 scroll: win.active_tab().scroll_mode(),
                 rule_anim,
                 rule_color,
+                controls,
+                maximized: self.maximized == Some(id),
             });
         }
         self.clock = clock_now();
         let prompt = self.compute_prompt_chrome();
         // The reserved bottom row, unless a prompt owns it this frame.
         let status = (prompt.is_none() && self.area.height > 0 && self.area.width > 0).then(|| {
+            let row = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
+            let name_end = row
+                .x
+                .saturating_add(1 + self.name.chars().count() as u16)
+                .min(row.right());
             StatusChrome {
-                row: Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1),
+                row,
                 name: self.name.clone(),
+                minimized: self.minimized_titles(row, name_end),
                 host: HOSTNAME.clone(),
                 clock: self.clock.clone(),
             }
@@ -1688,9 +1905,10 @@ impl Session {
     fn render_to_buffer(&self, buf: &mut Buffer) {
         // Each window confined to its own rectangle;
         // the active tab's content below the tab bar. While a window is
-        // maximized, it is the only one drawn.
+        // maximized, it is the only one drawn; minimized windows have no
+        // rectangle at all.
         for win in self.windows.values() {
-            if self.maximized.is_some_and(|id| id != win.id) {
+            if self.maximized.is_some_and(|id| id != win.id) || self.minimized.contains(&win.id) {
                 continue;
             }
             render_tab(win.active_tab(), buf);
@@ -1795,9 +2013,12 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         return;
     }
     let focused = chrome.window == focus;
+    // Badges and the rule stop short of the control group's reserved
+    // width.
+    let badges_end = chrome.controls.map_or(bar.right(), |c| c.x);
     let mut x = bar.x;
     let mut put = |x: &mut u16, ch: char, style: Style| -> bool {
-        if *x >= bar.right() {
+        if *x >= badges_end {
             return false;
         }
         if let Some(dst) = buf.cell_mut(Position::new(*x, bar.y)) {
@@ -1831,58 +2052,61 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         };
         Style::default().fg(color)
     };
-    // Two cells of rule anchor the bar's left edge.
-    for _ in 0..2 {
-        let style = rule_at(x);
-        if !put(&mut x, '─', style) {
-            return;
-        }
-    }
-    for (i, badge) in chrome.tabs.iter().enumerate() {
-        // Active is bright, inactive dimmed, no
-        // background fill — neutral shades only, matching the
-        // brightness-only chrome convention.
-        let style = if badge.active {
-            // Focused+active inherits the terminal's default foreground
-            // instead of hardcoding white, so it respects the user's
-            // terminal theme.
-            let color = if focused { Color::Reset } else { Color::Gray };
-            Style::default().fg(color)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        // `<index>:<name>`, indexed from 0.
-        for ch in format!(" {}:{}", i, badge.name).chars() {
-            if !put(&mut x, ch, style) {
-                return;
+    // Badges stop where the bar runs out; the controls still draw.
+    'badges: {
+        // Two cells of rule anchor the bar's left edge.
+        for _ in 0..2 {
+            let style = rule_at(x);
+            if !put(&mut x, '─', style) {
+                break 'badges;
             }
         }
-        // The bracketed status text, in its
-        // state's color, only for tabs identified as running Claude Code;
-        // working shimmers and blocked breathes.
-        if let Some(visual) = &badge.agent {
-            if !put(&mut x, ' ', style) {
-                return;
-            }
-            let len = visual.text.chars().count();
-            for (j, ch) in visual.text.chars().enumerate() {
-                let color = match visual.anim {
-                    Anim::None => visual.color,
-                    Anim::Shimmer => anim::shimmer(visual.color, j, len, elapsed),
-                    Anim::Breathe => anim::breathe(visual.color, elapsed),
-                };
-                if !put(&mut x, ch, style.fg(color)) {
-                    return;
+        for (i, badge) in chrome.tabs.iter().enumerate() {
+            // Active is bright, inactive dimmed, no
+            // background fill — neutral shades only, matching the
+            // brightness-only chrome convention.
+            let style = if badge.active {
+                // Focused+active inherits the terminal's default foreground
+                // instead of hardcoding white, so it respects the user's
+                // terminal theme.
+                let color = if focused { Color::Reset } else { Color::Gray };
+                Style::default().fg(color)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            // `<index>:<name>`, indexed from 0.
+            for ch in format!(" {}:{}", i, badge.name).chars() {
+                if !put(&mut x, ch, style) {
+                    break 'badges;
                 }
             }
-        }
-        if !put(&mut x, ' ', style) {
-            return;
+            // The bracketed status text, in its
+            // state's color, only for tabs identified as running Claude Code;
+            // working shimmers and blocked breathes.
+            if let Some(visual) = &badge.agent {
+                if !put(&mut x, ' ', style) {
+                    break 'badges;
+                }
+                let len = visual.text.chars().count();
+                for (j, ch) in visual.text.chars().enumerate() {
+                    let color = match visual.anim {
+                        Anim::None => visual.color,
+                        Anim::Shimmer => anim::shimmer(visual.color, j, len, elapsed),
+                        Anim::Breathe => anim::breathe(visual.color, elapsed),
+                    };
+                    if !put(&mut x, ch, style.fg(color)) {
+                        break 'badges;
+                    }
+                }
+            }
+            if !put(&mut x, ' ', style) {
+                break 'badges;
+            }
         }
     }
-    // The unused width, same thin rule.
+    // The unused width up to the controls, same thin rule.
     let indicators_end = x;
-    while x < bar.right() {
+    while x < badges_end {
         if let Some(dst) = buf.cell_mut(Position::new(x, bar.y)) {
             dst.set_symbol("─");
             dst.set_style(rule_at(x));
@@ -1890,20 +2114,39 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         x += 1;
     }
     // Mark a scrolled tab so a frozen view isn't mistaken
-    // for the live tail. Drawn over the rule, right-aligned.
+    // for the live tail. Drawn over the rule, right-aligned against the
+    // controls.
     if chrome.scroll {
         let label = " scroll ";
         let len = label.len() as u16;
-        if bar.width >= len && bar.right() - len >= indicators_end {
+        if badges_end >= bar.x + len && badges_end - len >= indicators_end {
             let style = Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::REVERSED);
-            let start = bar.right() - len;
+            let start = badges_end - len;
             for (i, ch) in label.chars().enumerate() {
                 if let Some(dst) = buf.cell_mut(Position::new(start + i as u16, bar.y)) {
                     dst.set_char(ch);
                     dst.set_style(style);
                 }
+            }
+        }
+    }
+    // The control group: minimize, maximize/restore, exit, in standard
+    // Unicode glyphs any monospace font covers, brightness following
+    // window focus like the rest of the bar.
+    if let Some(controls) = chrome.controls {
+        let style = Style::default().fg(if focused {
+            Color::Reset
+        } else {
+            Color::DarkGray
+        });
+        let toggle = if chrome.maximized { '❐' } else { '□' };
+        let glyphs = [' ', '−', ' ', toggle, ' ', '×'];
+        for (i, ch) in glyphs.into_iter().enumerate() {
+            if let Some(dst) = buf.cell_mut(Position::new(controls.x + i as u16, controls.y)) {
+                dst.set_char(ch);
+                dst.set_style(style);
             }
         }
     }
@@ -1974,6 +2217,20 @@ fn render_status(status: &StatusChrome, buf: &mut Buffer) {
         if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
             dst.set_char(ch);
             dst.set_style(name_style);
+        }
+    }
+    // Minimized windows' titles, clickable to restore.
+    let title_style = fill.fg(Color::Gray);
+    for title in &status.minimized {
+        for (i, ch) in title.name.chars().enumerate() {
+            let x = title.span.start + i as u16;
+            if x >= title.span.end {
+                break;
+            }
+            if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
+                dst.set_char(ch);
+                dst.set_style(title_style);
+            }
         }
     }
     // Hostname two spaces left of the clock.

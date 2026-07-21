@@ -1,5 +1,14 @@
 # News
 
+## 2026-07-21
+
+- Each window's tab bar now carries clickable minimize (`−`),
+  maximize/restore (`□`/`❐`), and exit (`×`) controls at its right edge:
+  minimize parks the window (processes still running) as a clickable
+  title in the session status line that restores it by splitting the
+  focused window, maximize toggles the zoom `prefix+z` provides, and
+  exit closes the window like `prefix+x`.
+
 ## 2026-07-19
 
 - The focused window's tab bar rule now animates in its active tab's
