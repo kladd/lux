@@ -159,7 +159,7 @@ fn wz_button(button: CtMouseButton) -> wezterm_term::MouseButton {
 }
 
 /// A clickable window control in a tab bar's control group.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Control {
     Minimize,
     Maximize,
@@ -200,6 +200,9 @@ struct Chrome {
     /// Whether the window is maximized; its maximize control renders as
     /// a restore icon.
     maximized: bool,
+    /// The control the mouse hovers over, rendered bright as a hover
+    /// cue.
+    hover: Option<Control>,
 }
 
 /// A minimized window's clickable title in the session status line.
@@ -329,6 +332,9 @@ pub struct Session {
     /// with their processes still running, each shown as a clickable
     /// title in the session status line.
     minimized: Vec<WindowId>,
+    /// The window control under the mouse with no button held; the
+    /// hovered control renders bright.
+    hover: Option<(WindowId, Control)>,
     /// The open bottom-row prompt (ex command line or tab rename), if
     /// any.
     prompt: Option<Prompt>,
@@ -369,6 +375,7 @@ impl Session {
             move_repeat: None,
             maximized: None,
             minimized: Vec::new(),
+            hover: None,
             prompt: None,
             keys,
             selection: None,
@@ -435,6 +442,7 @@ impl Session {
             move_repeat: None,
             maximized: None,
             minimized: Vec::new(),
+            hover: None,
             prompt: None,
             keys,
             selection: None,
@@ -940,8 +948,18 @@ impl Session {
                         forward_mouse(tab, &mouse, content);
                     }
                 }
-                // Hovering a draggable boundary shows a resize pointer.
+                // Hovering a window control brightens it; moving off
+                // restores its resting shade.
                 if mouse.kind == CtMouseKind::Moved {
+                    let hover = self
+                        .window_at(pos)
+                        .and_then(|id| self.control_at(id, pos).map(|c| (id, c)));
+                    if hover != self.hover {
+                        self.hover = hover;
+                        self.force_redraw = true;
+                    }
+                    // Hovering a control shows a hand pointer, a
+                    // draggable boundary a resize pointer.
                     return Some(Effect::Pointer(self.pointer_shape(pos)));
                 }
             }
@@ -1018,11 +1036,20 @@ impl Session {
         None
     }
 
-    /// The mouse pointer shape for `pos`: a resize shape over a draggable
-    /// boundary, matching the axis the boundary moves on, and the default
-    /// anywhere else. Shapes are OSC 22 names; terminals without
-    /// pointer-shape support ignore the sequence.
+    /// The mouse pointer shape for `pos`: a hand pointer over a window
+    /// control, a resize shape over a draggable boundary, matching the
+    /// axis the boundary moves on, and the default anywhere else. Shapes
+    /// are OSC 22 names; terminals without pointer-shape support ignore
+    /// the sequence.
     fn pointer_shape(&self, pos: Position) -> &'static str {
+        // The control wins where a tab bar doubles as a drag boundary;
+        // it stays clickable there via the motionless-release path.
+        if self
+            .window_at(pos)
+            .is_some_and(|id| self.control_at(id, pos).is_some())
+        {
+            return "pointer";
+        }
         if self.maximized.is_some() {
             return "default";
         }
@@ -1811,6 +1838,9 @@ impl Session {
                 rule_color,
                 controls,
                 maximized: self.maximized == Some(id),
+                hover: self
+                    .hover
+                    .and_then(|(win, control)| (win == id).then_some(control)),
             });
         }
         self.clock = clock_now();
@@ -2136,17 +2166,31 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
     // Unicode glyphs any monospace font covers, brightness following
     // window focus like the rest of the bar.
     if let Some(controls) = chrome.controls {
-        let style = Style::default().fg(if focused {
-            Color::Reset
+        // A hovered control brightens one step above its resting shade,
+        // per the bar's bright/dim convention.
+        let (rest, bright) = if focused {
+            (Color::Reset, Color::White)
         } else {
-            Color::DarkGray
-        });
+            (Color::DarkGray, Color::Gray)
+        };
         let toggle = if chrome.maximized { '❐' } else { '□' };
-        let glyphs = [' ', '−', ' ', toggle, ' ', '×'];
-        for (i, ch) in glyphs.into_iter().enumerate() {
+        let glyphs = [
+            (' ', Control::Minimize),
+            ('−', Control::Minimize),
+            (' ', Control::Maximize),
+            (toggle, Control::Maximize),
+            (' ', Control::Exit),
+            ('×', Control::Exit),
+        ];
+        for (i, (ch, control)) in glyphs.into_iter().enumerate() {
+            let color = if chrome.hover == Some(control) {
+                bright
+            } else {
+                rest
+            };
             if let Some(dst) = buf.cell_mut(Position::new(controls.x + i as u16, controls.y)) {
                 dst.set_char(ch);
-                dst.set_style(style);
+                dst.set_style(Style::default().fg(color));
             }
         }
     }

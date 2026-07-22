@@ -7,7 +7,9 @@
   minimize parks the window (processes still running) as a clickable
   title in the session status line that restores it by splitting the
   focused window, maximize toggles the zoom `prefix+z` provides, and
-  exit closes the window like `prefix+x`.
+  exit closes the window like `prefix+x`; hovering a control brightens
+  it and shows a hand pointer (in terminals that support pointer
+  shapes).
 
 ## 2026-07-19
 

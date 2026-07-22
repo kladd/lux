@@ -56,9 +56,7 @@ impl Request {
         let line = line.strip_suffix('\n').unwrap_or(line);
         Some(match line.split_once(' ') {
             Some(("session", name)) if !name.is_empty() => Request::Session(name.into()),
-            Some(("kill-session", name)) if !name.is_empty() => {
-                Request::KillSession(name.into())
-            }
+            Some(("kill-session", name)) if !name.is_empty() => Request::KillSession(name.into()),
             None => match line {
                 "new" => Request::New,
                 "recent" => Request::Recent,

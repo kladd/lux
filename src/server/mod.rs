@@ -481,20 +481,18 @@ impl Server {
                 let _ = std::fs::remove_file(protocol::socket_path());
                 std::process::exit(0);
             }
-            ServerEvent::KillSession(mut stream, name) => {
-                match self.session_by_name(&name) {
-                    Some(sid) => {
-                        self.end_session(sid);
-                        let _ = protocol::write_line(&mut stream, "ok");
-                    }
-                    None => {
-                        let _ = protocol::write_line(
-                            &mut stream,
-                            &format!("err no session named '{name}'"),
-                        );
-                    }
+            ServerEvent::KillSession(mut stream, name) => match self.session_by_name(&name) {
+                Some(sid) => {
+                    self.end_session(sid);
+                    let _ = protocol::write_line(&mut stream, "ok");
                 }
-            }
+                None => {
+                    let _ = protocol::write_line(
+                        &mut stream,
+                        &format!("err no session named '{name}'"),
+                    );
+                }
+            },
             ServerEvent::Resized(conn) => {
                 // Read the real dimensions from the
                 // client's descriptor and resize the attached session.

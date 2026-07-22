@@ -134,8 +134,11 @@ pub fn kill_session(name: &str) -> i32 {
     let Some(mut stream) = connect_existing() else {
         return 1;
     };
-    if protocol::write_line(&mut stream, Request::KillSession(name.into()).encode().trim_end())
-        .is_err()
+    if protocol::write_line(
+        &mut stream,
+        Request::KillSession(name.into()).encode().trim_end(),
+    )
+    .is_err()
     {
         eprintln!("lux: server connection failed");
         return 1;

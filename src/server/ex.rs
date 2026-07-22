@@ -4,7 +4,15 @@
 
 use std::path::PathBuf;
 
-pub const COMMANDS: &[&str] = &["kill-session", "new", "new-session", "rename-session", "sp", "vs", "w"];
+pub const COMMANDS: &[&str] = &[
+    "kill-session",
+    "new",
+    "new-session",
+    "rename-session",
+    "sp",
+    "vs",
+    "w",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExCommand {
@@ -116,7 +124,15 @@ mod tests {
     fn suggestions_narrow_with_the_text() {
         assert_eq!(
             suggestions(""),
-            vec!["kill-session", "new", "new-session", "rename-session", "sp", "vs", "w"]
+            vec![
+                "kill-session",
+                "new",
+                "new-session",
+                "rename-session",
+                "sp",
+                "vs",
+                "w"
+            ]
         );
         assert_eq!(suggestions("v"), vec!["vs"]);
         assert_eq!(suggestions("new"), vec!["new", "new-session"]);
