@@ -317,6 +317,17 @@ impl Tracker {
         self.seen = true;
     }
 
+    /// Whether the tab is in the done (idle-but-unseen) or blocked
+    /// state — the two states worth surfacing to a user who isn't
+    /// looking at the tab.
+    pub fn needs_attention(&self) -> bool {
+        match self.displayed {
+            AgentState::Blocked => true,
+            AgentState::Idle => !self.seen,
+            AgentState::Working => false,
+        }
+    }
+
     /// Bracketed status text and color per visual
     /// state — done is idle-but-unseen, idle is idle-and-seen. Working
     /// shimmers and blocked breathes; idle and done stay
@@ -525,6 +536,24 @@ mod tests {
         assert_eq!(t.visual().text, "[done]");
         t.mark_seen();
         assert_eq!(t.visual().text, "[idle]");
+    }
+
+    #[test]
+    fn attention_covers_done_and_blocked_only() {
+        let mut t = Tracker::default();
+        let t0 = Instant::now();
+        assert!(!t.needs_attention());
+        t.observe(AgentState::Working, t0);
+        assert!(!t.needs_attention());
+        t.observe(AgentState::Blocked, t0);
+        assert!(t.needs_attention());
+        // Blocked settling into idle lands as done (unseen)...
+        t.observe(AgentState::Idle, t0);
+        t.observe(AgentState::Idle, t0 + IDLE_DEBOUNCE);
+        assert!(t.needs_attention());
+        // ...until the user sees it.
+        t.mark_seen();
+        assert!(!t.needs_attention());
     }
 
     #[test]

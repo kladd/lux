@@ -26,7 +26,6 @@ use termwiz::input::{KeyCode, Modifiers as KeyModifiers};
 use termwiz::surface::CursorVisibility;
 use tui_textarea::TextArea;
 
-use crate::server::ServerEvent;
 use crate::server::agent;
 use crate::server::anim::{self, Anim};
 use crate::server::ex::{self, ExCommand};
@@ -35,6 +34,7 @@ use crate::server::layout::{self, Dir, Node, Separator, Side, SplitKind, WindowI
 use crate::server::persist;
 use crate::server::term::FdBackend;
 use crate::server::window::{Notice, Tab, TabId, Window};
+use crate::server::{ServerEvent, SessionId};
 
 /// Minimum window size a split may produce.
 const MIN_COLS: u16 = 10;
@@ -72,6 +72,9 @@ pub enum Effect {
     Paste,
     /// Set the client terminal's mouse pointer shape (an OSC 22 name).
     Pointer(&'static str),
+    /// Land on the pending-Claude indicator's tab, which may live in
+    /// another session.
+    GotoIndicator(Indicator),
     /// The last window's last tab exited.
     Ended,
 }
@@ -225,6 +228,19 @@ static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .into_owned()
 });
 
+/// The standing status-line indicator for a Claude Code tab, anywhere on
+/// the server, that finished or got blocked while the user wasn't looking
+/// at it: the tab it points to and the display text (the tab's name plus
+/// its bracketed status). Computed by the server, since the tab may live
+/// in another session.
+#[derive(Clone, PartialEq)]
+pub struct Indicator {
+    pub session: SessionId,
+    pub window: WindowId,
+    pub tab: usize,
+    pub text: String,
+}
+
 /// Per-frame session status line chrome, absent
 /// while the command line owns the bottom row.
 struct StatusChrome {
@@ -235,6 +251,10 @@ struct StatusChrome {
     minimized: Vec<MinimizedTitle>,
     host: String,
     clock: String,
+    /// The pending-Claude indicator's text and clickable span, shown in
+    /// place of the hostname; absent when nothing qualifies or the row
+    /// is too narrow to hold it with the clock.
+    indicator: Option<(String, std::ops::Range<u16>)>,
 }
 
 /// What an open bottom-row prompt collects; both kinds share the same
@@ -344,6 +364,9 @@ pub struct Session {
     selection: Option<Selection>,
     /// The boundary drag in progress, if any.
     border_drag: Option<BorderDrag>,
+    /// The pending-Claude indicator to show in the status line's
+    /// hostname block, set by the server each render pass.
+    indicator: Option<Indicator>,
     view: View,
     area: Rect,
     /// The clock text as of the last computed view.
@@ -380,6 +403,7 @@ impl Session {
             keys,
             selection: None,
             border_drag: None,
+            indicator: None,
             view: View::default(),
             area,
             clock: String::new(),
@@ -447,6 +471,7 @@ impl Session {
             keys,
             selection: None,
             border_drag: None,
+            indicator: None,
             view: View::default(),
             area,
             clock: String::new(),
@@ -647,6 +672,43 @@ impl Session {
         out
     }
 
+    /// The Claude Code tabs whose agent is in the done or blocked
+    /// state — on-screen windows in layout order, then minimized windows
+    /// in minimize order — each as its window id and position in that
+    /// window's tab list.
+    pub fn attention_tabs(&self) -> Vec<(WindowId, usize)> {
+        let mut ids = layout::leaves(&self.tree);
+        ids.extend(self.minimized.iter().copied());
+        let mut out = Vec::new();
+        for id in ids {
+            let Some(win) = self.windows.get(&id) else {
+                continue;
+            };
+            for (i, tab) in win.tabs.iter().enumerate() {
+                if tab.agent.as_ref().is_some_and(|t| t.needs_attention()) {
+                    out.push((id, i));
+                }
+            }
+        }
+        out
+    }
+
+    /// The focused window and its active tab's position — what the
+    /// attached client is looking at.
+    pub fn focused_active(&self) -> (WindowId, usize) {
+        let active = self.windows.get(&self.focus).map_or(0, |w| w.active);
+        (self.focus, active)
+    }
+
+    /// Set the pending-Claude indicator the status line shows; a change
+    /// forces a redraw.
+    pub fn set_indicator(&mut self, indicator: Option<Indicator>) {
+        if self.indicator != indicator {
+            self.indicator = indicator;
+            self.force_redraw = true;
+        }
+    }
+
     /// Every tab in window layout order then tab order, each as its
     /// window id and position in that window's tab list.
     pub fn all_tabs(&self) -> Vec<(WindowId, usize)> {
@@ -694,6 +756,25 @@ impl Session {
         {
             let _ = tab.engine.send_paste(text);
         }
+    }
+
+    /// Land on `window`'s tab at `index`: a minimized window is
+    /// restored, focused, and maximized — in that order, so focusing
+    /// doesn't immediately un-maximize — landing the user on the tab
+    /// full-screen; any other window is simply focused with the tab made
+    /// active. A restore that fails (minimum window size) leaves the
+    /// window minimized and changes nothing else.
+    pub fn goto_tab(&mut self, window: WindowId, index: usize) {
+        if self.minimized.contains(&window) {
+            self.restore_window(window);
+            if self.minimized.contains(&window) {
+                return;
+            }
+            self.focus_tab(window, index);
+            self.maximized = Some(window);
+            return;
+        }
+        self.focus_tab(window, index);
     }
 
     /// Focus `window` and make its tab at `index` active.
@@ -853,6 +934,14 @@ impl Session {
                 {
                     self.restore_window(id);
                     return None;
+                }
+                // A left click on the pending-Claude indicator lands on
+                // its tab; the server resolves it, since the tab may
+                // live in another session.
+                if button == CtMouseButton::Left
+                    && let Some(indicator) = self.indicator_at(pos)
+                {
+                    return Some(Effect::GotoIndicator(indicator));
                 }
                 // A left press on a draggable boundary — a separator
                 // column, or the tab bar row bordering the window above —
@@ -1398,6 +1487,17 @@ impl Session {
             .map(|t| t.id)
     }
 
+    /// The pending-Claude indicator, when its status-line span is under
+    /// `pos`, from the last computed view's geometry.
+    fn indicator_at(&self, pos: Position) -> Option<Indicator> {
+        let status = self.view.status.as_ref()?;
+        let (_, span) = status.indicator.as_ref()?;
+        if pos.y != status.row.y || !span.contains(&pos.x) {
+            return None;
+        }
+        self.indicator.clone()
+    }
+
     /// The minimized windows' status-line titles: each window's active
     /// tab's display name, in minimize order, laid out after `x` with
     /// the status line's two-space separation.
@@ -1716,18 +1816,20 @@ impl Session {
             })
     }
 
-    /// Any badge in a tab bar currently animated? While
-    /// one is on screen, the server redraws on its timer tick so the
+    /// Any badge in a tab bar currently animated — or the status line's
+    /// pending-Claude indicator, which always shimmers? While one is on
+    /// screen, the server redraws on its timer tick so the
     /// animation advances without waiting on PTY output.
     pub fn has_animation(&self) -> bool {
-        self.windows.values().any(|w| {
-            !self.minimized.contains(&w.id)
-                && w.tabs.iter().any(|t| {
-                    t.agent
-                        .as_ref()
-                        .is_some_and(|a| a.visual().anim != Anim::None)
-                })
-        })
+        self.indicator.is_some()
+            || self.windows.values().any(|w| {
+                !self.minimized.contains(&w.id)
+                    && w.tabs.iter().any(|t| {
+                        t.agent
+                            .as_ref()
+                            .is_some_and(|a| a.visual().anim != Anim::None)
+                    })
+            })
     }
 
     /// One frame to an attached client's terminal: compute geometry into
@@ -1852,12 +1954,24 @@ impl Session {
                 .x
                 .saturating_add(1 + self.name.chars().count() as u16)
                 .min(row.right());
+            // The pending-Claude indicator takes the hostname's place
+            // when it fits alongside the clock; too narrow a row falls
+            // back to the hostname block as usual.
+            let indicator = self.indicator.as_ref().and_then(|ind| {
+                let ind_len = ind.text.chars().count() as u16;
+                let len = ind_len + 2 + self.clock.chars().count() as u16 + 1;
+                (row.width >= len).then(|| {
+                    let start = row.right() - len;
+                    (ind.text.clone(), start..start + ind_len)
+                })
+            });
             StatusChrome {
                 row,
                 name: self.name.clone(),
                 minimized: self.minimized_titles(row, name_end),
                 host: HOSTNAME.clone(),
                 clock: self.clock.clone(),
+                indicator,
             }
         });
         self.view = View {
@@ -1962,7 +2076,7 @@ impl Session {
         // The session status line on the reserved bottom
         // row; absent while a prompt renders there instead.
         if let Some(status) = &self.view.status {
-            render_status(status, buf);
+            render_status(status, self.view.elapsed, buf);
         }
         if let Some(chrome) = &self.view.prompt {
             render_prompt_chrome(chrome, buf);
@@ -2240,7 +2354,7 @@ fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
 
 /// Draw the session status line: name left, clock right,
 /// on the neutral chrome background.
-fn render_status(status: &StatusChrome, buf: &mut Buffer) {
+fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
     let row = status.row;
     if row.height == 0 || row.width == 0 {
         return;
@@ -2277,16 +2391,25 @@ fn render_status(status: &StatusChrome, buf: &mut Buffer) {
             }
         }
     }
-    // Hostname two spaces left of the clock.
+    // Hostname two spaces left of the clock — or, in its place, the
+    // pending-Claude indicator, shimmering in the same neutral
+    // foreground.
     let clock_style = fill.fg(Color::Gray);
-    let text = format!("{}  {} ", status.host, status.clock);
+    let (text, ind_len) = match &status.indicator {
+        Some((ind, _)) => (format!("{}  {} ", ind, status.clock), ind.chars().count()),
+        None => (format!("{}  {} ", status.host, status.clock), 0),
+    };
     let len = text.chars().count() as u16;
     if row.width >= len {
         let start = row.right() - len;
         for (i, ch) in text.chars().enumerate() {
             if let Some(dst) = buf.cell_mut(Position::new(start + i as u16, row.y)) {
                 dst.set_char(ch);
-                dst.set_style(clock_style);
+                dst.set_style(if i < ind_len {
+                    clock_style.fg(anim::shimmer(Color::Gray, i, ind_len, elapsed))
+                } else {
+                    clock_style
+                });
             }
         }
     }

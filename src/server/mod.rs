@@ -815,6 +815,12 @@ impl Server {
                     let _ = write!(client.raw_out, "\x1b]22;{shape}\x1b\\");
                 }
             }
+            // The indicator's tab may be in another session; landing on
+            // it reuses the finder/grid attach path, restoring and
+            // maximizing its window if minimized.
+            Effect::GotoIndicator(ind) => {
+                self.attach_to_tab(conn, ind.session, ind.window, ind.tab);
+            }
             Effect::Ended => self.end_session(sid),
         }
     }
@@ -1002,8 +1008,10 @@ impl Server {
         }
         self.note_attached(sid);
         if let Some(session) = self.sessions.get_mut(&sid) {
-            session.focus_tab(window, index);
+            // Area first: a minimized window's restore checks minimum
+            // sizes against the session's layout area.
             session.set_area(Rect::new(0, 0, size.width, size.height));
+            session.goto_tab(window, index);
             session.request_redraw();
         }
     }
@@ -1246,10 +1254,64 @@ impl Server {
         }
     }
 
+    /// The pending-Claude indicator for a client attached to `attached`:
+    /// the first done-or-blocked Claude Code tab across every session,
+    /// ordered by session name then window and tab position (the
+    /// CLAUDECOM grid's order), skipping the tab the client is already
+    /// looking at — its attached session's focused window's active tab,
+    /// whose status is visible in its own tab bar.
+    fn pending_indicator(&self, attached: SessionId) -> Option<session::Indicator> {
+        let looking_at = self.sessions.get(&attached).map(Session::focused_active);
+        let mut by_name: Vec<(&str, SessionId)> = self
+            .sessions
+            .iter()
+            .map(|(&sid, s)| (s.name.as_str(), sid))
+            .collect();
+        by_name.sort();
+        for (_, sid) in by_name {
+            let session = &self.sessions[&sid];
+            for (window, index) in session.attention_tabs() {
+                if sid == attached && looking_at == Some((window, index)) {
+                    continue;
+                }
+                let Some(tab) = session.tab_at(window, index) else {
+                    continue;
+                };
+                let Some(visual) = tab.agent.as_ref().map(|t| t.visual()) else {
+                    continue;
+                };
+                return Some(session::Indicator {
+                    session: sid,
+                    window,
+                    tab: index,
+                    text: format!("{} {}", tab.name, visual.text),
+                });
+            }
+        }
+        None
+    }
+
     /// Draw every attached client that needs it: switcher and grid frames
     /// render each pass (their content is live); attached
     /// sessions render when their state advanced.
     fn render_all(&mut self) {
+        // The pending-Claude indicator is cross-session state, so it is
+        // computed here — per client viewing its attached session — and
+        // handed to that session to render; every other session's
+        // indicator is cleared.
+        let indicators: Vec<(SessionId, session::Indicator)> = self
+            .clients
+            .values()
+            .filter(|c| c.finder.is_none() && c.grid.is_none() && c.switcher.is_none())
+            .filter_map(|c| Some((c.attached, self.pending_indicator(c.attached)?)))
+            .collect();
+        for (&sid, session) in self.sessions.iter_mut() {
+            let indicator = indicators
+                .iter()
+                .find(|(s, _)| *s == sid)
+                .map(|(_, ind)| ind.clone());
+            session.set_indicator(indicator);
+        }
         let Server {
             sessions, clients, ..
         } = self;

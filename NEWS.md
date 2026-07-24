@@ -1,5 +1,13 @@
 # News
 
+## 2026-07-23
+
+- The session status line now shows a shimmering indicator in place of
+  the hostname whenever a Claude Code tab the user isn't looking at is
+  done or blocked — the first such tab in CLAUDECOM order — and clicking
+  it jumps straight to that tab, restoring and maximizing its window if
+  it had been minimized.
+
 ## 2026-07-21
 
 - Each window's tab bar now carries clickable minimize (`−`),
