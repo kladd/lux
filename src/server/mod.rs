@@ -335,7 +335,7 @@ impl Server {
         }
     }
 
-    /// Raise a desktop notification for a Claude Code tab that reached
+    /// Raise a desktop notification for an agent tab that reached
     /// done or blocked: forward it as a plain OSC 9 escape to every
     /// attached client's terminal — whichever terminal the user is
     /// looking at displays it, even for a background session. With no
@@ -698,9 +698,9 @@ impl Server {
 
     /// How many pinned entries precede the sessions in the switcher's
     /// list: the CLAUDECOM entry while any tab anywhere is
-    /// identified as running Claude Code.
+    /// identified as running a detected agent.
     fn pinned_entries(&self) -> usize {
-        self.sessions.values().any(Session::has_claude_tab) as usize
+        self.sessions.values().any(Session::has_agent_tab) as usize
     }
 
     fn client_input(&mut self, conn: ConnId, bytes: Vec<u8>) {
@@ -1094,7 +1094,7 @@ impl Server {
         };
         let items = grid::items(&self.sessions);
         // A captured tab owns the input. The tab can leave the grid (its
-        // process exited or stopped being Claude Code); capture ends
+        // process exited or stopped being a detected agent); capture ends
         // with it and the event falls through to grid navigation.
         if let Some(id) = state.capture {
             let target = items.iter().copied().find(|item| {
@@ -1254,8 +1254,8 @@ impl Server {
         }
     }
 
-    /// The pending-Claude indicator for a client attached to `attached`:
-    /// the first done-or-blocked Claude Code tab across every session,
+    /// The pending-agent indicator for a client attached to `attached`:
+    /// the first done-or-blocked agent tab across every session,
     /// ordered by session name then window and tab position (the
     /// CLAUDECOM grid's order), skipping the tab the client is already
     /// looking at — its attached session's focused window's active tab,
@@ -1295,7 +1295,7 @@ impl Server {
     /// render each pass (their content is live); attached
     /// sessions render when their state advanced.
     fn render_all(&mut self) {
-        // The pending-Claude indicator is cross-session state, so it is
+        // The pending-agent indicator is cross-session state, so it is
         // computed here — per client viewing its attached session — and
         // handed to that session to render; every other session's
         // indicator is cleared.
@@ -1373,14 +1373,14 @@ fn render_grid(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>)
 }
 
 /// The switcher frame: session list on the left — the pinned CLAUDECOM
-/// entry first while any Claude Code tab exists — and a live
+/// entry first while any agent tab exists — and a live
 /// preview of the highlighted entry on the right.
 fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
     highlight: usize,
 ) {
-    let pinned = sessions.values().any(Session::has_claude_tab) as usize;
+    let pinned = sessions.values().any(Session::has_agent_tab) as usize;
     let mut names: Vec<String> = Vec::with_capacity(pinned + sessions.len());
     if pinned > 0 {
         names.push(grid::ENTRY_NAME.to_string());

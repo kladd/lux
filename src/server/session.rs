@@ -72,7 +72,7 @@ pub enum Effect {
     Paste,
     /// Set the client terminal's mouse pointer shape (an OSC 22 name).
     Pointer(&'static str),
-    /// Land on the pending-Claude indicator's tab, which may live in
+    /// Land on the pending-agent indicator's tab, which may live in
     /// another session.
     GotoIndicator(Indicator),
     /// The last window's last tab exited.
@@ -175,7 +175,7 @@ const CONTROLS_WIDTH: u16 = 6;
 
 /// One tab's indicator in the bar: whether it's the active tab, its
 /// display name, plus its bracketed status text when the tab
-/// runs Claude Code.
+/// runs a detected agent.
 struct TabBadge {
     active: bool,
     name: String,
@@ -228,7 +228,7 @@ static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .into_owned()
 });
 
-/// The standing status-line indicator for a Claude Code tab, anywhere on
+/// The standing status-line indicator for an agent tab, anywhere on
 /// the server, that finished or got blocked while the user wasn't looking
 /// at it: the tab it points to and the display text (the tab's name plus
 /// its bracketed status). Computed by the server, since the tab may live
@@ -251,7 +251,7 @@ struct StatusChrome {
     minimized: Vec<MinimizedTitle>,
     host: String,
     clock: String,
-    /// The pending-Claude indicator's text and clickable span, shown in
+    /// The pending-agent indicator's text and clickable span, shown in
     /// place of the hostname; absent when nothing qualifies or the row
     /// is too narrow to hold it with the clock.
     indicator: Option<(String, std::ops::Range<u16>)>,
@@ -364,7 +364,7 @@ pub struct Session {
     selection: Option<Selection>,
     /// The boundary drag in progress, if any.
     border_drag: Option<BorderDrag>,
-    /// The pending-Claude indicator to show in the status line's
+    /// The pending-agent indicator to show in the status line's
     /// hostname block, set by the server each render pass.
     indicator: Option<Indicator>,
     view: View,
@@ -647,17 +647,17 @@ impl Session {
         self.windows.len()
     }
 
-    /// Whether any tab is currently identified as running Claude Code.
-    pub fn has_claude_tab(&self) -> bool {
+    /// Whether any tab is currently identified as running a detected agent.
+    pub fn has_agent_tab(&self) -> bool {
         self.windows
             .values()
             .any(|w| w.tabs.iter().any(|t| t.agent.is_some()))
     }
 
-    /// The tabs currently identified as running Claude Code, in window
+    /// The tabs currently identified as running a detected agent, in window
     /// layout order then tab order: each as its window id and position in
     /// that window's tab list.
-    pub fn claude_tabs(&self) -> Vec<(WindowId, usize)> {
+    pub fn agent_tabs(&self) -> Vec<(WindowId, usize)> {
         let mut out = Vec::new();
         for id in layout::leaves(&self.tree) {
             let Some(win) = self.windows.get(&id) else {
@@ -672,7 +672,7 @@ impl Session {
         out
     }
 
-    /// The Claude Code tabs whose agent is in the done or blocked
+    /// The agent tabs in the done or blocked
     /// state — on-screen windows in layout order, then minimized windows
     /// in minimize order — each as its window id and position in that
     /// window's tab list.
@@ -700,7 +700,7 @@ impl Session {
         (self.focus, active)
     }
 
-    /// Set the pending-Claude indicator the status line shows; a change
+    /// Set the pending-agent indicator the status line shows; a change
     /// forces a redraw.
     pub fn set_indicator(&mut self, indicator: Option<Indicator>) {
         if self.indicator != indicator {
@@ -935,7 +935,7 @@ impl Session {
                     self.restore_window(id);
                     return None;
                 }
-                // A left click on the pending-Claude indicator lands on
+                // A left click on the pending-agent indicator lands on
                 // its tab; the server resolves it, since the tab may
                 // live in another session.
                 if button == CtMouseButton::Left
@@ -1487,7 +1487,7 @@ impl Session {
             .map(|t| t.id)
     }
 
-    /// The pending-Claude indicator, when its status-line span is under
+    /// The pending-agent indicator, when its status-line span is under
     /// `pos`, from the last computed view's geometry.
     fn indicator_at(&self, pos: Position) -> Option<Indicator> {
         let status = self.view.status.as_ref()?;
@@ -1817,7 +1817,7 @@ impl Session {
     }
 
     /// Any badge in a tab bar currently animated — or the status line's
-    /// pending-Claude indicator, which always shimmers? While one is on
+    /// pending-agent indicator, which always shimmers? While one is on
     /// screen, the server redraws on its timer tick so the
     /// animation advances without waiting on PTY output.
     pub fn has_animation(&self) -> bool {
@@ -1954,7 +1954,7 @@ impl Session {
                 .x
                 .saturating_add(1 + self.name.chars().count() as u16)
                 .min(row.right());
-            // The pending-Claude indicator takes the hostname's place
+            // The pending-agent indicator takes the hostname's place
             // when it fits alongside the clock; too narrow a row falls
             // back to the hostname block as usual.
             let indicator = self.indicator.as_ref().and_then(|ind| {
@@ -2225,7 +2225,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
                 }
             }
             // The bracketed status text, in its
-            // state's color, only for tabs identified as running Claude Code;
+            // state's color, only for tabs identified as running a detected agent;
             // working shimmers and blocked breathes.
             if let Some(visual) = &badge.agent {
                 if !put(&mut x, ' ', style) {
@@ -2392,7 +2392,7 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
         }
     }
     // Hostname two spaces left of the clock — or, in its place, the
-    // pending-Claude indicator, shimmering in the same neutral
+    // pending-agent indicator, shimmering in the same neutral
     // foreground.
     let clock_style = fill.fg(Color::Gray);
     let (text, ind_len) = match &status.indicator {

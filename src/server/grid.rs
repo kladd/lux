@@ -1,6 +1,6 @@
 //! The CLAUDECOM grid: a pinned, non-attachable session
 //! switcher entry showing a live tile for every tab across
-//! every session currently identified as running Claude Code. The grid
+//! every session currently identified as running a detected agent. The grid
 //! owns no layout tree, windows, or PTYs — each tile resizes an existing
 //! tab's engine and PTY to its own interior so the content reflows to
 //! fit rather than showing a garbled crop; the next direct render in the
@@ -24,7 +24,7 @@ use crate::server::{SessionId, clear_region};
 pub const ENTRY_NAME: &str = "*CLAUDECOM*";
 
 /// Every tile is this many rows tall and at least this many columns
-/// wide — enough to show a recognizable slice of a Claude Code tab.
+/// wide — enough to show a recognizable slice of an agent tab.
 /// Deriving tile height from the screen made tiles taller than reads
 /// well; width, unlike height, grows past the minimum to consume
 /// whatever the packed columns leave unused.
@@ -46,7 +46,7 @@ pub struct GridState {
     pub pending_prefix: bool,
 }
 
-/// One tile's target: a Claude Code tab addressed by its home session,
+/// One tile's target: an agent tab addressed by its home session,
 /// window, and position in that window's tab list.
 #[derive(Clone, Copy)]
 pub struct GridItem {
@@ -55,7 +55,7 @@ pub struct GridItem {
     pub tab: usize,
 }
 
-/// Every Claude Code tab across every session, ordered by home session
+/// Every agent tab across every session, ordered by home session
 /// name, then window and tab position within the session — a stable
 /// order, so a tile stays put as unrelated tabs elsewhere update.
 pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<GridItem> {
@@ -68,7 +68,7 @@ pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<GridItem> {
         .into_iter()
         .flat_map(|(_, sid)| {
             sessions[&sid]
-                .claude_tabs()
+                .agent_tabs()
                 .into_iter()
                 .map(move |(window, tab)| GridItem {
                     session: sid,
@@ -250,7 +250,7 @@ fn draw(
 /// The grid with no items left stays on screen rather than ejecting its
 /// viewer; a dim notice marks it deliberate.
 fn draw_empty(buf: &mut Buffer, area: Rect) {
-    let msg = "no Claude Code tabs";
+    let msg = "no agent tabs";
     let len = msg.chars().count() as u16;
     if area.width < len || area.height == 0 {
         return;

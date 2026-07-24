@@ -244,23 +244,27 @@ pub fn evaluate(kind: AgentKind, snapshot: &Snapshot) -> AgentState {
 /// Per-tab agent display state: the debounced state the tab bar shows,
 /// plus whether the user has seen the tab since it last became idle.
 pub struct Tracker {
+    kind: AgentKind,
     displayed: AgentState,
     /// When a working/blocked tab first evaluated idle.
     pending_idle: Option<Instant>,
     seen: bool,
 }
 
-impl Default for Tracker {
-    fn default() -> Self {
+impl Tracker {
+    pub fn new(kind: AgentKind) -> Self {
         Self {
+            kind,
             displayed: AgentState::Idle,
             pending_idle: None,
             seen: true,
         }
     }
-}
 
-impl Tracker {
+    pub fn kind(&self) -> AgentKind {
+        self.kind
+    }
+
     /// Fold a fresh evaluation in; returns the newly displayed state when
     /// it changed. Transitions into idle are debounced and
     /// cancelled if the evidence moves off idle first.
@@ -504,7 +508,7 @@ mod tests {
 
     #[test]
     fn idle_transition_debounces_and_cancels() {
-        let mut t = Tracker::default();
+        let mut t = Tracker::new(AgentKind::Claude);
         let t0 = Instant::now();
         assert_eq!(
             t.observe(AgentState::Working, t0),
@@ -540,7 +544,7 @@ mod tests {
 
     #[test]
     fn attention_covers_done_and_blocked_only() {
-        let mut t = Tracker::default();
+        let mut t = Tracker::new(AgentKind::Claude);
         let t0 = Instant::now();
         assert!(!t.needs_attention());
         t.observe(AgentState::Working, t0);
@@ -558,7 +562,7 @@ mod tests {
 
     #[test]
     fn tick_commits_a_quiet_pending_idle() {
-        let mut t = Tracker::default();
+        let mut t = Tracker::new(AgentKind::Claude);
         let t0 = Instant::now();
         t.observe(AgentState::Working, t0);
         t.observe(AgentState::Idle, t0);

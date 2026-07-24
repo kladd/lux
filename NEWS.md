@@ -1,5 +1,9 @@
 # News
 
+## 2026-07-24
+
+- Codex support
+
 ## 2026-07-23
 
 - The session status line now shows a shimmering indicator in place of

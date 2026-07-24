@@ -244,12 +244,8 @@ pub struct Tab {
     /// Stable indices survive scrollback growth and trimming, so the view
     /// stays anchored to content while output arrives.
     scroll_top: Option<isize>,
-    /// Present while the tab is identified as running Claude Code.
+    /// Present while the tab is identified as running a detected agent.
     pub agent: Option<Tracker>,
-    /// Present while the tab is identified as running Codex. The state
-    /// is classified but deliberately surfaced nowhere — no status
-    /// text, overview entry, desktop notification, or persistence.
-    pub codex: Option<Tracker>,
     /// The Claude Code session id this tab's claude instance owns:
     /// seeded when the tab was spawned as a resume (Claude Code keeps
     /// the id across resumes), or assigned at save time by matching
@@ -372,7 +368,6 @@ impl Tab {
             drawn_seqno: 0,
             scroll_top: None,
             agent: None,
-            codex: None,
             claude_session: None,
             claude_since: None,
             notify_text,
@@ -415,21 +410,13 @@ impl Tab {
                 _ => false,
             }
         };
-        if fg.as_ref().is_some_and(|fg| fg.is_codex()) {
-            // Codex: classify the tab's state, but surface nothing —
-            // status text, overview, notifications, and persistence
-            // stay Claude Code-only.
-            let snapshot = agent::Snapshot::capture(&self.engine);
-            let raw = agent::evaluate(agent::AgentKind::Codex, &snapshot);
-            self.codex
-                .get_or_insert_default()
-                .observe(raw, std::time::Instant::now());
-            self.claude_session = None;
-            self.claude_since = None;
-            return (self.agent.take().is_some() || renamed, None);
-        }
-        if !fg.as_ref().is_some_and(|fg| fg.is_claude()) {
-            // Not Claude Code — no status text, drop
+        let kind = match fg.as_ref() {
+            Some(fg) if fg.is_claude() => Some(agent::AgentKind::Claude),
+            Some(fg) if fg.is_codex() => Some(agent::AgentKind::Codex),
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            // Not an agent — no status text, drop
             // any stale state. Session identity is cleared only on a
             // definite non-claude sighting (a later claude in this tab is
             // a different session); an unreadable foreground (e.g.
@@ -438,19 +425,32 @@ impl Tab {
                 self.claude_session = None;
                 self.claude_since = None;
             }
-            self.codex = None;
             return (self.agent.take().is_some() || renamed, None);
+        };
+        match kind {
+            // First sighting of this claude instance; kept across tracker
+            // flicker so the transcript-matching anchor doesn't drift.
+            agent::AgentKind::Claude => {
+                if self.claude_since.is_none() {
+                    self.claude_since = Some(std::time::SystemTime::now());
+                }
+            }
+            // Session identity stays Claude Code-only; a Codex sighting
+            // is as definite a non-claude sighting as a plain shell.
+            agent::AgentKind::Codex => {
+                self.claude_session = None;
+                self.claude_since = None;
+            }
         }
-        self.codex = None;
+        // A tracker left over from the other agent belongs to a process
+        // that's gone; start fresh.
+        if self.agent.as_ref().is_some_and(|t| t.kind() != kind) {
+            self.agent = None;
+        }
         let snapshot = agent::Snapshot::capture(&self.engine);
-        let raw = agent::evaluate(agent::AgentKind::Claude, &snapshot);
+        let raw = agent::evaluate(kind, &snapshot);
         let appeared = self.agent.is_none();
-        // First sighting of this claude instance; kept across tracker
-        // flicker so the transcript-matching anchor doesn't drift.
-        if self.claude_since.is_none() {
-            self.claude_since = Some(std::time::SystemTime::now());
-        }
-        let tracker = self.agent.get_or_insert_default();
+        let tracker = self.agent.get_or_insert_with(|| Tracker::new(kind));
         let entered = tracker.observe(raw, std::time::Instant::now());
         let notice = self.notice_for(entered);
         (appeared || entered.is_some() || renamed, notice)
@@ -499,11 +499,6 @@ impl Tab {
     /// further output; returns whether display changed, plus a notice
     /// when the commit landed the agent in done.
     pub fn tick_agent(&mut self, now: std::time::Instant) -> (bool, Option<Notice>) {
-        // A Codex commit changes nothing visible, so it neither redraws
-        // nor notifies.
-        if let Some(codex) = self.codex.as_mut() {
-            codex.tick(now);
-        }
         let entered = self.agent.as_mut().and_then(|t| t.tick(now));
         let notice = self.notice_for(entered);
         (entered.is_some(), notice)
@@ -511,7 +506,6 @@ impl Tab {
 
     pub fn agent_pending_idle(&self) -> bool {
         self.agent.as_ref().is_some_and(|t| t.pending())
-            || self.codex.as_ref().is_some_and(|t| t.pending())
     }
 
     pub fn scroll_mode(&self) -> bool {
