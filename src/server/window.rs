@@ -154,8 +154,11 @@ impl Window {
                 }
                 None => Tab::spawn(content, cwd, tx.clone()),
             };
-            if let Ok(tab) = spawned {
-                tabs.push(tab);
+            if let Ok(mut spawned_tab) = spawned {
+                if let Some(name) = &tab.name {
+                    spawned_tab.set_name(name.clone());
+                }
+                tabs.push(spawned_tab);
             }
         }
         if tabs.is_empty() {
@@ -387,6 +390,10 @@ impl Tab {
     pub fn set_name(&mut self, name: String) {
         self.name = name;
         self.manual_name = true;
+    }
+
+    pub fn is_manually_named(&self) -> bool {
+        self.manual_name
     }
 
     /// Re-identify the tab after new PTY output: re-derive its display
