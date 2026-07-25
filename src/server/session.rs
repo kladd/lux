@@ -505,6 +505,7 @@ impl Session {
                         persist::TabSnapshot {
                             cwd,
                             claude_session: tab.claude_session.clone(),
+                            name: tab.is_manually_named().then(|| tab.name.clone()),
                         }
                     })
                     .collect();

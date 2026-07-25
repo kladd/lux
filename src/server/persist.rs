@@ -39,6 +39,10 @@ pub struct TabSnapshot {
     /// Claude Code session id to resume, present when the tab was
     /// identified as running Claude Code at save time.
     pub claude_session: Option<String>,
+    /// Manual display name set via the rename prompt; absent when the
+    /// name tracks the foreground process automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// The layout tree, decoupled from the in-memory `Node` so the on-disk
@@ -271,10 +275,12 @@ mod tests {
                             TabSnapshot {
                                 cwd: "/tmp".into(),
                                 claude_session: None,
+                                name: None,
                             },
                             TabSnapshot {
                                 cwd: "/home".into(),
                                 claude_session: Some("abc-123".into()),
+                                name: Some("my-project".into()),
                             },
                         ],
                     },
@@ -284,6 +290,7 @@ mod tests {
                         tabs: vec![TabSnapshot {
                             cwd: "/".into(),
                             claude_session: None,
+                            name: None,
                         }],
                     },
                 ],
@@ -300,6 +307,11 @@ mod tests {
             session.windows[0].tabs[1].claude_session.as_deref(),
             Some("abc-123")
         );
+        assert_eq!(
+            session.windows[0].tabs[1].name.as_deref(),
+            Some("my-project")
+        );
+        assert_eq!(session.windows[0].tabs[0].name, None);
         assert_eq!(session.windows[1].tabs[0].cwd, PathBuf::from("/"));
     }
 
