@@ -154,8 +154,11 @@ impl Window {
                 }
                 None => Tab::spawn(content, cwd, tx.clone()),
             };
-            if let Ok(tab) = spawned {
-                tabs.push(tab);
+            if let Ok(mut spawned_tab) = spawned {
+                if let Some(name) = &tab.name {
+                    spawned_tab.set_name(name.clone());
+                }
+                tabs.push(spawned_tab);
             }
         }
         if tabs.is_empty() {
@@ -389,6 +392,21 @@ impl Tab {
         self.manual_name = true;
     }
 
+    /// Clear a manual name and resume automatic renaming from the foreground
+    /// process.
+    pub fn clear_name(&mut self) {
+        self.manual_name = false;
+        // Immediately reflect any Claude session name rather than waiting
+        // for the next PTY output to trigger refresh_identity.
+        if let Some(name) = self.claude_session_name() {
+            self.name = name;
+        }
+    }
+
+    pub fn is_manually_named(&self) -> bool {
+        self.manual_name
+    }
+
     /// Re-identify the tab after new PTY output: re-derive its display
     /// name from the foreground command and re-evaluate agent detection.
     /// Returns whether the displayed name or agent
@@ -400,14 +418,21 @@ impl Tab {
             // A manually renamed tab keeps its name.
             false
         } else {
-            match fg.as_ref().map(Foreground::display_name) {
-                Some(name) if !name.is_empty() && name != self.name => {
-                    self.name = name.to_string();
-                    true
+            let new_name = match fg.as_ref() {
+                Some(fg) if fg.is_claude() => {
+                    self.claude_session_name()
+                        .unwrap_or_else(|| fg.display_name().to_string())
                 }
+                Some(fg) => fg.display_name().to_string(),
                 // No readable foreground process (e.g. mid-exec): keep the
                 // current name rather than flickering through a fallback.
-                _ => false,
+                None => String::new(),
+            };
+            if !new_name.is_empty() && new_name != self.name {
+                self.name = new_name;
+                true
+            } else {
+                false
             }
         };
         let kind = match fg.as_ref() {
@@ -486,6 +511,25 @@ impl Tab {
             comm: comm.trim().to_string(),
             arg0,
         })
+    }
+
+    /// The Claude session name from `~/.claude/sessions/<pid>.json`, written
+    /// by a running Claude Code instance. Returns `None` if the file doesn't
+    /// exist yet, the pid is unreadable, or the name is auto-derived.
+    fn claude_session_name(&self) -> Option<String> {
+        let pid = self.master.process_group_leader()?;
+        let home = std::env::var_os("HOME")?;
+        let path = std::path::PathBuf::from(home)
+            .join(".claude/sessions")
+            .join(format!("{pid}.json"));
+        let text = std::fs::read_to_string(path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        // Skip auto-generated names; absent field means user-set.
+        if json["nameSource"].as_str() == Some("derived") {
+            return None;
+        }
+        let name = json["name"].as_str()?;
+        (!name.is_empty()).then(|| name.to_string())
     }
 
     /// The foreground process's working directory, via the
