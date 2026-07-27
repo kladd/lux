@@ -1333,7 +1333,12 @@ impl Session {
                             .windows
                             .get_mut(&self.focus)
                             .expect("focused window exists");
-                        win.active_tab_mut().set_name(text);
+                        let tab = win.active_tab_mut();
+                        if text.is_empty() {
+                            tab.clear_name();
+                        } else {
+                            tab.set_name(text);
+                        }
                     }
                 }
             }
