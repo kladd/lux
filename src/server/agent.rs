@@ -246,6 +246,10 @@ pub fn evaluate(kind: AgentKind, snapshot: &Snapshot) -> AgentState {
 pub struct Tracker {
     kind: AgentKind,
     displayed: AgentState,
+    /// When `displayed` last changed. Anchored to the displayed state,
+    /// not each evaluation, so an idle blip the debounce cancels doesn't
+    /// reset a working tab's clock.
+    since: Instant,
     /// When a working/blocked tab first evaluated idle.
     pending_idle: Option<Instant>,
     seen: bool,
@@ -256,6 +260,7 @@ impl Tracker {
         Self {
             kind,
             displayed: AgentState::Idle,
+            since: Instant::now(),
             pending_idle: None,
             seen: true,
         }
@@ -276,7 +281,7 @@ impl Tracker {
         if raw == AgentState::Idle {
             match self.pending_idle {
                 Some(since) if now.duration_since(since) >= IDLE_DEBOUNCE => {
-                    self.commit_idle();
+                    self.commit_idle(now);
                     Some(AgentState::Idle)
                 }
                 Some(_) => None,
@@ -289,6 +294,7 @@ impl Tracker {
             // This also covers direct working↔blocked moves.
             self.pending_idle = None;
             self.displayed = raw;
+            self.since = now;
             Some(raw)
         }
     }
@@ -298,15 +304,16 @@ impl Tracker {
     pub fn tick(&mut self, now: Instant) -> Option<AgentState> {
         match self.pending_idle {
             Some(since) if now.duration_since(since) >= IDLE_DEBOUNCE => {
-                self.commit_idle();
+                self.commit_idle(now);
                 Some(AgentState::Idle)
             }
             _ => None,
         }
     }
 
-    fn commit_idle(&mut self) {
+    fn commit_idle(&mut self, now: Instant) {
         self.displayed = AgentState::Idle;
+        self.since = now;
         self.pending_idle = None;
         // Freshly idle means not yet seen ("done").
         self.seen = false;
@@ -332,24 +339,51 @@ impl Tracker {
         }
     }
 
+    /// Whether the status text needs timer-driven redraws to stay
+    /// current: an animation is running or an elapsed time is ticking —
+    /// every visual state but seen-idle.
+    pub fn animated(&self) -> bool {
+        !(self.displayed == AgentState::Idle && self.seen)
+    }
+
     /// Bracketed status text and color per visual
     /// state — done is idle-but-unseen, idle is idle-and-seen. Working
     /// shimmers and blocked breathes; idle and done stay
-    /// still.
-    pub fn visual(&self) -> Visual {
-        let (text, color, anim) = match (self.displayed, self.seen) {
-            (AgentState::Working, _) => ("[working]", Color::Yellow, Anim::Shimmer),
-            (AgentState::Blocked, _) => ("[blocked]", Color::Red, Anim::Breathe),
-            (AgentState::Idle, false) => ("[done]", Color::Green, Anim::None),
-            (AgentState::Idle, true) => ("[idle]", Color::DarkGray, Anim::None),
+    /// still. Working, blocked, and done carry the elapsed time in
+    /// state; seen-idle stays bare.
+    pub fn visual(&self, now: Instant) -> Visual {
+        let (state, color, anim) = match (self.displayed, self.seen) {
+            (AgentState::Working, _) => ("working", Color::Yellow, Anim::Shimmer),
+            (AgentState::Blocked, _) => ("blocked", Color::Red, Anim::Breathe),
+            (AgentState::Idle, false) => ("done", Color::Green, Anim::None),
+            (AgentState::Idle, true) => ("idle", Color::DarkGray, Anim::None),
+        };
+        let text = if self.animated() {
+            format!("[{state} {}]", elapsed_text(now.duration_since(self.since)))
+        } else {
+            format!("[{state}]")
         };
         Visual { text, color, anim }
     }
 }
 
+/// Elapsed-time text: whole seconds below a minute, minutes and seconds
+/// below an hour, hours and minutes from an hour up — precision degrades
+/// as the number grows so the width doesn't.
+fn elapsed_text(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// A tab's bracketed status text as the tab bar draws it.
 pub struct Visual {
-    pub text: &'static str,
+    pub text: String,
     pub color: Color,
     pub anim: Anim,
 }
@@ -523,23 +557,21 @@ mod tests {
             None
         );
         assert!(!t.pending());
-        assert_eq!(t.visual().text, "[working]");
+        assert_eq!(t.visual(t0).text, "[working 0s]");
         // Idle held past the debounce commits...
         assert_eq!(
             t.observe(AgentState::Idle, t0 + Duration::from_millis(200)),
             None
         );
+        let committed = t0 + Duration::from_millis(200) + IDLE_DEBOUNCE;
         assert_eq!(
-            t.observe(
-                AgentState::Idle,
-                t0 + Duration::from_millis(200) + IDLE_DEBOUNCE
-            ),
+            t.observe(AgentState::Idle, committed),
             Some(AgentState::Idle)
         );
         // ...and lands as done (unseen) until marked seen.
-        assert_eq!(t.visual().text, "[done]");
+        assert_eq!(t.visual(committed).text, "[done 0s]");
         t.mark_seen();
-        assert_eq!(t.visual().text, "[idle]");
+        assert_eq!(t.visual(committed).text, "[idle]");
     }
 
     #[test]
@@ -568,6 +600,40 @@ mod tests {
         t.observe(AgentState::Idle, t0);
         assert_eq!(t.tick(t0 + Duration::from_millis(100)), None);
         assert_eq!(t.tick(t0 + IDLE_DEBOUNCE), Some(AgentState::Idle));
-        assert_eq!(t.visual().text, "[done]");
+        assert_eq!(t.visual(t0 + IDLE_DEBOUNCE).text, "[done 0s]");
+    }
+
+    #[test]
+    fn elapsed_text_degrades_precision_with_age() {
+        // Seconds below a minute, minutes and seconds below an hour,
+        // hours and minutes from an hour up.
+        assert_eq!(elapsed_text(Duration::from_secs(0)), "0s");
+        assert_eq!(elapsed_text(Duration::from_secs(59)), "59s");
+        assert_eq!(elapsed_text(Duration::from_secs(60)), "1m0s");
+        assert_eq!(elapsed_text(Duration::from_secs(252)), "4m12s");
+        assert_eq!(elapsed_text(Duration::from_secs(3599)), "59m59s");
+        assert_eq!(elapsed_text(Duration::from_secs(3600)), "1h0m");
+        assert_eq!(elapsed_text(Duration::from_secs(3840)), "1h4m");
+    }
+
+    #[test]
+    fn state_clock_measures_the_displayed_state() {
+        let mut t = Tracker::new(AgentKind::Claude);
+        let t0 = Instant::now();
+        t.observe(AgentState::Working, t0);
+        // A cancelled idle blip doesn't reset the working clock...
+        t.observe(AgentState::Idle, t0 + Duration::from_secs(10));
+        t.observe(AgentState::Working, t0 + Duration::from_secs(11));
+        assert_eq!(t.visual(t0 + Duration::from_secs(30)).text, "[working 30s]");
+        // ...but a real state change does.
+        t.observe(AgentState::Blocked, t0 + Duration::from_secs(40));
+        assert_eq!(t.visual(t0 + Duration::from_secs(45)).text, "[blocked 5s]");
+        // Seen-idle stays bare and needs no timer-driven redraws.
+        assert!(t.animated());
+        t.observe(AgentState::Idle, t0 + Duration::from_secs(50));
+        t.tick(t0 + Duration::from_secs(50) + IDLE_DEBOUNCE);
+        assert!(t.animated());
+        t.mark_seen();
+        assert!(!t.animated());
     }
 }

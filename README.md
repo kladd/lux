@@ -49,7 +49,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `n` / `p` | next / previous tab |
 | `0`-`9` | jump to tab by index |
 | `h` `j` `k` `l` | focus split left/down/up/right |
-| `H` `J` `K` `L` | move the active tab into the split left/down/up/right |
+| `H` `J` `K` `L` | move the active tab into the split left/down/up/right (tap again within 500ms to keep moving) |
 | `r` then `h` `j` `k` `l` | resize split left/down/up/right (tap again within 500ms to keep resizing) |
 | `m` then `h` `j` `k` `l` | swap the focused window with the adjacent window left/down/up/right |
 | `i` | rotate (flip the orientation of) the enclosing split |
@@ -63,6 +63,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `s` | open the session switcher |
 | `g` | open the CLAUDECOM grid |
 | `f` | open the fuzzy tab finder |
+| `Tab` | jump to the next agent tab that is done or blocked, across every session (wraps) |
 | `:` | open the ex command line |
 
 Arrow keys work as alternates for `h`/`j`/`k`/`l` (and Shift-arrows for
@@ -78,6 +79,9 @@ Ex commands (typed after `:`, with autocomplete):
 - `:new [name]` / `:new-session [name]` — create a session (auto-named
   without an argument) and attach to it; a name already in use does
   nothing
+- `:rename-session <name>` — rename the current session
+- `:kill-session [name]` — kill the named session, or the current one
+  without an argument
 
 ### Navigating sessions
 

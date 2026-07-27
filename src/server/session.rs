@@ -75,6 +75,9 @@ pub enum Effect {
     /// Land on the pending-agent indicator's tab, which may live in
     /// another session.
     GotoIndicator(Indicator),
+    /// Jump to the next agent tab in the done or blocked state across
+    /// every session on the server.
+    CycleAgent,
     /// The last window's last tab exited.
     Ended,
 }
@@ -673,15 +676,21 @@ impl Session {
         out
     }
 
+    /// On-screen windows in layout order, then minimized windows in
+    /// minimize order — the window order the CLAUDECOM surfaces sort by.
+    pub fn window_order(&self) -> Vec<WindowId> {
+        let mut ids = layout::leaves(&self.tree);
+        ids.extend(self.minimized.iter().copied());
+        ids
+    }
+
     /// The agent tabs in the done or blocked
     /// state — on-screen windows in layout order, then minimized windows
     /// in minimize order — each as its window id and position in that
     /// window's tab list.
     pub fn attention_tabs(&self) -> Vec<(WindowId, usize)> {
-        let mut ids = layout::leaves(&self.tree);
-        ids.extend(self.minimized.iter().copied());
         let mut out = Vec::new();
-        for id in ids {
+        for id in self.window_order() {
             let Some(win) = self.windows.get(&id) else {
                 continue;
             };
@@ -1253,6 +1262,7 @@ impl Session {
             }
             // Real detach, dispatched server-side.
             Command::Detach => return Some(Effect::Detach),
+            Command::CycleAgent => return Some(Effect::CycleAgent),
             // Switcher mode is the server's to run.
             Command::Switcher => return Some(Effect::OpenSwitcher),
             // So is the grid.
@@ -1822,19 +1832,18 @@ impl Session {
             })
     }
 
-    /// Any badge in a tab bar currently animated — or the status line's
-    /// pending-agent indicator, which always shimmers? While one is on
-    /// screen, the server redraws on its timer tick so the
-    /// animation advances without waiting on PTY output.
+    /// Any badge in a tab bar currently animated or carrying a ticking
+    /// elapsed time — or the status line's pending-agent indicator,
+    /// which always shimmers? While one is on screen, the server redraws
+    /// on its timer tick so the animation and elapsed time advance
+    /// without waiting on PTY output.
     pub fn has_animation(&self) -> bool {
         self.indicator.is_some()
             || self.windows.values().any(|w| {
                 !self.minimized.contains(&w.id)
-                    && w.tabs.iter().any(|t| {
-                        t.agent
-                            .as_ref()
-                            .is_some_and(|a| a.visual().anim != Anim::None)
-                    })
+                    && w.tabs
+                        .iter()
+                        .any(|t| t.agent.as_ref().is_some_and(agent::Tracker::animated))
             })
     }
 
@@ -1884,6 +1893,7 @@ impl Session {
             Some(id) => (vec![(id, tree_area(self.area))], Vec::new()),
             None => layout::compute(&self.tree, tree_area(self.area)),
         };
+        let now = Instant::now();
         let mut chrome = Vec::with_capacity(rects.len());
         for (id, rect) in rects {
             let Some(win) = self.windows.get_mut(&id) else {
@@ -1915,7 +1925,7 @@ impl Session {
                 .iter()
                 .enumerate()
                 .map(|(i, tab)| {
-                    let agent = tab.agent.as_ref().map(|t| t.visual());
+                    let agent = tab.agent.as_ref().map(|t| t.visual(now));
                     let mut width = format!(" {}:{}", i, tab.name).chars().count() as u16;
                     if let Some(visual) = &agent {
                         width += 1 + visual.text.chars().count() as u16;

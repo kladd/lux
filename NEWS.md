@@ -1,5 +1,12 @@
 # News
 
+## 2026-07-25
+
+- `prefix+Tab` now jumps to the next agent tab that is done or blocked,
+  across every session.
+- A detected agent's bracketed status now carries how long the agent has
+  been in that state (e.g. `[working 4m12s]`).
+
 ## 2026-07-24
 
 - Codex support

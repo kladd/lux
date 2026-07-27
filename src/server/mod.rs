@@ -821,6 +821,7 @@ impl Server {
             Effect::GotoIndicator(ind) => {
                 self.attach_to_tab(conn, ind.session, ind.window, ind.tab);
             }
+            Effect::CycleAgent => self.cycle_agent(conn),
             Effect::Ended => self.end_session(sid),
         }
     }
@@ -977,6 +978,50 @@ impl Server {
                     .unwrap_or(0);
             }
         }
+    }
+
+    /// Jump to the next agent tab in the done or blocked state across
+    /// every session, in the CLAUDECOM grid's session/window/tab order:
+    /// the first qualifying tab sorting after the client's focused
+    /// window's active tab, wrapping to the first qualifying tab when
+    /// none does. With no qualifying tab at all, focus is left
+    /// unchanged. Arrival reuses the same attach-and-focus (and
+    /// restore-and-maximize) path as the status-line indicator's click.
+    fn cycle_agent(&mut self, conn: ConnId) {
+        let Some(client) = self.clients.get(&conn) else {
+            return;
+        };
+        let attached = client.attached;
+        let mut by_name: Vec<(&str, SessionId)> = self
+            .sessions
+            .iter()
+            .map(|(&sid, s)| (s.name.as_str(), sid))
+            .collect();
+        by_name.sort();
+        // Every qualifying tab in grid order, keyed by its position in
+        // that order so it can be compared against the focused tab's.
+        let mut queue = Vec::new();
+        let mut current = None;
+        for (spos, &(_, sid)) in by_name.iter().enumerate() {
+            let session = &self.sessions[&sid];
+            let order = session.window_order();
+            let wpos = |window| order.iter().position(|&w| w == window).unwrap_or(0);
+            if sid == attached {
+                let (window, index) = session.focused_active();
+                current = Some((spos, wpos(window), index));
+            }
+            for (window, index) in session.attention_tabs() {
+                queue.push(((spos, wpos(window), index), sid, window, index));
+            }
+        }
+        let Some(&(_, sid, window, index)) = queue
+            .iter()
+            .find(|&&(key, ..)| Some(key) > current)
+            .or_else(|| queue.first())
+        else {
+            return;
+        };
+        self.attach_to_tab(conn, sid, window, index);
     }
 
     /// Re-attach `conn` to `sid`, focused on `window`'s tab at `index`:
@@ -1268,6 +1313,7 @@ impl Server {
             .map(|(&sid, s)| (s.name.as_str(), sid))
             .collect();
         by_name.sort();
+        let now = std::time::Instant::now();
         for (_, sid) in by_name {
             let session = &self.sessions[&sid];
             for (window, index) in session.attention_tabs() {
@@ -1277,7 +1323,7 @@ impl Server {
                 let Some(tab) = session.tab_at(window, index) else {
                     continue;
                 };
-                let Some(visual) = tab.agent.as_ref().map(|t| t.visual()) else {
+                let Some(visual) = tab.agent.as_ref().map(|t| t.visual(now)) else {
                     continue;
                 };
                 return Some(session::Indicator {

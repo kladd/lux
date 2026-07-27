@@ -314,11 +314,12 @@ fn draw_tile(
     if rect.width < 2 || rect.height < 2 {
         return;
     }
+    let now = std::time::Instant::now();
     let (color, border_anim) =
         tab.agent
             .as_ref()
             .map_or((Color::DarkGray, Anim::None), |tracker| {
-                let visual = tracker.visual();
+                let visual = tracker.visual(now);
                 (visual.color, visual.anim)
             });
     draw_border(buf, rect, highlighted, color, border_anim, elapsed);
@@ -344,7 +345,7 @@ fn draw_tile(
     };
     // The same status coloring and animation the tab's home tab bar shows.
     if let Some(tracker) = &tab.agent {
-        let visual = tracker.visual();
+        let visual = tracker.visual(now);
         let len = visual.text.chars().count();
         for (j, ch) in visual.text.chars().enumerate() {
             let color = match visual.anim {

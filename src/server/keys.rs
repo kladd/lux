@@ -50,6 +50,9 @@ pub enum Command {
     RenameTab,
     /// Terminate every tab in the focused window.
     CloseWindow,
+    /// Jump to the next agent tab in the done or blocked state, across
+    /// every session, wrapping.
+    CycleAgent,
 }
 
 impl Command {
@@ -94,6 +97,7 @@ impl Command {
             Command::Rebalance => "rebalance splits",
             Command::RenameTab => "rename tab",
             Command::CloseWindow => "close window",
+            Command::CycleAgent => "next agent needing attention",
         }
     }
 }
@@ -289,6 +293,14 @@ impl Default for KeyTable {
             shift_arrow(CtKeyCode::Right, Command::MoveTabDir(Dir::Right)),
             cmd('z', Command::Maximize),
             cmd('i', Command::Rotate),
+            (
+                KeyMatch {
+                    code: CtKeyCode::Tab,
+                    ctrl: false,
+                    shift: false,
+                },
+                KeyTrie::Command(Command::CycleAgent),
+            ),
             // `=` evokes making the splits equal.
             cmd('=', Command::Rebalance),
             cmd(',', Command::RenameTab),
@@ -568,6 +580,15 @@ mod tests {
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('x'), KeyModifiers::NONE)),
             Some(Command::CloseWindow)
+        );
+    }
+
+    #[test]
+    fn cycle_agent_is_bound_to_tab() {
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Tab, KeyModifiers::NONE)),
+            Some(Command::CycleAgent)
         );
     }
 
