@@ -1,5 +1,12 @@
 # News
 
+## 2026-08-02
+
+- New config-gated auto mode (`automode = true`): the CLAUDECOM entry points
+  present one done-or-blocked agent tab at a time instead of the grid,
+  handing off to the next automatically, with a fallback screen listing
+  the agents still working when nothing needs attention.
+
 ## 2026-07-25
 
 - `prefix+Tab` now jumps to the next agent tab that is done or blocked,

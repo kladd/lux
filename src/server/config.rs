@@ -1,13 +1,14 @@
 //! Config file loading (Phase 6): a TOML file overriding the prefix key,
-//! the session-restore toggle, and the desktop-notification toggle. The
-//! keybinding table itself is hardcoded and non-configurable. No other
-//! settings, and no live reloading.
+//! the session-restore toggle, the desktop-notification toggle, and the
+//! auto-mode toggle. The keybinding table itself is hardcoded and
+//! non-configurable. No other settings, and no live reloading.
 //!
 //! ```toml
 //! # ~/.config/lux/config.toml
 //! prefix = "C-a"    # "C-" prefix means Ctrl is held
 //! restore = false   # skip restoring persisted sessions at startup
 //! notify = false    # no desktop notifications for Claude Code tabs
+//! automode = true   # CLAUDECOM opens auto mode instead of the grid
 //! ```
 //!
 //! The key spec is a single character, optionally prefixed with `C-`.
@@ -28,6 +29,9 @@ pub struct Config {
     /// Whether the server raises desktop notifications when a Claude
     /// Code tab reaches done or blocked. Absent means notify.
     pub notify: bool,
+    /// Whether the CLAUDECOM entry points open auto mode instead of the
+    /// grid. Absent means the grid.
+    pub automode: bool,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
             keys: KeyTable::default(),
             restore: true,
             notify: true,
+            automode: false,
         }
     }
 }
@@ -94,6 +99,12 @@ fn from_toml(text: &str, origin: &str) -> Config {
         match value.as_bool() {
             Some(notify) => config.notify = notify,
             None => eprintln!("lux: {origin}: invalid notify value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("automode") {
+        match value.as_bool() {
+            Some(automode) => config.automode = automode,
+            None => eprintln!("lux: {origin}: invalid automode value {value}"),
         }
     }
     config
@@ -159,6 +170,16 @@ mod tests {
         assert!(from_toml("notify = true", "test").notify);
         // A non-boolean value keeps the default.
         assert!(from_toml("notify = \"no\"", "test").notify);
+    }
+
+    #[test]
+    fn automode_option_parses_and_defaults_off() {
+        // Absent means the grid.
+        assert!(!from_toml("prefix = \"C-a\"", "test").automode);
+        assert!(from_toml("automode = true", "test").automode);
+        assert!(!from_toml("automode = false", "test").automode);
+        // A non-boolean value keeps the default.
+        assert!(!from_toml("automode = \"yes\"", "test").automode);
     }
 
     #[test]

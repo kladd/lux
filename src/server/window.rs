@@ -419,10 +419,9 @@ impl Tab {
             false
         } else {
             let new_name = match fg.as_ref() {
-                Some(fg) if fg.is_claude() => {
-                    self.claude_session_name()
-                        .unwrap_or_else(|| fg.display_name().to_string())
-                }
+                Some(fg) if fg.is_claude() => self
+                    .claude_session_name()
+                    .unwrap_or_else(|| fg.display_name().to_string()),
                 Some(fg) => fg.display_name().to_string(),
                 // No readable foreground process (e.g. mid-exec): keep the
                 // current name rather than flickering through a fallback.

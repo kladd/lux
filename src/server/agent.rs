@@ -328,6 +328,11 @@ impl Tracker {
         self.seen = true;
     }
 
+    /// Whether the displayed state is working.
+    pub fn working(&self) -> bool {
+        self.displayed == AgentState::Working
+    }
+
     /// Whether the tab is in the done (idle-but-unseen) or blocked
     /// state — the two states worth surfacing to a user who isn't
     /// looking at the tab.

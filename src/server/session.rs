@@ -575,6 +575,13 @@ impl Session {
             .any(|w| w.tabs.iter().any(|t| t.id == id))
     }
 
+    /// The window and tab-list position of the tab with `id`.
+    pub fn locate_tab(&self, id: TabId) -> Option<(WindowId, usize)> {
+        self.windows
+            .iter()
+            .find_map(|(&wid, w)| w.tabs.iter().position(|t| t.id == id).map(|i| (wid, i)))
+    }
+
     /// Advance the owning engine with PTY output, whether or
     /// not that tab is currently visible, then re-derive the tab's name
     /// and re-evaluate agent detection against the new

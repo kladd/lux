@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod anim;
+pub mod auto;
 pub mod config;
 pub mod ex;
 pub mod find;
@@ -39,6 +40,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::protocol::{self, Request};
+use auto::AutoState;
 use grid::GridState;
 use input::{DecodedInput, InputDecoder};
 use keys::{KeyMatch, KeyTable};
@@ -105,6 +107,8 @@ struct Client {
     switcher: Option<usize>,
     /// `Some` while viewing the CLAUDECOM grid.
     grid: Option<GridState>,
+    /// `Some` while in auto mode.
+    auto: Option<AutoState>,
     /// `Some` while in fuzzy tab-find mode.
     finder: Option<find::FinderState>,
     /// The pointer shape last written to the client's terminal (an OSC
@@ -157,6 +161,7 @@ pub fn run() -> i32 {
         keys,
         clipboard: arboard::Clipboard::new().ok(),
         notify: config.notify,
+        auto_enabled: config.automode,
         next_session_id: 0,
         save_deadline: None,
         last_saved: None,
@@ -198,6 +203,7 @@ pub fn run() -> i32 {
             }
         }
         server.tick_agents();
+        server.tick_auto();
         server.tick_save();
         server.render_all();
     }
@@ -284,6 +290,9 @@ struct Server {
     clipboard: Option<arboard::Clipboard>,
     /// Whether desktop notifications are enabled (config `notify`).
     notify: bool,
+    /// Whether the CLAUDECOM entry points open auto mode instead of the
+    /// grid (config `auto`).
+    auto_enabled: bool,
     next_session_id: SessionId,
     /// When the pending automatic save runs; armed by any event that can
     /// change persisted state.
@@ -308,7 +317,10 @@ impl Server {
             || self.save_deadline.is_some()
             || self.sessions.values().any(|s| s.has_pending_repeat())
             || self.clients.values().any(|c| {
-                if c.switcher.is_some() || c.grid.is_some() {
+                if c.switcher.is_some()
+                    || c.grid.is_some()
+                    || c.auto.is_some_and(|a| a.presented.is_none())
+                {
                     self.sessions.values().any(|s| s.has_animation())
                 } else {
                     self.sessions
@@ -615,6 +627,7 @@ impl Server {
                 attached: sid,
                 switcher: None,
                 grid: None,
+                auto: None,
                 finder: None,
                 pointer: "default",
             },
@@ -738,6 +751,12 @@ impl Server {
                 self.switcher_input(conn, &event);
                 continue;
             }
+            // Auto mode intercepts input only on its blank screen; a
+            // presented tab is an ordinary attached view.
+            if client.auto.is_some_and(|a| a.presented.is_none()) {
+                self.auto_input(conn, &event);
+                continue;
+            }
             let sid = client.attached;
             let Some(session) = self.sessions.get_mut(&sid) else {
                 continue;
@@ -762,9 +781,12 @@ impl Server {
             // Switcher mode is per-connection.
             Effect::OpenSwitcher => self.open_switcher(conn),
             // The grid opens directly, without passing through the
-            // switcher.
+            // switcher; with auto mode enabled, every grid entry point
+            // begins auto mode instead.
             Effect::OpenGrid => {
-                if let Some(client) = self.clients.get_mut(&conn) {
+                if self.auto_enabled {
+                    self.begin_auto(conn);
+                } else if let Some(client) = self.clients.get_mut(&conn) {
                     client.grid = Some(GridState::default());
                 }
             }
@@ -876,14 +898,20 @@ impl Server {
                 }
             }
             // Re-attach the connection to the selection; the pinned
-            // CLAUDECOM entry opens its grid instead of any
-            // session.
+            // CLAUDECOM entry opens its grid (or auto mode) instead of
+            // any session. Landing on a session leaves auto mode — the
+            // user navigated away from what it was presenting.
             CtKeyCode::Enter => {
                 client.switcher = None;
                 if highlight < pinned {
-                    client.grid = Some(GridState::default());
+                    if self.auto_enabled {
+                        self.begin_auto(conn);
+                    } else {
+                        client.grid = Some(GridState::default());
+                    }
                     return;
                 }
+                client.auto = None;
                 let Some(&target) = self.sessions.keys().nth(highlight - pinned) else {
                     return;
                 };
@@ -956,7 +984,9 @@ impl Server {
                 }
             }
             // Attach to the highlighted match's home session, focused on
-            // its tab. With nothing matched there is nothing to select.
+            // its tab, leaving auto mode — the user navigated away from
+            // what it was presenting. With nothing matched there is
+            // nothing to select.
             CtKeyCode::Enter => {
                 let Some(&idx) = matched.get(highlight) else {
                     return;
@@ -964,6 +994,7 @@ impl Server {
                 let item = &items[idx];
                 let (sid, window, tab) = (item.session, item.window, item.tab);
                 client.finder = None;
+                client.auto = None;
                 self.attach_to_tab(conn, sid, window, tab);
             }
             // Everything else edits the query. The highlight follows the
@@ -980,6 +1011,58 @@ impl Server {
         }
     }
 
+    /// Session ids in name order — the CLAUDECOM grid's session order.
+    fn sessions_by_name(&self) -> Vec<SessionId> {
+        let mut by_name: Vec<(&str, SessionId)> = self
+            .sessions
+            .iter()
+            .map(|(&sid, s)| (s.name.as_str(), sid))
+            .collect();
+        by_name.sort();
+        by_name.into_iter().map(|(_, sid)| sid).collect()
+    }
+
+    /// The session, window, and tab-list position of the tab with `id`.
+    fn locate(&self, id: TabId) -> Option<(SessionId, layout::WindowId, usize)> {
+        self.sessions
+            .iter()
+            .find_map(|(&sid, s)| s.locate_tab(id).map(|(window, index)| (sid, window, index)))
+    }
+
+    /// A tab's sortable position in the CLAUDECOM grid's
+    /// session/window/tab order.
+    fn order_key(&self, id: TabId) -> Option<(usize, usize, usize)> {
+        let (sid, window, index) = self.locate(id)?;
+        let spos = self.sessions_by_name().iter().position(|&s| s == sid)?;
+        let order = self.sessions[&sid].window_order();
+        let wpos = order.iter().position(|&w| w == window).unwrap_or(0);
+        Some((spos, wpos, index))
+    }
+
+    /// The first agent tab in the done or blocked state sorting after
+    /// `cursor` in the CLAUDECOM grid's order, wrapping to the first
+    /// such tab when none does (a `None` cursor sorts before
+    /// everything).
+    fn next_attention(
+        &self,
+        cursor: Option<(usize, usize, usize)>,
+    ) -> Option<(SessionId, layout::WindowId, usize)> {
+        let mut queue = Vec::new();
+        for (spos, &sid) in self.sessions_by_name().iter().enumerate() {
+            let session = &self.sessions[&sid];
+            let order = session.window_order();
+            for (window, index) in session.attention_tabs() {
+                let wpos = order.iter().position(|&w| w == window).unwrap_or(0);
+                queue.push(((spos, wpos, index), sid, window, index));
+            }
+        }
+        queue
+            .iter()
+            .find(|&&(key, ..)| Some(key) > cursor)
+            .or_else(|| queue.first())
+            .map(|&(_, sid, window, index)| (sid, window, index))
+    }
+
     /// Jump to the next agent tab in the done or blocked state across
     /// every session, in the CLAUDECOM grid's session/window/tab order:
     /// the first qualifying tab sorting after the client's focused
@@ -992,36 +1075,121 @@ impl Server {
             return;
         };
         let attached = client.attached;
-        let mut by_name: Vec<(&str, SessionId)> = self
-            .sessions
-            .iter()
-            .map(|(&sid, s)| (s.name.as_str(), sid))
-            .collect();
-        by_name.sort();
-        // Every qualifying tab in grid order, keyed by its position in
-        // that order so it can be compared against the focused tab's.
-        let mut queue = Vec::new();
-        let mut current = None;
-        for (spos, &(_, sid)) in by_name.iter().enumerate() {
-            let session = &self.sessions[&sid];
+        let cursor = self.sessions.get(&attached).and_then(|session| {
+            let spos = self
+                .sessions_by_name()
+                .iter()
+                .position(|&sid| sid == attached)?;
+            let (window, index) = session.focused_active();
             let order = session.window_order();
-            let wpos = |window| order.iter().position(|&w| w == window).unwrap_or(0);
-            if sid == attached {
-                let (window, index) = session.focused_active();
-                current = Some((spos, wpos(window), index));
+            let wpos = order.iter().position(|&w| w == window).unwrap_or(0);
+            Some((spos, wpos, index))
+        });
+        if let Some((sid, window, index)) = self.next_attention(cursor) {
+            self.attach_to_tab(conn, sid, window, index);
+        }
+    }
+
+    /// Enter auto mode for `conn`, leaving any other full-screen mode;
+    /// the next tick selects and presents the first attention tab, or
+    /// falls back to the blank screen when none qualifies.
+    fn begin_auto(&mut self, conn: ConnId) {
+        if let Some(client) = self.clients.get_mut(&conn) {
+            client.grid = None;
+            client.switcher = None;
+            client.finder = None;
+            client.auto = Some(AutoState::default());
+        }
+    }
+
+    /// Advance every auto-mode client: a presented tab is kept until
+    /// its agent starts working again or the tab stops existing, then
+    /// the next attention tab in the grid's order is presented,
+    /// wrapping; with none, the blank screen shows until a tab needs
+    /// attention again. Clients browsing the switcher or finder are
+    /// left alone until they come back.
+    fn tick_auto(&mut self) {
+        let conns: Vec<ConnId> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.auto.is_some() && c.switcher.is_none() && c.finder.is_none())
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in conns {
+            let Some(state) = self.clients.get(&conn).and_then(|c| c.auto) else {
+                continue;
+            };
+            if let Some(id) = state.presented {
+                let keep = self.locate(id).is_some_and(|(sid, window, index)| {
+                    self.sessions[&sid]
+                        .tab_at(window, index)
+                        .and_then(|t| t.agent.as_ref())
+                        .is_none_or(|t| !t.working())
+                });
+                if keep {
+                    continue;
+                }
             }
-            for (window, index) in session.attention_tabs() {
-                queue.push(((spos, wpos(window), index), sid, window, index));
+            let cursor = state.presented.and_then(|id| self.order_key(id));
+            match self.next_attention(cursor) {
+                Some((sid, window, index)) => self.attach_to_tab(conn, sid, window, index),
+                None => {
+                    if let Some(state) = self.clients.get_mut(&conn).and_then(|c| c.auto.as_mut()) {
+                        state.presented = None;
+                    }
+                }
             }
         }
-        let Some(&(_, sid, window, index)) = queue
-            .iter()
-            .find(|&&(key, ..)| Some(key) > current)
-            .or_else(|| queue.first())
-        else {
+    }
+
+    /// Input while auto mode shows the blank screen. Escape or `q`
+    /// leaves auto mode and resumes the session this connection stayed
+    /// attached to underneath it, the prefix key leads `s` (switcher)
+    /// or `f` (finder), and everything else — mouse included — is
+    /// discarded.
+    fn auto_input(&mut self, conn: ConnId, event: &DecodedInput) {
+        let Some(mut state) = self.clients.get(&conn).and_then(|c| c.auto) else {
             return;
         };
-        self.attach_to_tab(conn, sid, window, index);
+        let DecodedInput::Key(key) = event else {
+            return;
+        };
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if state.pending_prefix {
+            state.pending_prefix = false;
+            self.store_auto_state(conn, state);
+            if plain_char(key, 's') {
+                self.open_switcher(conn);
+            } else if plain_char(key, 'f') {
+                self.open_finder(conn);
+            }
+            return;
+        }
+        if self.keys.is_prefix(*key) {
+            state.pending_prefix = true;
+            self.store_auto_state(conn, state);
+            return;
+        }
+        if let CtKeyCode::Esc | CtKeyCode::Char('q') = key.code {
+            let Some(client) = self.clients.get_mut(&conn) else {
+                return;
+            };
+            client.auto = None;
+            let sid = client.attached;
+            if let Some(session) = self.sessions.get_mut(&sid) {
+                session.request_redraw();
+            }
+        }
+    }
+
+    /// Write an auto-mode state copy back to the connection, if it is
+    /// still in auto mode.
+    fn store_auto_state(&mut self, conn: ConnId, state: AutoState) {
+        if let Some(auto) = self.clients.get_mut(&conn).and_then(|c| c.auto.as_mut()) {
+            *auto = state;
+        }
     }
 
     /// Re-attach `conn` to `sid`, focused on `window`'s tab at `index`:
@@ -1058,6 +1226,16 @@ impl Server {
             session.set_area(Rect::new(0, 0, size.width, size.height));
             session.goto_tab(window, index);
             session.request_redraw();
+        }
+        // A landing while in auto mode becomes the presented tab, so
+        // the next hand-off advances from it.
+        let id = self
+            .sessions
+            .get(&sid)
+            .and_then(|s| s.tab_at(window, index))
+            .map(|t| t.id);
+        if let Some(state) = self.clients.get_mut(&conn).and_then(|c| c.auto.as_mut()) {
+            state.presented = id;
         }
     }
 
@@ -1118,6 +1296,7 @@ impl Server {
         };
         if let Some(client) = self.clients.get_mut(&conn) {
             client.attached = sid;
+            client.auto = None;
         }
         self.note_attached(sid);
         if let Some(session) = self.sessions.get_mut(&sid) {
@@ -1348,7 +1527,12 @@ impl Server {
         let indicators: Vec<(SessionId, session::Indicator)> = self
             .clients
             .values()
-            .filter(|c| c.finder.is_none() && c.grid.is_none() && c.switcher.is_none())
+            .filter(|c| {
+                c.finder.is_none()
+                    && c.grid.is_none()
+                    && c.switcher.is_none()
+                    && !c.auto.is_some_and(|a| a.presented.is_none())
+            })
             .filter_map(|c| Some((c.attached, self.pending_indicator(c.attached)?)))
             .collect();
         for (&sid, session) in self.sessions.iter_mut() {
@@ -1368,6 +1552,8 @@ impl Server {
                 render_grid(client, sessions);
             } else if let Some(highlight) = client.switcher {
                 render_switcher(client, sessions, highlight);
+            } else if client.auto.is_some_and(|a| a.presented.is_none()) {
+                render_auto_blank(client, sessions);
             } else if let Some(session) = sessions.get_mut(&client.attached)
                 && session.needs_redraw()
             {
@@ -1402,6 +1588,15 @@ fn render_finder(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session
             }
         }
         find::render(buf, area, sessions, state);
+    });
+}
+
+/// The auto-mode blank frame: the fallback message and the live list of
+/// working agent tabs, rendered each pass like the grid.
+fn render_auto_blank(client: &mut Client, sessions: &BTreeMap<SessionId, Session>) {
+    let _ = client.terminal.draw(|frame| {
+        let area = frame.area();
+        auto::render_blank(frame.buffer_mut(), area, sessions);
     });
 }
 
