@@ -1000,6 +1000,10 @@ impl Session {
                 {
                     return Some(Effect::GotoIndicator(indicator));
                 }
+                // A left click on the menu icon opens the switcher.
+                if button == CtMouseButton::Left && self.menu_icon_at(pos) {
+                    return Some(Effect::OpenSwitcher);
+                }
                 // A left press on a draggable boundary — a separator
                 // column, or the tab bar row bordering the window above —
                 // starts a boundary drag. Boundaries are lux chrome, so
@@ -1563,6 +1567,14 @@ impl Session {
             .map(|t| t.id)
     }
 
+    /// Whether the status line's menu icon is under `pos`.
+    fn menu_icon_at(&self, pos: Position) -> bool {
+        self.view
+            .status
+            .as_ref()
+            .is_some_and(|s| pos.y == s.row.y && pos.x == s.row.x)
+    }
+
     /// The pending-agent indicator, when its status-line span is under
     /// `pos`, from the last computed view's geometry.
     fn indicator_at(&self, pos: Position) -> Option<Indicator> {
@@ -2028,7 +2040,7 @@ impl Session {
             let row = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
             let name_end = row
                 .x
-                .saturating_add(1 + self.name.chars().count() as u16)
+                .saturating_add(2 + self.name.chars().count() as u16)
                 .min(row.right());
             // The pending-agent indicator takes the hostname's place
             // when it fits alongside the clock; too narrow a row falls
@@ -2442,9 +2454,14 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
             dst.set_style(fill);
         }
     }
+    // Menu icon: clicking it opens the switcher.
+    if let Some(dst) = buf.cell_mut(Position::new(row.x, row.y)) {
+        dst.set_char('☢');
+        dst.set_style(fill.fg(Color::Gray));
+    }
     let name_style = fill.fg(Color::Green);
     for (i, ch) in format!(" {}", status.name).chars().enumerate() {
-        let x = row.x + i as u16;
+        let x = row.x + 1 + i as u16;
         if x >= row.right() {
             break;
         }

@@ -91,6 +91,8 @@ Ex commands (typed after `:`, with autocomplete):
 Prefix+`s` opens the session switcher: a list of sessions with a live
 preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
 `Ctrl-n`/`Ctrl-p`; `Enter` (or clicking an entry) attaches, `Esc` cancels.
+Clicking the `☢` icon at the left of the status bar opens it too; while
+the switcher is open the icon shows as `○`, and clicking it exits.
 
 Prefix+`f` opens the fuzzy tab finder: a popover floating over your
 session that lists every tab across every session, narrowing as you type

@@ -2,6 +2,7 @@
 
 ## 2026-08-11
 
+- A status-line menu icon toggles the session switcher.
 - Kiro CLI support
 - Fixed a false blocked state when a typed Claude Code message starts
   with "1."

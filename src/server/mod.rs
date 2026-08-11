@@ -853,13 +853,17 @@ impl Server {
         let key = match event {
             DecodedInput::Key(key) => key,
             DecodedInput::Mouse(mouse) => {
-                if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Left))
-                    && let Some(index) = self.switcher_entry_at(conn, mouse.column, mouse.row)
-                {
-                    if let Some(client) = self.clients.get_mut(&conn) {
-                        client.switcher = Some(index);
+                if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Left)) {
+                    if self.switcher_icon_at(conn, mouse.column, mouse.row) {
+                        self.switcher_cancel(conn);
+                    } else if let Some(index) =
+                        self.switcher_entry_at(conn, mouse.column, mouse.row)
+                    {
+                        if let Some(client) = self.clients.get_mut(&conn) {
+                            client.switcher = Some(index);
+                        }
+                        self.switcher_select(conn, index);
                     }
-                    self.switcher_select(conn, index);
                 }
                 return;
             }
@@ -903,16 +907,31 @@ impl Server {
                 });
             }
             // Back out without changing attachment.
-            CtKeyCode::Esc => {
-                client.switcher = None;
-                let sid = client.attached;
-                if let Some(session) = self.sessions.get_mut(&sid) {
-                    session.request_redraw();
-                }
-            }
+            CtKeyCode::Esc => self.switcher_cancel(conn),
             CtKeyCode::Enter => self.switcher_select(conn, highlight),
             _ => {}
         }
+    }
+
+    /// Leave switcher mode without changing attachment.
+    fn switcher_cancel(&mut self, conn: ConnId) {
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        client.switcher = None;
+        let sid = client.attached;
+        if let Some(session) = self.sessions.get_mut(&sid) {
+            session.request_redraw();
+        }
+    }
+
+    /// Whether the switcher frame's menu icon is at a clicked position.
+    fn switcher_icon_at(&self, conn: ConnId, column: u16, row: u16) -> bool {
+        let Some(client) = self.clients.get(&conn) else {
+            return false;
+        };
+        let size = term::fd_size(&client.raw_out);
+        size.height > 0 && column == 0 && row == size.height - 1
     }
 
     /// Leave switcher mode and act on the entry at `highlight`: the
@@ -1696,6 +1715,13 @@ fn render_switcher(
                     dst.set_style(style);
                 }
             }
+        }
+        // Menu icon in its switcher-active state; clicking it exits.
+        if area.height > 0
+            && let Some(dst) = buf.cell_mut(Position::new(area.x, area.bottom() - 1))
+        {
+            dst.set_char('○');
+            dst.set_style(Style::default().fg(Color::Green));
         }
         // Divider and preview pane.
         if area.width > list_w {
