@@ -85,7 +85,7 @@ fn from_toml(text: &str, origin: &str) -> Config {
     if let Some(value) = doc.get("prefix") {
         match value.as_str().and_then(parse_key_spec) {
             // The configured prefix replaces the default.
-            Some(key) => config.keys.prefix = key,
+            Some(key) => config.keys.set_prefix(key),
             None => eprintln!("lux: {origin}: invalid prefix key {value}"),
         }
     }
@@ -215,14 +215,14 @@ mod tests {
     fn keybinding_overrides_are_not_a_setting() {
         // Per-command keybinding overrides are prohibited: a `[keys]` table changes nothing.
         let t = table("prefix = \"C-a\"\n[keys]\nnew-tab = \"t\"");
-        assert_eq!(t.root, KeyTable::default().root);
-        assert_eq!(
-            t.prefix,
-            KeyMatch {
-                code: CtKeyCode::Char('a'),
-                ctrl: true,
-                shift: false
-            }
-        );
+        let prefix = KeyMatch {
+            code: CtKeyCode::Char('a'),
+            ctrl: true,
+            shift: false,
+        };
+        let mut expected = KeyTable::default();
+        expected.set_prefix(prefix);
+        assert_eq!(t.root, expected.root);
+        assert_eq!(t.prefix, prefix);
     }
 }

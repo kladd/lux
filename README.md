@@ -6,7 +6,8 @@ differentiating features so far.
 - Window management: Lux sessions are similar to tmux sessions, but windows and
   panes are different. In Lux the layout is independent of active windows/panes.
   Each window has its own tabs. Cycling tabs does not disturb the layout.
-- Agents: Lux detects Claude Code and reports its status in the tab bar: working, idle, done, blocked.
+- Agents: Lux detects Claude Code, Codex, and Kiro CLI and reports their
+  status in the tab bar: working, idle, done, blocked.
 - vim/helix style: prefix+`:` opens a command line with autocomplete, and
   commands like `:vs`/`:sp` mirror vim's split bindings.
 
@@ -56,6 +57,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `=` | rebalance every split to an even ratio |
 | `z` | maximize/zoom the focused window |
 | `o` | close every split but the focused one |
+| `w` | close the active tab |
 | `x` | close the focused window |
 | `,` | rename the active tab |
 | `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit) |
@@ -65,6 +67,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `f` | open the fuzzy tab finder |
 | `Tab` | jump to the next agent tab that is done or blocked, across every session (wraps) |
 | `:` | open the ex command line |
+| the prefix key again | send a literal prefix keypress to the tab (tap again within 500ms to send another) |
 
 Arrow keys work as alternates for `h`/`j`/`k`/`l` (and Shift-arrows for
 `H`/`J`/`K`/`L`).
@@ -87,7 +90,7 @@ Ex commands (typed after `:`, with autocomplete):
 
 Prefix+`s` opens the session switcher: a list of sessions with a live
 preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
-`Ctrl-n`/`Ctrl-p`; `Enter` attaches, `Esc` cancels.
+`Ctrl-n`/`Ctrl-p`; `Enter` (or clicking an entry) attaches, `Esc` cancels.
 
 Prefix+`f` opens the fuzzy tab finder: a popover floating over your
 session that lists every tab across every session, narrowing as you type

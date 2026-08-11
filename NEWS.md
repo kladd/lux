@@ -1,5 +1,15 @@
 # News
 
+## 2026-08-11
+
+- Kiro CLI support
+- Fixed a false blocked state when a typed Claude Code message starts
+  with "1."
+- `prefix+prefix` forwards a literal prefix key press to the focused
+  tab, repeating on a quick second tap.
+- `prefix+w` closes the focused window's active tab.
+- Switcher entries can be selected by mouse click.
+
 ## 2026-08-02
 
 - New config-gated auto mode (`automode = true`): the CLAUDECOM entry points

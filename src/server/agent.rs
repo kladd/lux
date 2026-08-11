@@ -30,6 +30,7 @@ pub enum AgentState {
 pub enum AgentKind {
     Claude,
     Codex,
+    Kiro,
 }
 
 /// The evidence a rule matches against: the tab's
@@ -143,14 +144,22 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
                 ..Default::default()
             },
         },
-        // Any interactive prompt renders a numbered option list with a ❯
-        // selector regardless of wording — AskUserQuestion, trust
-        // dialogs, permission variants.
+        // A numbered option list with a ❯ selector, plus the companion
+        // evidence (a second option or an esc hint) that distinguishes a
+        // real prompt from typed input after the input box's selector.
         Rule {
             state: AgentState::Blocked,
             priority: 890,
             source: Source::Screen,
-            gate: regex(&["❯\\s*1\\."]),
+            gate: Gate {
+                regex: vec![Regex::new("(?m)^\\s*❯\\s*\\d+\\.").expect("valid rule regex")],
+                any: vec![
+                    regex(&["(?m)^\\s*\\d+\\."]),
+                    contains(&["esc to interrupt"]),
+                    contains(&["esc to cancel"]),
+                ],
+                ..Default::default()
+            },
         },
         // The CLI animates a Braille spinner into the window title while
         // it runs.
@@ -218,6 +227,68 @@ static CODEX_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     ]
 });
 
+/// The hardcoded Kiro CLI rule set: screen-content rules only, no OSC
+/// title or progress signals.
+static KIRO_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+    vec![
+        // The tool-approval prompt.
+        Rule {
+            state: AgentState::Blocked,
+            priority: 300,
+            source: Source::Screen,
+            gate: Gate {
+                contains: vec!["requires approval"],
+                any: vec![
+                    contains(&["yes, single permission"]),
+                    contains(&["trust, always allow"]),
+                    contains(&["no (tab to edit)"]),
+                    contains(&["esc to close"]),
+                ],
+                ..Default::default()
+            },
+        },
+        // The subagent-approval prompt.
+        Rule {
+            state: AgentState::Blocked,
+            priority: 290,
+            source: Source::Screen,
+            gate: Gate {
+                contains: vec!["pending from subagents"],
+                any: vec![contains(&["tool approval"]), contains(&["tool approvals"])],
+                all: vec![Gate {
+                    any: vec![
+                        contains(&["approve all pending"]),
+                        contains(&["configure individually"]),
+                        contains(&["exit (cancel subagents)"]),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        },
+        // The working banner.
+        Rule {
+            state: AgentState::Working,
+            priority: 100,
+            source: Source::Screen,
+            gate: contains(&["kiro is working"]),
+        },
+        // A running tool's spinner line with its cancel hint.
+        Rule {
+            state: AgentState::Working,
+            priority: 90,
+            source: Source::Screen,
+            gate: Gate {
+                contains: vec!["esc to cancel"],
+                regex: vec![
+                    Regex::new(r"(?m)^\s*[◔◑◕●]\s+\p{Alphabetic}").expect("valid rule regex"),
+                ],
+                ..Default::default()
+            },
+        },
+    ]
+});
+
 /// Evaluate every rule in the agent's rule set; the highest-priority
 /// match wins, ties favoring the earliest declared. No match at all
 /// means idle.
@@ -225,6 +296,7 @@ pub fn evaluate(kind: AgentKind, snapshot: &Snapshot) -> AgentState {
     let rules = match kind {
         AgentKind::Claude => &CLAUDE_RULES,
         AgentKind::Codex => &CODEX_RULES,
+        AgentKind::Kiro => &KIRO_RULES,
     };
     let mut best: Option<&Rule> = None;
     for rule in rules.iter() {
@@ -475,6 +547,72 @@ mod tests {
         // A numbered list without the selector is ordinary output.
         let s = snap("1. serde\n2. nanoserde\n", "claude", "none");
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn typed_numbered_input_is_not_blocked() {
+        // A bare selector line is typed input; with an esc hint it is a
+        // real prompt.
+        let s = snap("❯ 1. do the first thing\n", "claude", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        let s = snap("❯ 1. Yes\n(esc to cancel)\n", "claude", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
+    }
+
+    #[test]
+    fn kiro_approval_prompts_are_blocked() {
+        let s = snap(
+            "Shell command requires approval\n❯ 1. Yes, single permission\n  \
+             2. Trust, always allow\n  3. No (tab to edit)\n",
+            "kiro",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Blocked);
+        let s = snap(
+            "2 tool approvals pending from subagents\n❯ Approve all pending\n  \
+             Configure individually\n  Exit (cancel subagents)\n",
+            "kiro",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Blocked);
+        // The banner without any companion option is not enough.
+        let s = snap("this tool requires approval\n", "kiro", "none");
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn kiro_working_evidence_is_working() {
+        let s = snap("Kiro is working on your request\n", "kiro", "none");
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Working);
+        let s = snap("◔ Running shell command (esc to cancel)\n", "kiro", "none");
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Working);
+        // The cancel hint without a spinner line is not enough.
+        let s = snap("press esc to cancel\n", "kiro", "none");
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Idle);
+        // Blocked outranks working evidence on the same screen.
+        let s = snap(
+            "◑ Editing file (esc to cancel)\nrequires approval\nesc to close\n",
+            "kiro",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Blocked);
+    }
+
+    #[test]
+    fn kiro_no_evidence_is_idle() {
+        assert_eq!(
+            evaluate(AgentKind::Kiro, &snap("$ ls\nfoo bar\n", "kiro", "none")),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn kiro_rules_do_not_leak_across_agents() {
+        let s = snap("(esc to interrupt)\n", "⠹ claude", "none");
+        assert_eq!(evaluate(AgentKind::Kiro, &s), AgentState::Idle);
+        let s = snap("Kiro is working\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Idle);
     }
 
     #[test]

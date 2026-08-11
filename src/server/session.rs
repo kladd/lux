@@ -48,6 +48,10 @@ const RESIZE_REPEAT: Duration = Duration::from_millis(500);
 /// dispatch, matching the resize submap's timing.
 const MOVE_REPEAT: Duration = Duration::from_millis(500);
 
+/// The send-prefix repeat deadline; restarted on each repeated
+/// dispatch, matching the resize submap's timing.
+const SEND_PREFIX_REPEAT: Duration = Duration::from_millis(500);
+
 /// A session-level consequence the server must act on; everything else is
 /// handled inside the session.
 pub enum Effect {
@@ -347,6 +351,9 @@ pub struct Session {
     /// a bare `H`/`J`/`K`/`L` moves the tab again without the prefix;
     /// elapsing (or any other key) closes the window.
     move_repeat: Option<Instant>,
+    /// The send-prefix repeat deadline: a bare prefix press before it
+    /// elapses forwards again.
+    send_prefix_repeat: Option<Instant>,
     /// The maximized window, rendered over the whole layout area while
     /// set. Purely a view state: the layout tree is untouched, focus
     /// leaving the window clears it, and it is never persisted.
@@ -399,6 +406,7 @@ impl Session {
             chord: None,
             resize_repeat: None,
             move_repeat: None,
+            send_prefix_repeat: None,
             maximized: None,
             minimized: Vec::new(),
             hover: None,
@@ -467,6 +475,7 @@ impl Session {
             chord: None,
             resize_repeat: None,
             move_repeat: None,
+            send_prefix_repeat: None,
             maximized: None,
             minimized: Vec::new(),
             hover: None,
@@ -605,16 +614,18 @@ impl Session {
             .any(|w| w.tabs.iter().any(|t| t.agent_pending_idle()))
     }
 
-    /// Whether a repeat deadline (resize submap or move-tab) is armed.
-    /// The server wakes on a timer while one is, so the deadline can
-    /// close its repeat window.
+    /// Whether a repeat deadline (resize submap, move-tab, or
+    /// send-prefix) is armed. The server wakes on a timer while one is,
+    /// so the deadline can close its repeat window.
     pub fn has_pending_repeat(&self) -> bool {
-        self.resize_repeat.is_some() || self.move_repeat.is_some()
+        self.resize_repeat.is_some()
+            || self.move_repeat.is_some()
+            || self.send_prefix_repeat.is_some()
     }
 
     /// Close repeat windows whose deadline elapsed with no keypress: the
-    /// resize submap (requiring prefix+r again) and the move-tab window
-    /// (requiring the prefix again).
+    /// resize submap (requiring prefix+r again) and the move-tab and
+    /// send-prefix windows (each requiring the prefix again).
     pub fn tick_repeats(&mut self, now: Instant) {
         if self.resize_repeat.is_some_and(|deadline| now >= deadline) {
             self.resize_repeat = None;
@@ -623,6 +634,12 @@ impl Session {
         }
         if self.move_repeat.is_some_and(|deadline| now >= deadline) {
             self.move_repeat = None;
+        }
+        if self
+            .send_prefix_repeat
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.send_prefix_repeat = None;
         }
     }
 
@@ -871,6 +888,11 @@ impl Session {
             }
             return None;
         }
+        // While the send-prefix window is armed, a bare prefix press
+        // forwards again; any other key closes it and is handled normally.
+        if self.send_prefix_repeat.take().is_some() && self.keys.is_prefix(key) {
+            return self.execute(Command::SendPrefix);
+        }
         // The prefix key (Ctrl-b by default, config
         // may override it) arms the prefix instead of
         // reaching the focused window's PTY.
@@ -919,6 +941,24 @@ impl Session {
             let _ = win.active_tab_mut().engine.key_down(code, mods);
         }
         None
+    }
+
+    /// Write the prefix key's encoded bytes to the focused window's
+    /// active tab's PTY.
+    fn write_prefix_key(&mut self) {
+        let prefix = self.keys.prefix;
+        let mut mods = CtMods::NONE;
+        if prefix.ctrl {
+            mods |= CtMods::CONTROL;
+        }
+        if prefix.shift {
+            mods |= CtMods::SHIFT;
+        }
+        if let Some((code, mods)) = map_key(KeyEvent::new(prefix.code, mods))
+            && let Some(win) = self.windows.get_mut(&self.focus)
+        {
+            let _ = win.active_tab_mut().engine.key_down(code, mods);
+        }
     }
 
     /// Write text to the focused window's active tab's PTY, honoring
@@ -1282,8 +1322,21 @@ impl Session {
                 let name = self.windows[&self.focus].active_tab().name.clone();
                 self.open_prompt(PromptKind::Rename, name);
             }
+            // Prefix+w terminates the active tab's process; exit-driven
+            // removal takes it from there.
+            Command::CloseTab => {
+                if let Some(win) = self.windows.get_mut(&self.focus) {
+                    win.active_tab_mut().kill();
+                }
+            }
             // Prefix+x closes the focused window outright.
             Command::CloseWindow => self.close_window(),
+            // Prefix+prefix forwards a literal prefix key press, arming
+            // the repeat window.
+            Command::SendPrefix => {
+                self.write_prefix_key();
+                self.send_prefix_repeat = Some(Instant::now() + SEND_PREFIX_REPEAT);
+            }
             // Prefix+[ enters scroll mode.
             Command::ScrollMode => {
                 if let Some(win) = self.windows.get_mut(&self.focus) {

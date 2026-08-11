@@ -48,8 +48,13 @@ pub enum Command {
     Rebalance,
     /// Open the rename prompt for the focused window's active tab.
     RenameTab,
+    /// Terminate the focused window's active tab.
+    CloseTab,
     /// Terminate every tab in the focused window.
     CloseWindow,
+    /// Write one literal press of the prefix key to the focused window's
+    /// PTY.
+    SendPrefix,
     /// Jump to the next agent tab in the done or blocked state, across
     /// every session, wrapping.
     CycleAgent,
@@ -96,7 +101,9 @@ impl Command {
             Command::Rotate => "rotate split",
             Command::Rebalance => "rebalance splits",
             Command::RenameTab => "rename tab",
+            Command::CloseTab => "close tab",
             Command::CloseWindow => "close window",
+            Command::SendPrefix => "send prefix key",
             Command::CycleAgent => "next agent needing attention",
         }
     }
@@ -261,6 +268,9 @@ impl Default for KeyTable {
             )
         }
         let mut bindings = vec![
+            // First, so send-prefix wins any same-key collision with a
+            // configured prefix.
+            (DEFAULT_PREFIX, KeyTrie::Command(Command::SendPrefix)),
             cmd('%', Command::SplitSideBySide),
             cmd('"', Command::SplitStacked),
             cmd('c', Command::NewTab),
@@ -304,6 +314,7 @@ impl Default for KeyTable {
             // `=` evokes making the splits equal.
             cmd('=', Command::Rebalance),
             cmd(',', Command::RenameTab),
+            cmd('w', Command::CloseTab),
             cmd('x', Command::CloseWindow),
             // Prefix+m enters the swap submap; the direction key picks
             // the spatially adjacent window the focused window trades
@@ -360,6 +371,17 @@ impl KeyTable {
     /// Whether `key` is the prefix key.
     pub fn is_prefix(&self, key: KeyEvent) -> bool {
         KeyMatch::from_event(key) == self.prefix
+    }
+
+    /// Change the prefix key, rebinding its send-prefix root binding to
+    /// match.
+    pub fn set_prefix(&mut self, prefix: KeyMatch) {
+        for (key, trie) in &mut self.root.bindings {
+            if *trie == KeyTrie::Command(Command::SendPrefix) {
+                *key = prefix;
+            }
+        }
+        self.prefix = prefix;
     }
 
     /// The node a pending chord's accumulated keys lead to, walking from
@@ -580,6 +602,41 @@ mod tests {
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('x'), KeyModifiers::NONE)),
             Some(Command::CloseWindow)
+        );
+    }
+
+    #[test]
+    fn close_tab_is_bound_to_w() {
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(Command::CloseTab)
+        );
+    }
+
+    #[test]
+    fn send_prefix_is_bound_to_the_prefix_key() {
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Some(Command::SendPrefix)
+        );
+        // The binding follows a configured prefix.
+        let mut table = KeyTable::default();
+        let prefix = KeyMatch {
+            code: CtKeyCode::Char('a'),
+            ctrl: true,
+            shift: false,
+        };
+        table.set_prefix(prefix);
+        assert_eq!(table.prefix, prefix);
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Some(Command::SendPrefix)
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('b'), KeyModifiers::CONTROL)),
+            None
         );
     }
 

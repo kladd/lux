@@ -217,6 +217,13 @@ impl Foreground {
         self.comm == "codex" || self.arg0 == "codex"
     }
 
+    /// The foreground command name must be `kiro` or `kiro-cli`,
+    /// under either reading.
+    fn is_kiro(&self) -> bool {
+        ["kiro", "kiro-cli"].contains(&self.comm.as_str())
+            || ["kiro", "kiro-cli"].contains(&self.arg0.as_str())
+    }
+
     /// The tab's display name: argv[0]'s basename, with
     /// comm covering processes that rewrite their argv.
     fn display_name(&self) -> &str {
@@ -437,6 +444,7 @@ impl Tab {
         let kind = match fg.as_ref() {
             Some(fg) if fg.is_claude() => Some(agent::AgentKind::Claude),
             Some(fg) if fg.is_codex() => Some(agent::AgentKind::Codex),
+            Some(fg) if fg.is_kiro() => Some(agent::AgentKind::Kiro),
             _ => None,
         };
         let Some(kind) = kind else {
@@ -459,9 +467,9 @@ impl Tab {
                     self.claude_since = Some(std::time::SystemTime::now());
                 }
             }
-            // Session identity stays Claude Code-only; a Codex sighting
-            // is as definite a non-claude sighting as a plain shell.
-            agent::AgentKind::Codex => {
+            // Session identity stays Claude Code-only; another agent is
+            // as definite a non-claude sighting as a plain shell.
+            agent::AgentKind::Codex | agent::AgentKind::Kiro => {
                 self.claude_session = None;
                 self.claude_since = None;
             }

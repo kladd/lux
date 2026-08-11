@@ -35,6 +35,7 @@ use ratatui::Terminal;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers as CtMods,
+    MouseButton as CtMouseButton, MouseEventKind as CtMouseKind,
 };
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -849,8 +850,20 @@ impl Server {
     }
 
     fn switcher_input(&mut self, conn: ConnId, event: &DecodedInput) {
-        let DecodedInput::Key(key) = event else {
-            return;
+        let key = match event {
+            DecodedInput::Key(key) => key,
+            DecodedInput::Mouse(mouse) => {
+                if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Left))
+                    && let Some(index) = self.switcher_entry_at(conn, mouse.column, mouse.row)
+                {
+                    if let Some(client) = self.clients.get_mut(&conn) {
+                        client.switcher = Some(index);
+                    }
+                    self.switcher_select(conn, index);
+                }
+                return;
+            }
+            DecodedInput::Paste(_) => return,
         };
         let pinned = self.pinned_entries();
         let count = pinned + self.sessions.len();
@@ -897,48 +910,65 @@ impl Server {
                     session.request_redraw();
                 }
             }
-            // Re-attach the connection to the selection; the pinned
-            // CLAUDECOM entry opens its grid (or auto mode) instead of
-            // any session. Landing on a session leaves auto mode — the
-            // user navigated away from what it was presenting.
-            CtKeyCode::Enter => {
-                client.switcher = None;
-                if highlight < pinned {
-                    if self.auto_enabled {
-                        self.begin_auto(conn);
-                    } else {
-                        client.grid = Some(GridState::default());
-                    }
-                    return;
-                }
-                client.auto = None;
-                let Some(&target) = self.sessions.keys().nth(highlight - pinned) else {
-                    return;
-                };
-                let current = client.attached;
-                let size = term::fd_size(&client.raw_out);
-                if target != current {
-                    // Exclusive attachment.
-                    if let Some(other) = self
-                        .clients
-                        .iter()
-                        .find(|(c, cl)| **c != conn && cl.attached == target)
-                        .map(|(conn, _)| *conn)
-                    {
-                        self.detach(other);
-                    }
-                    if let Some(client) = self.clients.get_mut(&conn) {
-                        client.attached = target;
-                    }
-                }
-                self.note_attached(target);
-                if let Some(session) = self.sessions.get_mut(&target) {
-                    session.set_area(Rect::new(0, 0, size.width, size.height));
-                    session.request_redraw();
-                }
-            }
+            CtKeyCode::Enter => self.switcher_select(conn, highlight),
             _ => {}
         }
+    }
+
+    /// Leave switcher mode and act on the entry at `highlight`: the
+    /// pinned CLAUDECOM entry opens its grid (or auto mode), a session
+    /// entry re-attaches the connection.
+    fn switcher_select(&mut self, conn: ConnId, highlight: usize) {
+        let pinned = self.pinned_entries();
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        client.switcher = None;
+        if highlight < pinned {
+            if self.auto_enabled {
+                self.begin_auto(conn);
+            } else {
+                client.grid = Some(GridState::default());
+            }
+            return;
+        }
+        client.auto = None;
+        let Some(&target) = self.sessions.keys().nth(highlight - pinned) else {
+            return;
+        };
+        let current = client.attached;
+        let size = term::fd_size(&client.raw_out);
+        if target != current {
+            // Exclusive attachment.
+            if let Some(other) = self
+                .clients
+                .iter()
+                .find(|(c, cl)| **c != conn && cl.attached == target)
+                .map(|(conn, _)| *conn)
+            {
+                self.detach(other);
+            }
+            if let Some(client) = self.clients.get_mut(&conn) {
+                client.attached = target;
+            }
+        }
+        self.note_attached(target);
+        if let Some(session) = self.sessions.get_mut(&target) {
+            session.set_area(Rect::new(0, 0, size.width, size.height));
+            session.request_redraw();
+        }
+    }
+
+    /// The switcher list entry at a clicked screen position, if any.
+    fn switcher_entry_at(&self, conn: ConnId, column: u16, row: u16) -> Option<usize> {
+        let count = self.pinned_entries() + self.sessions.len();
+        let client = self.clients.get(&conn)?;
+        let size = term::fd_size(&client.raw_out);
+        if column >= SWITCHER_LIST_WIDTH.min(size.width) || row < 1 {
+            return None;
+        }
+        let index = (row - 1) as usize;
+        (index < count).then_some(index)
     }
 
     /// Input while the fuzzy tab finder is open: Ctrl-p/Up and Ctrl-n/Down
@@ -1613,6 +1643,9 @@ fn render_grid(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>)
     });
 }
 
+/// Width of the switcher's session-list column.
+const SWITCHER_LIST_WIDTH: u16 = 28;
+
 /// The switcher frame: session list on the left — the pinned CLAUDECOM
 /// entry first while any agent tab exists — and a live
 /// preview of the highlighted entry on the right.
@@ -1639,7 +1672,7 @@ fn render_switcher(
         let area = frame.area();
         let buf = frame.buffer_mut();
         clear_region(buf, area);
-        let list_w = 28.min(area.width);
+        let list_w = SWITCHER_LIST_WIDTH.min(area.width);
         for (i, name) in names.iter().enumerate() {
             let y = area.y + 1 + i as u16;
             if y >= area.bottom() {
