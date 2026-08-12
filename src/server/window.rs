@@ -257,13 +257,14 @@ pub struct Tab {
     /// Present while the tab is identified as running a detected agent.
     pub agent: Option<Tracker>,
     /// The Claude Code session id this tab's claude instance owns:
-    /// seeded when the tab was spawned as a resume (Claude Code keeps
-    /// the id across resumes), or assigned at save time by matching
-    /// transcript creation times. Cleared when claude exits.
+    /// seeded when the tab was spawned as a resume, refreshed at save
+    /// time from the instance's own session file. Cleared when claude
+    /// exits.
     pub claude_session: Option<String>,
-    /// When this tab was first seen running Claude Code; the matching
-    /// anchor for transcripts. Cleared when claude exits.
-    pub claude_since: Option<std::time::SystemTime>,
+    /// Whether the tab is currently identified as running Claude Code.
+    /// Held across unreadable-foreground flicker (e.g. mid-exec);
+    /// cleared on a definite non-claude sighting.
+    pub running_claude: bool,
     /// The latest OSC 9 system-notification text the tab's program wrote,
     /// shared with the engine's alert handler. Taken (once) when a desktop
     /// notification is raised, so a later notification without a fresh
@@ -296,8 +297,8 @@ impl Tab {
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
         let mut tab = Self::spawn_argv(rect, cwd, &["claude", "--resume", session], tx)?;
-        // The resumed instance keeps this id, so the tab's owner is known
-        // without transcript matching.
+        // Seed the reference; the save-time refresh takes over once the
+        // resumed instance's session file appears.
         tab.claude_session = Some(session.to_string());
         Ok(tab)
     }
@@ -379,7 +380,7 @@ impl Tab {
             scroll_top: None,
             agent: None,
             claude_session: None,
-            claude_since: None,
+            running_claude: false,
             notify_text,
             master: pair.master,
             child,
@@ -455,23 +456,17 @@ impl Tab {
             // mid-exec) is transient and must not wipe it.
             if fg.is_some() {
                 self.claude_session = None;
-                self.claude_since = None;
+                self.running_claude = false;
             }
             return (self.agent.take().is_some() || renamed, None);
         };
         match kind {
-            // First sighting of this claude instance; kept across tracker
-            // flicker so the transcript-matching anchor doesn't drift.
-            agent::AgentKind::Claude => {
-                if self.claude_since.is_none() {
-                    self.claude_since = Some(std::time::SystemTime::now());
-                }
-            }
+            agent::AgentKind::Claude => self.running_claude = true,
             // Session identity stays Claude Code-only; another agent is
             // as definite a non-claude sighting as a plain shell.
             agent::AgentKind::Codex | agent::AgentKind::Kiro => {
                 self.claude_session = None;
-                self.claude_since = None;
+                self.running_claude = false;
             }
         }
         // A tracker left over from the other agent belongs to a process
@@ -520,23 +515,38 @@ impl Tab {
         })
     }
 
-    /// The Claude session name from `~/.claude/sessions/<pid>.json`, written
-    /// by a running Claude Code instance. Returns `None` if the file doesn't
-    /// exist yet, the pid is unreadable, or the name is auto-derived.
-    fn claude_session_name(&self) -> Option<String> {
+    /// The parsed `~/.claude/sessions/<pid>.json` a running Claude Code
+    /// instance maintains for the tab's foreground process. `None` if
+    /// the file doesn't exist yet or the pid is unreadable.
+    fn claude_session_file(&self) -> Option<serde_json::Value> {
         let pid = self.master.process_group_leader()?;
         let home = std::env::var_os("HOME")?;
         let path = std::path::PathBuf::from(home)
             .join(".claude/sessions")
             .join(format!("{pid}.json"));
         let text = std::fs::read_to_string(path).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// The Claude session name from the tab's session file.
+    /// Returns `None` when the name is auto-derived.
+    fn claude_session_name(&self) -> Option<String> {
+        let json = self.claude_session_file()?;
         // Skip auto-generated names; absent field means user-set.
         if json["nameSource"].as_str() == Some("derived") {
             return None;
         }
         let name = json["name"].as_str()?;
         (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// The current Claude Code session id from the tab's session file,
+    /// tracking id changes (e.g. `/clear`) within one process.
+    pub fn claude_session_id(&self) -> Option<String> {
+        let id = self.claude_session_file()?["sessionId"]
+            .as_str()?
+            .to_string();
+        (!id.is_empty()).then_some(id)
     }
 
     /// The foreground process's working directory, via the

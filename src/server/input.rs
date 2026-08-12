@@ -19,6 +19,14 @@ pub enum DecodedInput {
     Paste(String),
 }
 
+/// The part of pasted text a single-line prompt can take: everything
+/// before the first line break or other control character, since a
+/// literally inserted line break would submit mid-paste.
+pub fn prompt_paste(text: &str) -> &str {
+    let end = text.find(char::is_control).unwrap_or(text.len());
+    &text[..end]
+}
+
 pub struct InputDecoder {
     parser: InputParser,
     /// Buttons held as of the previous mouse event, to derive
@@ -364,6 +372,15 @@ mod tests {
         let mut d = InputDecoder::default();
         let evs = d.decode(b"\x1b[200~one\ntwo\x1b[201~");
         assert_eq!(paste_of(&evs), "one\ntwo");
+    }
+
+    #[test]
+    fn prompt_paste_stops_at_the_first_control_character() {
+        assert_eq!(prompt_paste("plain text"), "plain text");
+        assert_eq!(prompt_paste("first\nsecond"), "first");
+        assert_eq!(prompt_paste("tab\there"), "tab");
+        assert_eq!(prompt_paste("\nleading"), "");
+        assert_eq!(prompt_paste(""), "");
     }
 
     #[test]

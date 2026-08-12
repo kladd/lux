@@ -1,5 +1,10 @@
 # News
 
+## 2026-08-12
+
+- Improvements to session resume
+- Allow clipboard paste in text prompts
+
 ## 2026-08-11
 
 - A status-line menu icon toggles the session switcher.

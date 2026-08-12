@@ -29,6 +29,7 @@ use tui_textarea::TextArea;
 use crate::server::agent;
 use crate::server::anim::{self, Anim};
 use crate::server::ex::{self, ExCommand};
+use crate::server::input;
 use crate::server::keys::{Command, KeyMatch, KeyTable, KeyTrie};
 use crate::server::layout::{self, Dir, Node, Separator, Side, SplitKind, WindowId};
 use crate::server::persist;
@@ -498,7 +499,7 @@ impl Session {
     /// and — for tabs identified as running Claude Code — a session
     /// reference to resume it by.
     pub fn snapshot(&mut self) -> persist::SessionSnapshot {
-        self.assign_claude_sessions();
+        self.refresh_claude_sessions();
         let windows = layout::leaves(&self.tree)
             .into_iter()
             .filter_map(|id| {
@@ -535,44 +536,20 @@ impl Session {
         }
     }
 
-    /// Give every Claude Code tab that doesn't yet know its session id a
-    /// distinct one, by matching each project directory's transcripts
-    /// (by creation time) against when each tab was first seen running
-    /// claude. Ids already owned — resumed tabs, earlier matches — are
-    /// never taken, so concurrent claude tabs in the same directory keep
-    /// distinct sessions instead of all saving the newest one. An
-    /// assignment sticks until that tab's claude exits.
-    fn assign_claude_sessions(&mut self) {
-        let mut claimed: std::collections::HashSet<String> = self
-            .windows
-            .values()
-            .flat_map(|w| w.tabs.iter().filter_map(|t| t.claude_session.clone()))
-            .collect();
-        // Unassigned claude tabs grouped by working directory, in
-        // first-seen order within each group.
-        let mut groups: std::collections::HashMap<
-            std::path::PathBuf,
-            Vec<(WindowId, usize, std::time::SystemTime)>,
-        > = std::collections::HashMap::new();
-        for (&wid, win) in &self.windows {
-            for (idx, tab) in win.tabs.iter().enumerate() {
-                if tab.agent.is_none() || tab.claude_session.is_some() {
+    /// Refresh every Claude Code tab's session reference from the
+    /// session file its instance maintains, re-read per save so the
+    /// reference tracks the live session across `/clear`. A tab with no
+    /// readable file keeps the reference it already holds: the file
+    /// appears shortly after startup, and a restored tab holds the id it
+    /// was resumed with.
+    fn refresh_claude_sessions(&mut self) {
+        for win in self.windows.values_mut() {
+            for tab in win.tabs.iter_mut() {
+                if !tab.running_claude {
                     continue;
                 }
-                let (Some(since), Some(cwd)) = (tab.claude_since, tab.working_dir()) else {
-                    continue;
-                };
-                groups.entry(cwd).or_default().push((wid, idx, since));
-            }
-        }
-        for (cwd, mut tabs) in groups {
-            tabs.sort_by_key(|&(_, _, since)| since);
-            let transcripts = persist::claude_sessions(&cwd);
-            let since: Vec<std::time::SystemTime> = tabs.iter().map(|&(_, _, s)| s).collect();
-            let ids = persist::match_claude_sessions(&since, &transcripts, &mut claimed);
-            for (&(wid, idx, _), id) in tabs.iter().zip(ids) {
-                if let Some(win) = self.windows.get_mut(&wid) {
-                    win.tabs[idx].claude_session = id;
+                if let Some(id) = tab.claude_session_id() {
+                    tab.claude_session = Some(id);
                 }
             }
         }
@@ -961,10 +938,18 @@ impl Session {
         }
     }
 
-    /// Write text to the focused window's active tab's PTY, honoring
-    /// bracketed paste, including client-initiated pastes.
+    /// Deliver pasted text: into the open prompt at its cursor if one is
+    /// open, otherwise to the focused window's active tab's PTY,
+    /// honoring bracketed paste. Covers both terminal-level and
+    /// right-click pastes, so the two paths never disagree about their
+    /// destination.
     pub fn paste_text(&mut self, text: &str) {
         if text.is_empty() {
+            return;
+        }
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.textarea.insert_str(input::prompt_paste(text));
+            self.force_redraw = true;
             return;
         }
         if let Some(win) = self.windows.get_mut(&self.focus) {

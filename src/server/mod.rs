@@ -83,6 +83,8 @@ pub enum ServerEvent {
     InputIdle(ConnId),
     /// A tab's program set the clipboard via OSC 52.
     ProgramCopy(TabId, String),
+    /// SIGTERM or SIGHUP: persist and exit.
+    Shutdown,
 }
 
 /// Where a captured grid tab's prefix command sent the connection, when
@@ -154,6 +156,21 @@ pub fn run() -> i32 {
             thread::spawn(move || connection_thread(conn, stream, tx));
         }
     });
+
+    // Logout, reboot, and service teardown terminate the server by
+    // signal rather than through kill-server; persist before exiting
+    // instead of losing the last debounce window's changes.
+    let signal_tx = tx.clone();
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ]) {
+        thread::spawn(move || {
+            if signals.forever().next().is_some() {
+                let _ = signal_tx.send(ServerEvent::Shutdown);
+            }
+        });
+    }
 
     let mut server = Server {
         sessions: BTreeMap::new(),
@@ -377,6 +394,18 @@ impl Server {
         }
     }
 
+    /// The system clipboard's current text. A connection dropped or
+    /// never acquired is re-established first: acquisition at server
+    /// startup can fail in an environment where a later attempt would
+    /// succeed, and the daemonized server outlives the one it started
+    /// in.
+    fn clipboard_text(&mut self) -> Option<String> {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        self.clipboard.as_mut().and_then(|c| c.get_text().ok())
+    }
+
     /// Arm the automatic save; the debounce coalesces event bursts into
     /// one write.
     fn mark_dirty(&mut self) {
@@ -445,7 +474,8 @@ impl Server {
             | ServerEvent::KillSession(..)
             | ServerEvent::Resized(_)
             | ServerEvent::ConnGone(_)
-            | ServerEvent::ProgramCopy(..) => {}
+            | ServerEvent::ProgramCopy(..)
+            | ServerEvent::Shutdown => {}
         }
         match event {
             ServerEvent::PtyOutput(tab, bytes) => {
@@ -544,6 +574,17 @@ impl Server {
                 for client in self.clients.values_mut().filter(|c| c.attached == sid) {
                     osc52_copy(&mut client.raw_out, &text);
                 }
+            }
+            // Terminated by signal: the same save-and-exit as
+            // kill-server, minus the requesting connection.
+            ServerEvent::Shutdown => {
+                self.save_sessions();
+                let conns: Vec<ConnId> = self.clients.keys().copied().collect();
+                for conn in conns {
+                    self.detach(conn);
+                }
+                let _ = std::fs::remove_file(protocol::socket_path());
+                std::process::exit(0);
             }
         }
     }
@@ -693,6 +734,10 @@ impl Server {
     /// client's connection with it.
     fn end_session(&mut self, sid: SessionId) {
         self.sessions.remove(&sid);
+        // A removal changes persisted state like any other structural
+        // change; without this, a CLI kill-session only sticks if some
+        // unrelated event saves before the server exits.
+        self.mark_dirty();
         if let Some(&conn) = self
             .clients
             .iter()
@@ -821,7 +866,7 @@ impl Server {
             }
             // Paste the system clipboard's current text.
             Effect::Paste => {
-                let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) else {
+                let Some(text) = self.clipboard_text() else {
                     return;
                 };
                 if let Some(session) = self.sessions.get_mut(&sid) {
@@ -996,8 +1041,23 @@ impl Server {
     /// session the connection is attached to, and every other key edits
     /// the query, re-narrowing the matched list.
     fn finder_input(&mut self, conn: ConnId, event: &DecodedInput) {
-        let DecodedInput::Key(key) = event else {
-            return;
+        let key = match event {
+            DecodedInput::Key(key) => key,
+            // A bracketed paste from the client's terminal belongs to
+            // the query, not to any tab.
+            DecodedInput::Paste(text) => {
+                self.finder_paste(conn, text.clone());
+                return;
+            }
+            // So does a right-click paste of the system clipboard.
+            DecodedInput::Mouse(mouse) => {
+                if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Right))
+                    && let Some(text) = self.clipboard_text()
+                {
+                    self.finder_paste(conn, text);
+                }
+                return;
+            }
         };
         if key.kind == KeyEventKind::Release {
             return;
@@ -1058,6 +1118,26 @@ impl Server {
                     .unwrap_or(0);
             }
         }
+    }
+
+    /// Insert pasted text into the finder query at its cursor; the
+    /// highlight follows the re-narrowed list as for typed edits.
+    fn finder_paste(&mut self, conn: ConnId, text: String) {
+        let items = find::items(&self.sessions);
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        let Some(state) = client.finder.as_mut() else {
+            return;
+        };
+        let matched = find::matches(&items, &state.query());
+        let highlight = state.highlight.min(matched.len().saturating_sub(1));
+        let followed = matched.get(highlight).map(|&i| items[i].id);
+        state.textarea.insert_str(input::prompt_paste(&text));
+        let matched = find::matches(&items, &state.query());
+        state.highlight = followed
+            .and_then(|id| matched.iter().position(|&i| items[i].id == id))
+            .unwrap_or(0);
     }
 
     /// Session ids in name order — the CLAUDECOM grid's session order.
