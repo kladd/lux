@@ -1,5 +1,10 @@
 # News
 
+## 2026-08-13
+
+- CLI verbs resolve like tmux: full names, aliases, and unambiguous
+  prefixes (e.g. `att`, `new-s`, `list-sessions`).
+
 ## 2026-08-12
 
 - Improvements to session resume
