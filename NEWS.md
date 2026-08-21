@@ -1,5 +1,11 @@
 # News
 
+## 2026-08-20
+
+- Fixed Claude Code working detection on 2.1.228+: the new title
+  spinner, the on-screen spinner line, and background shells/agents
+  now all count as working.
+
 ## 2026-08-13
 
 - CLI verbs resolve like tmux: full names, aliases, and unambiguous

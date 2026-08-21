@@ -161,13 +161,14 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
                 ..Default::default()
             },
         },
-        // The CLI animates a Braille spinner into the window title while
-        // it runs.
+        // The CLI animates a spinner into the window title while it
+        // runs: Braille frames on older versions, half-circle frames
+        // from 2.1.228 on.
         Rule {
             state: AgentState::Working,
             priority: 850,
             source: Source::OscTitle,
-            gate: regex(&["^[\u{2800}-\u{28FF}]"]),
+            gate: regex(&["^[\u{2800}-\u{28FF}\u{25D0}-\u{25D3}]"]),
         },
         // OSC 9;4 progress present in any form means active work.
         Rule {
@@ -186,6 +187,33 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             priority: 800,
             source: Source::Screen,
             gate: contains(&["esc to interrupt"]),
+        },
+        // A running turn's spinner line — a spinner glyph, a verb, an
+        // ellipsis, optionally an elapsed-time parenthetical. Stays on
+        // screen when the interrupt hint rotates away and when the
+        // window title is suppressed.
+        Rule {
+            state: AgentState::Working,
+            priority: 790,
+            source: Source::Screen,
+            gate: regex(&[r"(?m)^\s*[*·✢✶✻✽]\s+\S.*…(?:\s+\(\d+[smh](?:\s|·)|\s*$)"]),
+        },
+        // The status line's running-shell count: background shells keep
+        // running after the turn's own evidence is gone.
+        Rule {
+            state: AgentState::Working,
+            priority: 780,
+            source: Source::Screen,
+            gate: regex(&[r"(?m)^\s*[⏸⏵].*·\s+[1-9]\d*\s+shells?(?:\s+·|\s*$)"]),
+        },
+        // Likewise for background agents that outlive the turn.
+        Rule {
+            state: AgentState::Working,
+            priority: 770,
+            source: Source::Screen,
+            gate: regex(&[
+                r"(?m)^\s*[*·✢✶✻✽]\s+Waiting for [1-9]\d* background agents? to finish\s*$",
+            ]),
         },
     ]
 });
@@ -498,9 +526,52 @@ mod tests {
             AgentState::Working
         );
         assert_eq!(
+            evaluate(AgentKind::Claude, &snap("", "◐ claude", "none")),
+            AgentState::Working
+        );
+        assert_eq!(
             evaluate(AgentKind::Claude, &snap("", "claude", "none")),
             AgentState::Idle
         );
+    }
+
+    #[test]
+    fn spinner_line_is_working() {
+        // With and without the elapsed-time parenthetical; the
+        // interrupt hint may be rotated out entirely.
+        let s = snap("✻ Thinking…\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        let s = snap("✶ Herding… (12s · ↓ 450 tokens)\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        // Without the leading spinner glyph it is ordinary output.
+        let s = snap("Thinking…\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        // An ellipsis mid-sentence is ordinary output too.
+        let s = snap("· some bullet… about a thing\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn background_shell_count_is_working() {
+        let s = snap(
+            "⏵⏵ auto mode on (shift+tab to cycle) · 2 shells\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        let s = snap("⏸ plan mode · 1 shell · ctx 6%\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        // A shell count outside the status line is ordinary output.
+        let s = snap("the script created 2 shells\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn background_agents_line_is_working() {
+        let s = snap("✻ Waiting for 2 background agents to finish\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        let s = snap("Waiting for 2 background agents to finish\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
     }
 
     #[test]
