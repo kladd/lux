@@ -2,6 +2,8 @@
 
 ## 2026-08-20
 
+- Tabs not renamed by hand now take their name from the program's OSC
+  window title when it sets one, falling back to the process name.
 - Drag selections now copy to the clipboard on release, with a status
   message reporting the characters copied (`copy-on-select = false` to
   opt out).

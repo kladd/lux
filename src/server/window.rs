@@ -57,16 +57,25 @@ impl Clipboard for ClipboardRelay {
 
 /// Captures a tab program's plain OSC 9 system-notification text (the
 /// engine's toast alert) into a slot the tab reads when it next raises a
-/// desktop notification. The OSC 9;4 progress sequence takes a different
-/// engine path and never lands here.
+/// desktop notification, and the program's OSC 0/2 window title into a
+/// slot the tab reads when re-deriving its display name. The OSC 9;4
+/// progress sequence takes a different engine path and never lands here,
+/// and OSC 1 fires only the icon-title alert, which is ignored.
 struct NotificationRelay {
     text: Arc<Mutex<Option<String>>>,
+    title: Arc<Mutex<Option<String>>>,
 }
 
 impl AlertHandler for NotificationRelay {
     fn alert(&mut self, alert: Alert) {
-        if let Alert::ToastNotification { body, .. } = alert {
-            *self.text.lock().unwrap() = Some(body);
+        match alert {
+            Alert::ToastNotification { body, .. } => {
+                *self.text.lock().unwrap() = Some(body);
+            }
+            Alert::WindowTitleChanged(title) => {
+                *self.title.lock().unwrap() = Some(title);
+            }
+            _ => {}
         }
     }
 }
@@ -237,9 +246,10 @@ impl Foreground {
 
 pub struct Tab {
     pub id: TabId,
-    /// Display name derived from the PTY's foreground process command
-    /// name, re-derived as that process changes — until a manual rename
-    /// pins it.
+    /// Display name derived from the program's OSC window title when it
+    /// has set one, otherwise from the PTY's foreground process command
+    /// name, re-derived as either changes — until a manual rename pins
+    /// it.
     pub name: String,
     /// Whether the name was set by the rename prompt; a pinned name no
     /// longer tracks the foreground process.
@@ -270,6 +280,10 @@ pub struct Tab {
     /// notification is raised, so a later notification without a fresh
     /// summary says nothing rather than repeating a stale one.
     notify_text: Arc<Mutex<Option<String>>>,
+    /// The latest OSC 0/2 window title the tab's program set, shared with
+    /// the engine's alert handler. `None` until a program sets one; an
+    /// empty string means the program cleared it.
+    osc_title: Arc<Mutex<Option<String>>>,
     master: Box<dyn MasterPty>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -359,8 +373,10 @@ impl Tab {
         });
         engine.set_clipboard(&clipboard);
         let notify_text = Arc::new(Mutex::new(None));
+        let osc_title = Arc::new(Mutex::new(None));
         engine.set_notification_handler(Box::new(NotificationRelay {
             text: notify_text.clone(),
+            title: osc_title.clone(),
         }));
 
         // Until the first foreground read, the name is the spawned
@@ -382,6 +398,7 @@ impl Tab {
             claude_session: None,
             running_claude: false,
             notify_text,
+            osc_title,
             master: pair.master,
             child,
         })
@@ -404,11 +421,23 @@ impl Tab {
     /// process.
     pub fn clear_name(&mut self) {
         self.manual_name = false;
-        // Immediately reflect any Claude session name rather than waiting
-        // for the next PTY output to trigger refresh_identity.
-        if let Some(name) = self.claude_session_name() {
+        // Immediately reflect any Claude session name or OSC title rather
+        // than waiting for the next PTY output to trigger refresh_identity.
+        if let Some(name) = self.claude_session_name().or_else(|| self.osc_title()) {
             self.name = name;
         }
+    }
+
+    /// The tab program's current OSC window title, if it has set a
+    /// non-empty one.
+    fn osc_title(&self) -> Option<String> {
+        self.osc_title
+            .lock()
+            .unwrap()
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
     }
 
     pub fn is_manually_named(&self) -> bool {
@@ -416,7 +445,8 @@ impl Tab {
     }
 
     /// Re-identify the tab after new PTY output: re-derive its display
-    /// name from the foreground command and re-evaluate agent detection.
+    /// name from the OSC title or foreground command and re-evaluate
+    /// agent detection.
     /// Returns whether the displayed name or agent
     /// state (including the status text appearing or disappearing)
     /// changed, plus a notice when the agent reached done or blocked.
@@ -427,10 +457,15 @@ impl Tab {
             false
         } else {
             let new_name = match fg.as_ref() {
+                // A Claude session name outranks the OSC title, which
+                // Claude Code churns as a working-state channel.
                 Some(fg) if fg.is_claude() => self
                     .claude_session_name()
+                    .or_else(|| self.osc_title())
                     .unwrap_or_else(|| fg.display_name().to_string()),
-                Some(fg) => fg.display_name().to_string(),
+                Some(fg) => self
+                    .osc_title()
+                    .unwrap_or_else(|| fg.display_name().to_string()),
                 // No readable foreground process (e.g. mid-exec): keep the
                 // current name rather than flickering through a fallback.
                 None => String::new(),
@@ -741,7 +776,11 @@ mod tests {
             Box::new(NullWriter),
         );
         let text = Arc::new(Mutex::new(None));
-        engine.set_notification_handler(Box::new(NotificationRelay { text: text.clone() }));
+        let title = Arc::new(Mutex::new(None));
+        engine.set_notification_handler(Box::new(NotificationRelay {
+            text: text.clone(),
+            title: title.clone(),
+        }));
 
         // The OSC 9;4 progress sequence is not notification text.
         engine.advance_bytes(b"\x1b]9;4;1;40\x07");
@@ -755,5 +794,47 @@ mod tests {
         );
         engine.advance_bytes(b"\x1b]9;ran the tests\x1b\\");
         assert_eq!(text.lock().unwrap().as_deref(), Some("ran the tests"));
+    }
+
+    #[test]
+    fn osc_titles_land_in_the_title_slot() {
+        struct NullWriter;
+        impl std::io::Write for NullWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut engine = Engine::new(
+            term_size(Rect::new(0, 0, 80, 24)),
+            Arc::new(LuxConfig),
+            "lux",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(NullWriter),
+        );
+        let text = Arc::new(Mutex::new(None));
+        let title = Arc::new(Mutex::new(None));
+        engine.set_notification_handler(Box::new(NotificationRelay {
+            text: text.clone(),
+            title: title.clone(),
+        }));
+
+        // OSC 2 (window title) and OSC 0 (icon + window title) both land;
+        // a later title replaces the earlier one.
+        engine.advance_bytes(b"\x1b]2;kyle@host: ~/src\x07");
+        assert_eq!(title.lock().unwrap().as_deref(), Some("kyle@host: ~/src"));
+        engine.advance_bytes(b"\x1b]0;notes.txt - vim\x1b\\");
+        assert_eq!(title.lock().unwrap().as_deref(), Some("notes.txt - vim"));
+
+        // OSC 1 (icon title only) does not touch the slot.
+        engine.advance_bytes(b"\x1b]1;icon-only\x07");
+        assert_eq!(title.lock().unwrap().as_deref(), Some("notes.txt - vim"));
+
+        // An empty title is stored, marking the title as cleared.
+        engine.advance_bytes(b"\x1b]2;\x07");
+        assert_eq!(title.lock().unwrap().as_deref(), Some(""));
     }
 }
