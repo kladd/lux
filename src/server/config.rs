@@ -1,7 +1,8 @@
 //! Config file loading (Phase 6): a TOML file overriding the prefix key,
-//! the session-restore toggle, the desktop-notification toggle, and the
-//! auto-mode toggle. The keybinding table itself is hardcoded and
-//! non-configurable. No other settings, and no live reloading.
+//! the session-restore toggle, the desktop-notification toggle, the
+//! auto-mode toggle, and the copy-on-select toggle. The keybinding table
+//! itself is hardcoded and non-configurable. No other settings, and no
+//! live reloading.
 //!
 //! ```toml
 //! # ~/.config/lux/config.toml
@@ -9,6 +10,7 @@
 //! restore = false   # skip restoring persisted sessions at startup
 //! notify = false    # no desktop notifications for Claude Code tabs
 //! automode = true   # CLAUDECOM opens auto mode instead of the grid
+//! copy-on-select = false   # selections yank only on right-click
 //! ```
 //!
 //! The key spec is a single character, optionally prefixed with `C-`.
@@ -32,6 +34,9 @@ pub struct Config {
     /// Whether the CLAUDECOM entry points open auto mode instead of the
     /// grid. Absent means the grid.
     pub automode: bool,
+    /// Whether a finished drag selection yanks to the system clipboard
+    /// on release. Absent means it does.
+    pub copy_on_select: bool,
 }
 
 impl Default for Config {
@@ -41,6 +46,7 @@ impl Default for Config {
             restore: true,
             notify: true,
             automode: false,
+            copy_on_select: true,
         }
     }
 }
@@ -105,6 +111,12 @@ fn from_toml(text: &str, origin: &str) -> Config {
         match value.as_bool() {
             Some(automode) => config.automode = automode,
             None => eprintln!("lux: {origin}: invalid automode value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("copy-on-select") {
+        match value.as_bool() {
+            Some(copy) => config.copy_on_select = copy,
+            None => eprintln!("lux: {origin}: invalid copy-on-select value {value}"),
         }
     }
     config
@@ -180,6 +192,16 @@ mod tests {
         assert!(!from_toml("automode = false", "test").automode);
         // A non-boolean value keeps the default.
         assert!(!from_toml("automode = \"yes\"", "test").automode);
+    }
+
+    #[test]
+    fn copy_on_select_option_parses_and_defaults_on() {
+        // Absent means copy on select.
+        assert!(from_toml("prefix = \"C-a\"", "test").copy_on_select);
+        assert!(!from_toml("copy-on-select = false", "test").copy_on_select);
+        assert!(from_toml("copy-on-select = true", "test").copy_on_select);
+        // A non-boolean value keeps the default.
+        assert!(from_toml("copy-on-select = \"no\"", "test").copy_on_select);
     }
 
     #[test]

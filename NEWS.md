@@ -2,6 +2,11 @@
 
 ## 2026-08-20
 
+- Drag selections now copy to the clipboard on release, with a status
+  message reporting the characters copied (`copy-on-select = false` to
+  opt out).
+- `:w` confirms a successful write with a status message reporting the
+  path and byte count.
 - Fixed Claude Code working detection on 2.1.228+: the new title
   spinner, the on-screen spinner line, and background shells/agents
   now all count as working.

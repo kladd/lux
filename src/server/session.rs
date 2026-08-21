@@ -103,6 +103,10 @@ struct Selection {
     window: WindowId,
     start: (u16, u16),
     end: (u16, u16),
+    /// True from the anchoring press until the release that ends the
+    /// drag; a finished selection can outlive the drag (copy-on-select
+    /// keeps it highlighted after yanking).
+    dragging: bool,
 }
 
 impl Selection {
@@ -326,6 +330,9 @@ struct View {
     separators: Vec<Separator>,
     chrome: Vec<Chrome>,
     status: Option<StatusChrome>,
+    /// The status message owning the reserved bottom row this frame, in
+    /// place of the session status line.
+    message: Option<(Rect, String)>,
     prompt: Option<PromptChrome>,
     hints: Option<HintChrome>,
     /// The animation clock this frame renders at.
@@ -371,6 +378,12 @@ pub struct Session {
     prompt: Option<Prompt>,
     /// The server's prefix and bindings (config may override both).
     keys: Arc<KeyTable>,
+    /// Whether a finished drag selection yanks on release (config
+    /// `copy-on-select`).
+    copy_on_select: bool,
+    /// A transient message shown on the reserved bottom row in place of
+    /// the session status line, until the next key press.
+    message: Option<String>,
     /// The current drag selection, if any.
     selection: Option<Selection>,
     /// The boundary drag in progress, if any.
@@ -392,6 +405,7 @@ impl Session {
         name: String,
         area: Rect,
         keys: Arc<KeyTable>,
+        copy_on_select: bool,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
         // The initial window's shell, sized to the viewport
@@ -413,6 +427,8 @@ impl Session {
             hover: None,
             prompt: None,
             keys,
+            copy_on_select,
+            message: None,
             selection: None,
             border_drag: None,
             indicator: None,
@@ -434,6 +450,7 @@ impl Session {
         snap: &persist::SessionSnapshot,
         area: Rect,
         keys: Arc<KeyTable>,
+        copy_on_select: bool,
         tx: Sender<ServerEvent>,
     ) -> Option<Self> {
         let mut tree = Some(persist::restore_node(&snap.tree));
@@ -482,6 +499,8 @@ impl Session {
             hover: None,
             prompt: None,
             keys,
+            copy_on_select,
+            message: None,
             selection: None,
             border_drag: None,
             indicator: None,
@@ -805,6 +824,10 @@ impl Session {
         if key.kind == KeyEventKind::Release {
             return None;
         }
+        // Any key press dismisses a status message.
+        if self.message.take().is_some() {
+            self.force_redraw = true;
+        }
         // While a prompt is open, every key press edits
         // it instead of reaching the focused window's PTY.
         if self.prompt.is_some() {
@@ -1042,6 +1065,7 @@ impl Session {
                             window: id,
                             start: cell,
                             end: cell,
+                            dragging: true,
                         });
                         self.force_redraw = true;
                     }
@@ -1081,6 +1105,25 @@ impl Session {
                     let tab = win.active_tab_mut();
                     if tab.engine.is_mouse_grabbed() && !shift {
                         forward_mouse(tab, &mouse, content);
+                    }
+                }
+                // With copy-on-select, the release ending a drag
+                // selection yanks it right away, keeping the selection
+                // highlighted; without it, yanking stays on right-click.
+                if matches!(mouse.kind, CtMouseKind::Up(CtMouseButton::Left))
+                    && let Some(sel) = self.selection.as_mut()
+                    && sel.dragging
+                {
+                    sel.dragging = false;
+                    if self.copy_on_select
+                        && let Some(text) = self.selection_text()
+                    {
+                        self.message = Some(format!(
+                            "copied {}",
+                            count(text.chars().count(), "character")
+                        ));
+                        self.force_redraw = true;
+                        return Some(Effect::Copy(text));
                     }
                 }
                 // Hovering a window control brightens it; moving off
@@ -1402,10 +1445,11 @@ impl Session {
     }
 
     /// Write the focused window's active tab's entire terminal content,
-    /// scrollback included, to `path`. A leading `~/` expands to the
-    /// user's home directory. There is no error surface yet, so a failed
-    /// write is dropped.
-    fn write_tab_content(&self, path: &std::path::Path) {
+    /// scrollback included, to `path`, confirming a successful write
+    /// with a status message. A leading `~/` expands to the user's home
+    /// directory. There is no error surface yet, so a failed write is
+    /// dropped.
+    fn write_tab_content(&mut self, path: &std::path::Path) {
         let tab = self.windows[&self.focus].active_tab();
         let screen = tab.engine.screen();
         // Every physical row: scrollback plus the visible grid.
@@ -1424,7 +1468,19 @@ impl Session {
         } else {
             format!("{trimmed}\n")
         };
-        let _ = std::fs::write(expand_tilde(path), out);
+        let path = expand_tilde(path);
+        if std::fs::write(&path, &out).is_err() {
+            return;
+        }
+        // The canonical form names where the write really landed, even
+        // for a relative path resolved against the server's directory.
+        let full = std::fs::canonicalize(&path).unwrap_or(path);
+        self.message = Some(format!(
+            "wrote {} ({})",
+            full.display(),
+            count(out.len(), "byte")
+        ));
+        self.force_redraw = true;
     }
 
     fn find_tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
@@ -2020,37 +2076,51 @@ impl Session {
         }
         self.clock = clock_now();
         let prompt = self.compute_prompt_chrome();
-        // The reserved bottom row, unless a prompt owns it this frame.
-        let status = (prompt.is_none() && self.area.height > 0 && self.area.width > 0).then(|| {
-            let row = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
-            let name_end = row
-                .x
-                .saturating_add(2 + self.name.chars().count() as u16)
-                .min(row.right());
-            // The pending-agent indicator takes the hostname's place
-            // when it fits alongside the clock; too narrow a row falls
-            // back to the hostname block as usual.
-            let indicator = self.indicator.as_ref().and_then(|ind| {
-                let ind_len = ind.text.chars().count() as u16;
-                let len = ind_len + 2 + self.clock.chars().count() as u16 + 1;
-                (row.width >= len).then(|| {
-                    let start = row.right() - len;
-                    (ind.text.clone(), start..start + ind_len)
+        // A status message takes the reserved bottom row in place of the
+        // session status line; an open prompt outranks both.
+        let message = (prompt.is_none() && self.area.height > 0 && self.area.width > 0)
+            .then(|| {
+                self.message.as_ref().map(|text| {
+                    let row = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
+                    (row, text.clone())
                 })
-            });
-            StatusChrome {
-                row,
-                name: self.name.clone(),
-                minimized: self.minimized_titles(row, name_end),
-                host: HOSTNAME.clone(),
-                clock: self.clock.clone(),
-                indicator,
-            }
-        });
+            })
+            .flatten();
+        // The reserved bottom row, unless a prompt or message owns it
+        // this frame.
+        let status =
+            (prompt.is_none() && message.is_none() && self.area.height > 0 && self.area.width > 0)
+                .then(|| {
+                    let row = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
+                    let name_end = row
+                        .x
+                        .saturating_add(2 + self.name.chars().count() as u16)
+                        .min(row.right());
+                    // The pending-agent indicator takes the hostname's place
+                    // when it fits alongside the clock; too narrow a row falls
+                    // back to the hostname block as usual.
+                    let indicator = self.indicator.as_ref().and_then(|ind| {
+                        let ind_len = ind.text.chars().count() as u16;
+                        let len = ind_len + 2 + self.clock.chars().count() as u16 + 1;
+                        (row.width >= len).then(|| {
+                            let start = row.right() - len;
+                            (ind.text.clone(), start..start + ind_len)
+                        })
+                    });
+                    StatusChrome {
+                        row,
+                        name: self.name.clone(),
+                        minimized: self.minimized_titles(row, name_end),
+                        host: HOSTNAME.clone(),
+                        clock: self.clock.clone(),
+                        indicator,
+                    }
+                });
         self.view = View {
             separators,
             chrome,
             status,
+            message,
             prompt,
             hints: self.compute_hint_chrome(),
             elapsed: anim::elapsed(),
@@ -2147,9 +2217,13 @@ impl Session {
             render_separator(sep, buf);
         }
         // The session status line on the reserved bottom
-        // row; absent while a prompt renders there instead.
+        // row; absent while a prompt or status message renders there
+        // instead.
         if let Some(status) = &self.view.status {
             render_status(status, self.view.elapsed, buf);
+        }
+        if let Some((row, text)) = &self.view.message {
+            render_message(*row, text, buf);
         }
         if let Some(chrome) = &self.view.prompt {
             render_prompt_chrome(chrome, buf);
@@ -2423,6 +2497,38 @@ fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
         return std::path::PathBuf::from(home).join(rest);
     }
     path.to_path_buf()
+}
+
+/// `n` with its pluralized unit, e.g. "1 byte", "42 bytes".
+fn count(n: usize, unit: &str) -> String {
+    let s = if n == 1 { "" } else { "s" };
+    format!("{n} {unit}{s}")
+}
+
+/// Draw a status message on the reserved bottom row, in place of the
+/// session status line.
+fn render_message(row: Rect, text: &str, buf: &mut Buffer) {
+    if row.height == 0 || row.width == 0 {
+        return;
+    }
+    let fill = Style::default().bg(CHROME_BG);
+    for x in row.x..row.right() {
+        if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
+            dst.set_char(' ');
+            dst.set_style(fill);
+        }
+    }
+    let style = fill.fg(Color::Gray);
+    for (i, ch) in text.chars().enumerate() {
+        let x = row.x + 1 + i as u16;
+        if x >= row.right() {
+            break;
+        }
+        if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
+            dst.set_char(ch);
+            dst.set_style(style);
+        }
+    }
 }
 
 /// Draw the session status line: name left, clock right,

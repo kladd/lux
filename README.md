@@ -128,6 +128,7 @@ table itself is not configurable:
 prefix = "C-a"   # "C-" prefix means Ctrl is held (default: C-b)
 restore = false  # skip restoring persisted sessions at startup
 notify = false   # no desktop notifications for Claude Code tabs
+copy-on-select = false   # selections yank only on right-click
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`

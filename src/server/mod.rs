@@ -180,6 +180,7 @@ pub fn run() -> i32 {
         clipboard: arboard::Clipboard::new().ok(),
         notify: config.notify,
         auto_enabled: config.automode,
+        copy_on_select: config.copy_on_select,
         next_session_id: 0,
         save_deadline: None,
         last_saved: None,
@@ -311,6 +312,9 @@ struct Server {
     /// Whether the CLAUDECOM entry points open auto mode instead of the
     /// grid (config `auto`).
     auto_enabled: bool,
+    /// Whether a finished drag selection yanks on release (config
+    /// `copy-on-select`).
+    copy_on_select: bool,
     next_session_id: SessionId,
     /// When the pending automatic save runs; armed by any event that can
     /// change persisted state.
@@ -450,8 +454,13 @@ impl Server {
             if self.session_by_name(&snap.name).is_some() {
                 continue;
             }
-            let Some(session) = Session::restore(snap, area, self.keys.clone(), self.tx.clone())
-            else {
+            let Some(session) = Session::restore(
+                snap,
+                area,
+                self.keys.clone(),
+                self.copy_on_select,
+                self.tx.clone(),
+            ) else {
                 continue;
             };
             let sid = self.next_session_id;
@@ -687,8 +696,14 @@ impl Server {
                 .find(|candidate| self.session_by_name(candidate).is_none())
                 .expect("some integer name is free"),
         };
-        let session = Session::new(name, area, self.keys.clone(), self.tx.clone())
-            .map_err(|err| format!("cannot start session: {err:#}"))?;
+        let session = Session::new(
+            name,
+            area,
+            self.keys.clone(),
+            self.copy_on_select,
+            self.tx.clone(),
+        )
+        .map_err(|err| format!("cannot start session: {err:#}"))?;
         let sid = self.next_session_id;
         self.next_session_id += 1;
         self.sessions.insert(sid, session);
