@@ -34,10 +34,12 @@ pub enum AgentKind {
 }
 
 /// The evidence a rule matches against: the tab's
-/// current screen text, or the OSC title / OSC 9;4 progress state the
-/// engine captured from the PTY stream.
+/// current screen text, the last non-empty screen line above the
+/// input box, or the OSC title / OSC 9;4 progress state the engine
+/// captured from the PTY stream.
 enum Source {
     Screen,
+    LastLineAbovePrompt,
     OscTitle,
     OscProgress,
 }
@@ -206,14 +208,15 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             source: Source::Screen,
             gate: regex(&[r"(?m)^\s*[⏸⏵].*·\s+[1-9]\d*\s+shells?(?:\s+·|\s*$)"]),
         },
-        // Likewise for background agents that outlive the turn.
+        // Likewise for background agents that outlive the turn. The
+        // wait line is not erased when the agents finish — completion
+        // output lands below it — so it only counts while it is still
+        // the last transcript line.
         Rule {
             state: AgentState::Working,
             priority: 770,
-            source: Source::Screen,
-            gate: regex(&[
-                r"(?m)^\s*[*·✢✶✻✽]\s+Waiting for [1-9]\d* background agents? to finish\s*$",
-            ]),
+            source: Source::LastLineAbovePrompt,
+            gate: regex(&[r"^\s*[*·✢✶✻✽]\s+Waiting for [1-9]\d* background agents? to finish\s*$"]),
         },
     ]
 });
@@ -317,6 +320,44 @@ static KIRO_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     ]
 });
 
+/// The last non-empty screen line above the input box's top border.
+/// The box's bottom border is the first horizontal rule up from the
+/// screen bottom and its top border the second; with fewer than two
+/// rules on screen there is no box, and the whole screen is searched.
+fn last_line_above_prompt(screen: &str) -> &str {
+    let lines: Vec<&str> = screen.lines().collect();
+    let top = prompt_box_top(&lines).unwrap_or(lines.len());
+    lines[..top]
+        .iter()
+        .rev()
+        .copied()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+}
+
+/// Index of the input box's top border: the second horizontal rule
+/// scanning up from the screen bottom.
+fn prompt_box_top(lines: &[&str]) -> Option<usize> {
+    let mut rules = 0;
+    for (index, line) in lines.iter().enumerate().rev() {
+        if is_horizontal_rule(line) {
+            rules += 1;
+            if rules == 2 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// A border line: a run of `─`, either alone on the line or at least
+/// three long when text follows (a rule carrying an inline hint).
+fn is_horizontal_rule(line: &str) -> bool {
+    let trimmed = line.trim();
+    let dashes = trimmed.chars().take_while(|&c| c == '─').count();
+    dashes >= 3 || (dashes > 0 && dashes == trimmed.chars().count())
+}
+
 /// Evaluate every rule in the agent's rule set; the highest-priority
 /// match wins, ties favoring the earliest declared. No match at all
 /// means idle.
@@ -329,9 +370,10 @@ pub fn evaluate(kind: AgentKind, snapshot: &Snapshot) -> AgentState {
     let mut best: Option<&Rule> = None;
     for rule in rules.iter() {
         let text = match rule.source {
-            Source::Screen => &snapshot.screen,
-            Source::OscTitle => &snapshot.title,
-            Source::OscProgress => &snapshot.progress,
+            Source::Screen => snapshot.screen.as_str(),
+            Source::LastLineAbovePrompt => last_line_above_prompt(&snapshot.screen),
+            Source::OscTitle => snapshot.title.as_str(),
+            Source::OscProgress => snapshot.progress.as_str(),
         };
         let lower = text.to_lowercase();
         if rule.gate.matches(text, &lower) && best.is_none_or(|b| rule.priority > b.priority) {
@@ -571,6 +613,34 @@ mod tests {
         let s = snap("✻ Waiting for 2 background agents to finish\n", "", "none");
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
         let s = snap("Waiting for 2 background agents to finish\n", "", "none");
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        // Still live when only the prompt box and status line sit
+        // below it.
+        let s = snap(
+            "● Done. Two investigations delegated.\n\n\
+             ✻ Waiting for 2 background agents to finish\n\n\
+             ────────────\n❯\n────────────\n  ~/src/lux ⎇ main\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+    }
+
+    #[test]
+    fn finished_background_agents_line_is_idle() {
+        // The wait line is not erased when the agents finish —
+        // completion output lands below it — so it is stale once it is
+        // no longer the last transcript line.
+        let s = snap(
+            "✻ Waiting for 1 background agent to finish\n\n\
+             ● Agent \"Sleep then say hi\" completed · 17s\n\n● hi\n\n\
+             ────────────\n❯\n────────────\n  ~/src/lux ⎇ main\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        // A zero count means nothing is left running.
+        let s = snap("✻ Waiting for 0 background agents to finish\n", "", "none");
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
     }
 

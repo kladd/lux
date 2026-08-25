@@ -1,5 +1,10 @@
 # News
 
+## 2026-08-24
+
+- Fixed a Claude Code tab staying working after its background agents
+  finished.
+
 ## 2026-08-20
 
 - Tabs not renamed by hand now take their name from the program's OSC
