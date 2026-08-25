@@ -2,6 +2,8 @@
 
 ## 2026-08-24
 
+- Tab names too long for the tab bar are truncated with an ellipsis;
+  names that fit keep their full length.
 - Fixed a Claude Code tab staying working after its background agents
   finished.
 

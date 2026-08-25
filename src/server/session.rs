@@ -2028,6 +2028,23 @@ impl Session {
             let controls = (bar.height > 0 && bar.width >= CONTROLS_WIDTH + 2)
                 .then(|| Rect::new(bar.right() - CONTROLS_WIDTH, bar.y, CONTROLS_WIDTH, 1));
             let badges_end = controls.map_or(bar.right(), |c| c.x);
+            let visuals: Vec<Option<agent::Visual>> = win
+                .tabs
+                .iter()
+                .map(|t| t.agent.as_ref().map(|a| a.visual(now)))
+                .collect();
+            let fixed: usize = visuals
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    format!(" {}:", i).chars().count()
+                        + v.as_ref().map_or(0, |v| 1 + v.text.chars().count())
+                        + 1
+                })
+                .sum();
+            let name_lens: Vec<usize> = win.tabs.iter().map(|t| t.name.chars().count()).collect();
+            let avail = badges_end.saturating_sub(bar.x.saturating_add(2)) as usize;
+            let widths = allocate_name_widths(&name_lens, avail.saturating_sub(fixed));
             // Badge spans track render_tab_bar's layout: the two-cell
             // rule lead-in, then per badge " i:name", the
             // agent text when present, and the trailing separator space,
@@ -2036,10 +2053,11 @@ impl Session {
             let tabs: Vec<TabBadge> = win
                 .tabs
                 .iter()
+                .zip(visuals)
                 .enumerate()
-                .map(|(i, tab)| {
-                    let agent = tab.agent.as_ref().map(|t| t.visual(now));
-                    let mut width = format!(" {}:{}", i, tab.name).chars().count() as u16;
+                .map(|(i, (tab, agent))| {
+                    let name = truncate_name(&tab.name, widths[i]);
+                    let mut width = format!(" {}:{}", i, name).chars().count() as u16;
                     if let Some(visual) = &agent {
                         width += 1 + visual.text.chars().count() as u16;
                     }
@@ -2048,7 +2066,7 @@ impl Session {
                     next_x = next_x.saturating_add(width).min(badges_end);
                     TabBadge {
                         active: i == active,
-                        name: tab.name.clone(),
+                        name,
                         agent,
                         span: start..next_x,
                     }
@@ -2291,6 +2309,56 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
             }
         }
     }
+}
+
+/// Split `budget` cells among names of the given lengths: every name
+/// that fits keeps its full length, and the rest share the width the
+/// fitting names don't use.
+fn allocate_name_widths(lens: &[usize], budget: usize) -> Vec<usize> {
+    let total: usize = lens.iter().sum();
+    if total <= budget {
+        return lens.to_vec();
+    }
+    // The largest uniform cap that fits; names shorter than the cap
+    // keep their full length, so the cap absorbs the width they free.
+    let fits = |cap: usize| lens.iter().map(|&l| l.min(cap)).sum::<usize>() <= budget;
+    let (mut lo, mut hi) = (0, budget);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut alloc: Vec<usize> = lens.iter().map(|&l| l.min(lo)).collect();
+    // Cells the cap's granularity leaves over go one each to the
+    // capped names, left to right.
+    let mut spare = budget - alloc.iter().sum::<usize>();
+    for (a, &l) in alloc.iter_mut().zip(lens) {
+        if spare == 0 {
+            break;
+        }
+        if *a < l {
+            *a += 1;
+            spare -= 1;
+        }
+    }
+    alloc
+}
+
+/// The name cut to `width` cells, ending in an ellipsis when anything
+/// was cut.
+fn truncate_name(name: &str, width: usize) -> String {
+    if name.chars().count() <= width {
+        return name.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out: String = name.chars().take(width - 1).collect();
+    out.push('…');
+    out
 }
 
 /// Draw one window's tab bar: a two-cell rule lead-in, an
@@ -2807,5 +2875,51 @@ fn cell_color(attr: ColorAttribute) -> Color {
             let (r, g, b, _) = c.to_srgb_u8();
             Color::Rgb(r, g, b)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{allocate_name_widths, truncate_name};
+
+    #[test]
+    fn names_that_fit_keep_full_length() {
+        assert_eq!(allocate_name_widths(&[4, 20, 3], 17), vec![4, 10, 3]);
+    }
+
+    #[test]
+    fn no_truncation_when_everything_fits() {
+        assert_eq!(allocate_name_widths(&[4, 5, 6], 15), vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn long_names_share_the_budget_evenly() {
+        assert_eq!(allocate_name_widths(&[20, 20], 11), vec![6, 5]);
+    }
+
+    #[test]
+    fn zero_budget_allocates_nothing() {
+        assert_eq!(allocate_name_widths(&[5, 5], 0), vec![0, 0]);
+    }
+
+    #[test]
+    fn truncated_name_ends_in_ellipsis() {
+        assert_eq!(truncate_name("long-tab-name", 5), "long…");
+    }
+
+    #[test]
+    fn fitting_name_is_untouched() {
+        assert_eq!(truncate_name("vim", 3), "vim");
+        assert_eq!(truncate_name("vim", 10), "vim");
+    }
+
+    #[test]
+    fn zero_width_name_is_empty() {
+        assert_eq!(truncate_name("vim", 0), "");
+    }
+
+    #[test]
+    fn truncation_counts_chars_not_bytes() {
+        assert_eq!(truncate_name("héllo wörld", 6), "héllo…");
     }
 }
