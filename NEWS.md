@@ -4,6 +4,8 @@
 
 - `prefix+y` yanks a tab and `prefix+P` pastes it into any session's
   focused window; `prefix+Escape` cancels.
+- Hovering any clickable element shows a hand pointer: tab indicators, minimized
+  titles, the pending-agent indicator, the menu icon, and switcher entries.
 
 ## 2026-08-24
 

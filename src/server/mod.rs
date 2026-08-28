@@ -892,16 +892,7 @@ impl Server {
                     session.paste_text(&text);
                 }
             }
-            // Written only on change, so plain mouse motion doesn't spam
-            // escape sequences at the client's terminal.
-            Effect::Pointer(shape) => {
-                if let Some(client) = self.clients.get_mut(&conn)
-                    && client.pointer != shape
-                {
-                    client.pointer = shape;
-                    let _ = write!(client.raw_out, "\x1b]22;{shape}\x1b\\");
-                }
-            }
+            Effect::Pointer(shape) => self.set_pointer(conn, shape),
             // The indicator's tab may be in another session; landing on
             // it reuses the finder/grid attach path, restoring and
             // maximizing its window if minimized.
@@ -928,7 +919,15 @@ impl Server {
         let key = match event {
             DecodedInput::Key(key) => key,
             DecodedInput::Mouse(mouse) => {
-                if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Left)) {
+                // Hovering the menu icon or a list entry shows the same
+                // hand pointer the attached view's clickable chrome gets.
+                if mouse.kind == CtMouseKind::Moved {
+                    let clickable = self.switcher_icon_at(conn, mouse.column, mouse.row)
+                        || self
+                            .switcher_entry_at(conn, mouse.column, mouse.row)
+                            .is_some();
+                    self.set_pointer(conn, if clickable { "pointer" } else { "default" });
+                } else if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Left)) {
                     if self.switcher_icon_at(conn, mouse.column, mouse.row) {
                         self.switcher_cancel(conn);
                     } else if let Some(index) =
@@ -997,6 +996,17 @@ impl Server {
         let sid = client.attached;
         if let Some(session) = self.sessions.get_mut(&sid) {
             session.request_redraw();
+        }
+    }
+
+    /// Set the client terminal's mouse pointer shape, written only on
+    /// change so plain mouse motion doesn't spam escape sequences.
+    fn set_pointer(&mut self, conn: ConnId, shape: &'static str) {
+        if let Some(client) = self.clients.get_mut(&conn)
+            && client.pointer != shape
+        {
+            client.pointer = shape;
+            let _ = write!(client.raw_out, "\x1b]22;{shape}\x1b\\");
         }
     }
 

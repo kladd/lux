@@ -5,7 +5,9 @@ differentiating features.
 
 - Window management: Lux sessions are similar to tmux sessions, but windows and
   panes are different. In Lux the layout is independent of active windows/panes.
-  Each window has its own tabs. Cycling tabs does not disturb the layout.
+  Each window has its own tabs. Cycling tabs does not disturb the layout,
+  and a tab can be yanked and pasted into another window, even in another
+  session.
 - Agents: Lux detects Claude Code, Codex, and Kiro CLI and reports their
   status in the tab bar: working, idle, done, blocked.
 - vim/helix style: prefix+`:` opens a command line with autocomplete, and
@@ -60,6 +62,9 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `w` | close the active tab |
 | `x` | close the focused window |
 | `,` | rename the active tab |
+| `y` | yank the active tab (`*` marks it in the tab bar) |
+| `P` | paste the yanked tab into the focused window, even in another session |
+| `Esc` | cancel a pending yank |
 | `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit) |
 | `d` | detach from the session |
 | `s` | open the session switcher |
@@ -71,6 +76,11 @@ All window commands start with the prefix key (default `Ctrl-b`):
 
 Arrow keys work as alternates for `h`/`j`/`k`/`l` (and Shift-arrows for
 `H`/`J`/`K`/`L`).
+
+In terminals that support pointer shapes, clickable chrome — tab
+indicators, window controls, minimized window titles, the status bar's
+menu icon and agent indicator, and switcher entries — shows a hand
+pointer on hover, and draggable split boundaries a resize pointer.
 
 Ex commands (typed after `:`, with autocomplete):
 

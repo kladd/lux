@@ -1240,17 +1240,25 @@ impl Session {
         None
     }
 
-    /// The mouse pointer shape for `pos`: a hand pointer over a window
-    /// control, a resize shape over a draggable boundary, matching the
-    /// axis the boundary moves on, and the default anywhere else. Shapes
-    /// are OSC 22 names; terminals without pointer-shape support ignore
-    /// the sequence.
+    /// The mouse pointer shape for `pos`: a hand pointer over a
+    /// clickable element — a window control, a tab's indicator, or the
+    /// status line's menu icon, minimized titles, and pending-agent
+    /// indicator — a resize shape over a draggable boundary, matching
+    /// the axis the boundary moves on, and the default anywhere else.
+    /// Shapes are OSC 22 names; terminals without pointer-shape support
+    /// ignore the sequence.
     fn pointer_shape(&self, pos: Position) -> &'static str {
-        // The control wins where a tab bar doubles as a drag boundary;
-        // it stays clickable there via the motionless-release path.
-        if self
-            .window_at(pos)
-            .is_some_and(|id| self.control_at(id, pos).is_some())
+        // Controls and tab badges win where a tab bar doubles as a drag
+        // boundary; they stay clickable there via the motionless-release
+        // path.
+        if self.window_at(pos).is_some_and(|id| {
+            self.control_at(id, pos).is_some() || self.tab_badge_at(id, pos).is_some()
+        }) {
+            return "pointer";
+        }
+        if self.menu_icon_at(pos)
+            || self.minimized_title_at(pos).is_some()
+            || self.indicator_at(pos).is_some()
         {
             return "pointer";
         }
