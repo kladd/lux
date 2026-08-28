@@ -1,7 +1,7 @@
 # Lux
 
 A terminal multiplexer designed for tmux muscle memory, but with a few
-differentiating features so far.
+differentiating features.
 
 - Window management: Lux sessions are similar to tmux sessions, but windows and
   panes are different. In Lux the layout is independent of active windows/panes.
