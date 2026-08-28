@@ -34,8 +34,8 @@ lux ls                 # list sessions
 lux kill-server        # stop the server and all sessions
 ```
 
-Sessions are saved automatically and restored when the server next
-starts, resuming Claude Code sessions in their tabs (disable with
+Sessions save automatically and restore when the server next starts,
+resuming Claude Code sessions in their tabs (disable with
 `restore = false`, see Configuration).
 
 ### Navigating and manipulating windows
@@ -50,10 +50,10 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `n` / `p` | next / previous tab |
 | `0`-`9` | jump to tab by index |
 | `h` `j` `k` `l` | focus split left/down/up/right |
-| `H` `J` `K` `L` | move the active tab into the split left/down/up/right (tap again within 500ms to keep moving) |
+| `H` `J` `K` `L` | move active tab into split left/down/up/right (tap again within 500ms to keep moving) |
 | `r` then `h` `j` `k` `l` | resize split left/down/up/right (tap again within 500ms to keep resizing) |
-| `m` then `h` `j` `k` `l` | swap the focused window with the adjacent window left/down/up/right |
-| `i` | rotate (flip the orientation of) the enclosing split |
+| `m` then `h` `j` `k` `l` | swap focused window with adjacent window left/down/up/right |
+| `i` | flip the enclosing split's orientation |
 | `=` | rebalance every split to an even ratio |
 | `z` | maximize/zoom the focused window |
 | `o` | close every split but the focused one |
@@ -65,7 +65,7 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `s` | open the session switcher |
 | `g` | open the CLAUDECOM grid |
 | `f` | open the fuzzy tab finder |
-| `Tab` | jump to the next agent tab that is done or blocked, across every session (wraps) |
+| `Tab` | jump to the next done or blocked agent tab, across every session (wraps) |
 | `:` | open the ex command line |
 | the prefix key again | send a literal prefix keypress to the tab (tap again within 500ms to send another) |
 
@@ -94,19 +94,19 @@ preview. Move the highlight with `j`/`k`, the arrow keys, or readline-style
 Clicking the `☢` icon at the left of the status bar opens it too; while
 the switcher is open the icon shows as `○`, and clicking it exits.
 
-Prefix+`f` opens the fuzzy tab finder: a popover floating over your
-session that lists every tab across every session, narrowing as you type
-a query, with a live preview of the highlighted match. Move the highlight
-with `Ctrl-n`/`Ctrl-p` or the arrow keys; `Enter` jumps to the
-highlighted tab's home session, window, and tab; `Esc` cancels.
+Prefix+`f` opens the fuzzy tab finder: a popover over your session
+listing every tab across every session, narrowing as you type a query,
+with a live preview of the highlighted match. Move the highlight with
+`Ctrl-n`/`Ctrl-p` or the arrow keys; `Enter` jumps to the highlighted
+tab's home session, window, and tab; `Esc` cancels.
 
 ### CLAUDECOM
 
 While any tab runs Claude Code, the switcher pins a **CLAUDECOM** entry
 at the top: a live grid with one tile per Claude Code tab across every
-session, each showing its status text, home session name, tab name, and
-its content resized to fit the tile. Prefix+`g` jumps straight to the
-grid without opening the switcher.
+session, each showing status text, home session name, tab name, and
+content resized to fit the tile. Prefix+`g` jumps straight to the grid
+without opening the switcher.
 
 In the grid: move the highlight with `h`/`j`/`k`/`l` or the arrow keys
 (overflow rows scroll with it); `Enter` captures the highlighted tile for
@@ -116,11 +116,22 @@ tab's home session, window, and tab; prefix+`s` and prefix+`f` open the
 switcher or finder directly; `q`/`Esc` returns to the session you came
 from.
 
+### Auto mode
+
+With `automode = true` (see Configuration), both of CLAUDECOM's entry
+points — prefix+`g` and selecting CLAUDECOM from the switcher — open auto
+mode instead of the grid. Auto mode attaches you to one agent tab that's
+done or blocked at a time. Once that tab starts working again or goes
+away, it hands off automatically to the next such tab, in the same order
+the grid uses. Prefix+`Tab` skips to the next one manually. When no tab
+needs attention, it shows a blank screen — "Claude doesn't need you right
+now" — with a list of tabs still working underneath.
+
 ## Configuration
 
 Lux reads `$XDG_CONFIG_HOME/lux/config.toml` (falling back to
 `~/.config/lux/config.toml`) at startup. A missing file is fine; a malformed
-one falls back to defaults with an error printed to stderr. The keybinding
+one falls back to defaults and prints an error to stderr. The keybinding
 table itself is not configurable:
 
 ```toml
@@ -128,6 +139,7 @@ table itself is not configurable:
 prefix = "C-a"   # "C-" prefix means Ctrl is held (default: C-b)
 restore = false  # skip restoring persisted sessions at startup
 notify = false   # no desktop notifications for Claude Code tabs
+automode = true  # CLAUDECOM opens auto mode instead of the grid
 copy-on-select = false   # selections yank only on right-click
 ```
 
