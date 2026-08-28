@@ -114,6 +114,9 @@ struct Client {
     auto: Option<AutoState>,
     /// `Some` while in fuzzy tab-find mode.
     finder: Option<find::FinderState>,
+    /// The tab held as this connection's pending yank; the tab keeps
+    /// running in place until paste moves it.
+    yank: Option<TabId>,
     /// The pointer shape last written to the client's terminal (an OSC
     /// 22 name), so hover updates only write changes.
     pointer: &'static str,
@@ -680,6 +683,7 @@ impl Server {
                 grid: None,
                 auto: None,
                 finder: None,
+                yank: None,
                 pointer: "default",
             },
         );
@@ -903,6 +907,17 @@ impl Server {
             // maximizing its window if minimized.
             Effect::GotoIndicator(ind) => {
                 self.attach_to_tab(conn, ind.session, ind.window, ind.tab);
+            }
+            Effect::YankTab(id) => {
+                if let Some(client) = self.clients.get_mut(&conn) {
+                    client.yank = Some(id);
+                }
+            }
+            Effect::PasteTab => self.paste_yank(conn),
+            Effect::ClearYank => {
+                if let Some(client) = self.clients.get_mut(&conn) {
+                    client.yank = None;
+                }
             }
             Effect::CycleAgent => self.cycle_agent(conn),
             Effect::Ended => self.end_session(sid),
@@ -1231,6 +1246,44 @@ impl Server {
         });
         if let Some((sid, window, index)) = self.next_attention(cursor) {
             self.attach_to_tab(conn, sid, window, index);
+        }
+    }
+
+    /// Move the connection's pending yank into its attached session's
+    /// focused window. No pending yank discards the key; a yank whose
+    /// tab is gone, or already in the focused window, just clears.
+    fn paste_yank(&mut self, conn: ConnId) {
+        let Some(client) = self.clients.get(&conn) else {
+            return;
+        };
+        let Some(id) = client.yank else {
+            return;
+        };
+        let dest_sid = client.attached;
+        let Some(dest_focus) = self.sessions.get(&dest_sid).map(|s| s.focused_active().0) else {
+            return;
+        };
+        if let Some(client) = self.clients.get_mut(&conn) {
+            client.yank = None;
+        }
+        let Some((src_sid, src_window, _)) = self.locate(id) else {
+            return;
+        };
+        if src_sid == dest_sid && src_window == dest_focus {
+            return;
+        }
+        let Some((tab, ended)) = self
+            .sessions
+            .get_mut(&src_sid)
+            .and_then(|s| s.extract_tab(id))
+        else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(&dest_sid) {
+            session.insert_tab(tab);
+        }
+        if ended {
+            self.end_session(src_sid);
         }
     }
 
@@ -1685,6 +1738,17 @@ impl Server {
                 .find(|(s, _)| *s == sid)
                 .map(|(_, ind)| ind.clone());
             session.set_indicator(indicator);
+        }
+        // Pending yanks are connection state; hand each session the ones
+        // pointing at its tabs so their indicators carry the mark.
+        let yanks: Vec<TabId> = self.clients.values().filter_map(|c| c.yank).collect();
+        for session in self.sessions.values_mut() {
+            let held = yanks
+                .iter()
+                .copied()
+                .filter(|&id| session.has_tab(id))
+                .collect();
+            session.set_yanked(held);
         }
         let Server {
             sessions, clients, ..

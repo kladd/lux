@@ -1,5 +1,10 @@
 # News
 
+## 2026-08-27
+
+- `prefix+y` yanks a tab and `prefix+P` pastes it into any session's
+  focused window; `prefix+Escape` cancels.
+
 ## 2026-08-24
 
 - Tab names too long for the tab bar are truncated with an ellipsis;

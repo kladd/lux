@@ -52,6 +52,11 @@ pub enum Command {
     CloseTab,
     /// Terminate every tab in the focused window.
     CloseWindow,
+    /// Record the focused window's active tab as the connection's
+    /// pending yank.
+    YankTab,
+    /// Move the connection's pending yank into the focused window.
+    PasteTab,
     /// Write one literal press of the prefix key to the focused window's
     /// PTY.
     SendPrefix,
@@ -103,6 +108,8 @@ impl Command {
             Command::RenameTab => "rename tab",
             Command::CloseTab => "close tab",
             Command::CloseWindow => "close window",
+            Command::YankTab => "yank tab",
+            Command::PasteTab => "paste yanked tab",
             Command::SendPrefix => "send prefix key",
             Command::CycleAgent => "next agent needing attention",
         }
@@ -316,6 +323,8 @@ impl Default for KeyTable {
             cmd(',', Command::RenameTab),
             cmd('w', Command::CloseTab),
             cmd('x', Command::CloseWindow),
+            cmd('y', Command::YankTab),
+            cmd('P', Command::PasteTab),
             // Prefix+m enters the swap submap; the direction key picks
             // the spatially adjacent window the focused window trades
             // places with.
@@ -602,6 +611,23 @@ mod tests {
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('x'), KeyModifiers::NONE)),
             Some(Command::CloseWindow)
+        );
+    }
+
+    #[test]
+    fn yank_and_paste_are_bound() {
+        let table = KeyTable::default();
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(Command::YankTab)
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('P'), KeyModifiers::SHIFT)),
+            Some(Command::PasteTab)
+        );
+        assert_eq!(
+            lookup(&table, key(CtKeyCode::Char('p'), KeyModifiers::NONE)),
+            Some(Command::PrevTab)
         );
     }
 

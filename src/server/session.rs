@@ -77,6 +77,14 @@ pub enum Effect {
     Paste,
     /// Set the client terminal's mouse pointer shape (an OSC 22 name).
     Pointer(&'static str),
+    /// Record this tab as the driving client's connection-scoped
+    /// pending yank.
+    YankTab(TabId),
+    /// Move the driving client's pending yank into this session's
+    /// focused window.
+    PasteTab,
+    /// Clear the driving client's pending yank, if any.
+    ClearYank,
     /// Land on the pending-agent indicator's tab, which may live in
     /// another session.
     GotoIndicator(Indicator),
@@ -191,6 +199,8 @@ const CONTROLS_WIDTH: u16 = 6;
 struct TabBadge {
     active: bool,
     name: String,
+    /// Marked while held as a pending yank.
+    yanked: bool,
     agent: Option<agent::Visual>,
     /// The x-extent this badge occupies in the bar, for click hit-tests;
     /// mirrors render_tab_bar's layout.
@@ -391,6 +401,10 @@ pub struct Session {
     /// The pending-agent indicator to show in the status line's
     /// hostname block, set by the server each render pass.
     indicator: Option<Indicator>,
+    /// Tabs in this session held as some connection's pending yank,
+    /// set by the server each render pass; their tab-bar indicators
+    /// carry a mark.
+    yanked: Vec<TabId>,
     view: View,
     area: Rect,
     /// The clock text as of the last computed view.
@@ -432,6 +446,7 @@ impl Session {
             selection: None,
             border_drag: None,
             indicator: None,
+            yanked: Vec::new(),
             view: View::default(),
             area,
             clock: String::new(),
@@ -504,6 +519,7 @@ impl Session {
             selection: None,
             border_drag: None,
             indicator: None,
+            yanked: Vec::new(),
             view: View::default(),
             area,
             clock: String::new(),
@@ -739,6 +755,15 @@ impl Session {
         }
     }
 
+    /// Set which of this session's tabs are held as pending yanks; a
+    /// change forces a redraw.
+    pub fn set_yanked(&mut self, yanked: Vec<TabId>) {
+        if self.yanked != yanked {
+            self.yanked = yanked;
+            self.force_redraw = true;
+        }
+    }
+
     /// Every tab in window layout order then tab order, each as its
     /// window id and position in that window's tab list.
     pub fn all_tabs(&self) -> Vec<(WindowId, usize)> {
@@ -843,9 +868,10 @@ impl Session {
             self.resize_repeat = None;
             // Whatever this key does, the hint popup changes or closes.
             self.force_redraw = true;
-            // Escape discards the pending sequence.
+            // Escape discards the pending sequence; directly after the
+            // prefix it also clears the connection's pending yank.
             if key.code == CtKeyCode::Esc {
-                return None;
+                return path.is_empty().then_some(Effect::ClearYank);
             }
             // Every recognized sequence
             // dispatches through the single, server-side keybinding table.
@@ -1363,6 +1389,13 @@ impl Session {
             }
             // Prefix+x closes the focused window outright.
             Command::CloseWindow => self.close_window(),
+            // The pending yank is connection state; the server records
+            // and moves it.
+            Command::YankTab => {
+                let id = self.windows[&self.focus].active_tab().id;
+                return Some(Effect::YankTab(id));
+            }
+            Command::PasteTab => return Some(Effect::PasteTab),
             // Prefix+prefix forwards a literal prefix key press, arming
             // the repeat window.
             Command::SendPrefix => {
@@ -1892,8 +1925,15 @@ impl Session {
         // A window's last tab exiting collapses the window.
         let mut win = self.windows.remove(&win_id).expect("window exists");
         win.tabs.pop().expect("last tab exists").wait();
+        self.collapse_window(win_id)
+    }
+
+    /// Collapse a window already removed from the window map: its space
+    /// goes to its sibling subtree, focus moves off it if needed, and a
+    /// minimized window just drops its status-line title. Returns
+    /// `Effect::Ended` when it was the session's last window.
+    fn collapse_window(&mut self, win_id: WindowId) -> Option<Effect> {
         if self.windows.is_empty() {
-            // The session's last process is gone.
             return Some(Effect::Ended);
         }
         self.drop_selection_in(win_id);
@@ -1928,6 +1968,48 @@ impl Session {
         }
         self.force_redraw = true;
         None
+    }
+
+    /// Remove the tab with `id` from its window and hand it over for
+    /// relocation into another window, possibly in another session. A
+    /// window left with no tabs collapses through the same removal path
+    /// as a process exit; `true` alongside the tab means the collapse
+    /// emptied the whole session.
+    pub fn extract_tab(&mut self, id: TabId) -> Option<(Tab, bool)> {
+        let (win_id, idx) = self.locate_tab(id)?;
+        let win = self.windows.get_mut(&win_id).expect("window exists");
+        if win.tabs.len() > 1 {
+            let active_removed = idx == win.active;
+            let tab = win.tabs.remove(idx);
+            if idx < win.active || win.active == win.tabs.len() {
+                win.active -= 1;
+            }
+            if active_removed {
+                self.drop_selection_in(win_id);
+            }
+            self.force_redraw = true;
+            return Some((tab, false));
+        }
+        let mut win = self.windows.remove(&win_id).expect("window exists");
+        let tab = win.tabs.pop().expect("last tab exists");
+        let ended = matches!(self.collapse_window(win_id), Some(Effect::Ended));
+        self.force_redraw = true;
+        Some((tab, ended))
+    }
+
+    /// Append a relocated tab to the focused window's tab list as its
+    /// active tab, resized to that window's content rectangle.
+    pub fn insert_tab(&mut self, tab: Tab) {
+        self.drop_selection_in(self.focus);
+        let win = self
+            .windows
+            .get_mut(&self.focus)
+            .expect("focused window exists");
+        win.tabs.push(tab);
+        win.active = win.tabs.len() - 1;
+        let content = win.content_rect();
+        win.active_tab_mut().resize(content);
+        self.force_redraw = true;
     }
 
     pub fn needs_redraw(&self) -> bool {
@@ -2007,6 +2089,7 @@ impl Session {
             None => layout::compute(&self.tree, tree_area(self.area)),
         };
         let now = Instant::now();
+        let yanked = self.yanked.clone();
         let mut chrome = Vec::with_capacity(rects.len());
         for (id, rect) in rects {
             let Some(win) = self.windows.get_mut(&id) else {
@@ -2033,12 +2116,15 @@ impl Session {
                 .iter()
                 .map(|t| t.agent.as_ref().map(|a| a.visual(now)))
                 .collect();
+            let marks: Vec<bool> = win.tabs.iter().map(|t| yanked.contains(&t.id)).collect();
             let fixed: usize = visuals
                 .iter()
+                .zip(&marks)
                 .enumerate()
-                .map(|(i, v)| {
+                .map(|(i, (v, &mark))| {
                     format!(" {}:", i).chars().count()
                         + v.as_ref().map_or(0, |v| 1 + v.text.chars().count())
+                        + mark as usize
                         + 1
                 })
                 .sum();
@@ -2058,6 +2144,7 @@ impl Session {
                 .map(|(i, (tab, agent))| {
                     let name = truncate_name(&tab.name, widths[i]);
                     let mut width = format!(" {}:{}", i, name).chars().count() as u16;
+                    width += marks[i] as u16;
                     if let Some(visual) = &agent {
                         width += 1 + visual.text.chars().count() as u16;
                     }
@@ -2067,6 +2154,7 @@ impl Session {
                     TabBadge {
                         active: i == active,
                         name,
+                        yanked: marks[i],
                         agent,
                         span: start..next_x,
                     }
@@ -2438,6 +2526,9 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
                 if !put(&mut x, ch, style) {
                     break 'badges;
                 }
+            }
+            if badge.yanked && !put(&mut x, '*', style.fg(Color::Yellow)) {
+                break 'badges;
             }
             // The bracketed status text, in its
             // state's color, only for tabs identified as running a detected agent;
