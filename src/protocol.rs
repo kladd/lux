@@ -1,14 +1,5 @@
-//! The attach protocol shared by client and server — the only thing the
-//! two sides communicate through.
-//!
-//! One Unix stream per client. The client sends a single request line; for
-//! attach requests the same sendmsg carries its stdin and stdout file
-//! descriptors as SCM_RIGHTS ancillary data. After a
-//! successful attach the stream stays open as a control channel: the
-//! client sends `resize` lines, and the server ending
-//! the stream is the detach/end signal. All terminal
-//! input and rendered output flow over the passed descriptors directly,
-//! never through protocol messages.
+//! The client-server protocol: one request line per Unix stream, with the
+//! client's terminal descriptors passed as SCM_RIGHTS on attach.
 
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -17,25 +8,18 @@ use std::path::PathBuf;
 
 use sendfd::{RecvWithFd, SendWithFd};
 
-/// Client request line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Create a new auto-named session and attach. Carries fds.
+    /// Attach to a new auto-named session. Carries fds.
     New,
-    /// Attach to the named session, creating it first if no session has
-    /// that name. Carries fds.
+    /// Attach to the named session, creating it if needed. Carries fds.
     Session(String),
-    /// Attach to the most recently attached session, or to a new
-    /// auto-named one if no session has ever been attached to.
-    /// Carries fds.
+    /// Attach to the last attached session, or a new one if none. Carries fds.
     Recent,
-    /// List session names.
     Ls,
-    /// Terminate the server.
+    /// Stop the server.
     Kill,
-    /// Terminate one named session.
     KillSession(String),
-    /// The attached client's terminal was resized.
     Resize,
 }
 
@@ -70,8 +54,6 @@ impl Request {
     }
 }
 
-/// `$XDG_RUNTIME_DIR/lux/server.sock`, falling back to
-/// `/tmp/lux-$UID/server.sock`.
 pub fn socket_path() -> PathBuf {
     socket_dir().join("server.sock")
 }
@@ -83,7 +65,6 @@ pub fn socket_dir() -> PathBuf {
     }
 }
 
-/// Send a request line together with the fds to pass.
 pub fn send_request_with_fds(
     stream: &UnixStream,
     request: &Request,
@@ -97,15 +78,14 @@ pub fn send_request_with_fds(
     Ok(())
 }
 
-/// Receive the initial request line, capturing any passed fds.
 pub fn recv_request_with_fds(stream: &UnixStream) -> std::io::Result<(String, Vec<OwnedFd>)> {
     let mut buf = [0u8; 256];
     let mut fd_buf = [-1 as RawFd; 4];
     let (n, nfds) = stream.recv_with_fd(&mut buf, &mut fd_buf)?;
     let fds = fd_buf[..nfds]
         .iter()
-        // Safety: recv_with_fd returns fds freshly installed in this
-        // process by the kernel; we are their sole owner.
+        // SAFETY: the kernel just installed these fds in this process and
+        // nothing else owns them.
         .map(|&fd| unsafe { OwnedFd::from_raw_fd(fd) })
         .collect();
     Ok((String::from_utf8_lossy(&buf[..n]).into_owned(), fds))
@@ -117,7 +97,6 @@ pub fn write_line(stream: &mut UnixStream, line: &str) -> std::io::Result<()> {
     stream.flush()
 }
 
-/// Read one newline-terminated line; `None` on EOF.
 pub fn read_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];

@@ -1,6 +1,4 @@
-//! The keybinding table: every recognized prefix key sequence dispatches
-//! through this single table. The table is hardcoded and
-//! non-configurable; a config file may override only the prefix key.
+//! The keybinding table, hardcoded except for the prefix key.
 
 use ratatui::crossterm::event::{KeyCode as CtKeyCode, KeyEvent, KeyModifiers as CtMods};
 
@@ -12,65 +10,33 @@ pub enum Command {
     SplitStacked,
     NewTab,
     NextTab,
-    /// Terminate every non-focused window's child processes
-    /// (vim's `<C-w>o` "only").
     OnlyWindow,
     FocusDir(Dir),
     ResizeDir(Dir),
-    /// Previous tab, wrapping.
     PrevTab,
-    /// Detach the client from its session.
     Detach,
-    /// Open the session switcher.
     Switcher,
-    /// Open the CLAUDECOM grid directly, skipping the switcher.
     Grid,
-    /// Open the fuzzy tab finder.
     FindTab,
-    /// Open the ex command line.
     OpenEx,
-    /// Enter scroll mode for the focused window's active tab.
     ScrollMode,
-    /// Make the focused window's tab at this index active.
     SelectTab(usize),
-    /// Move the focused window's active tab into the spatially adjacent
-    /// window in this direction.
     MoveTabDir(Dir),
-    /// Exchange the focused window with the window spatially adjacent
-    /// in this direction.
     SwapDir(Dir),
-    /// Toggle the focused window's maximized state.
     Maximize,
-    /// Flip the orientation of the split immediately containing the
-    /// focused window.
     Rotate,
-    /// Reset every split in the layout tree to an even ratio.
     Rebalance,
-    /// Open the rename prompt for the focused window's active tab.
     RenameTab,
-    /// Terminate the focused window's active tab.
     CloseTab,
-    /// Terminate every tab in the focused window.
     CloseWindow,
-    /// Record the focused window's active tab as the connection's
-    /// pending yank.
     YankTab,
-    /// Move the connection's pending yank into the focused window.
     PasteTab,
-    /// Write one literal press of the prefix key to the focused window's
-    /// PTY.
     SendPrefix,
-    /// Jump to the next agent tab in the done or blocked state, across
-    /// every session, wrapping.
     CycleAgent,
 }
 
 impl Command {
-    /// The short description the key-hint popup displays
-    /// for this command. A method on `Command` itself, with an
-    /// exhaustive match, so a new
-    /// command can't ship without hint text and the popup can't drift
-    /// from the real bindings.
+    /// Hint-popup text.
     pub fn description(self) -> &'static str {
         match self {
             Command::SplitSideBySide => "split side by side",
@@ -116,8 +82,6 @@ impl Command {
     }
 }
 
-/// One key sequence following the prefix: a key code plus whether Ctrl
-/// and Shift are held. This is the identity table lookups match on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct KeyMatch {
     pub code: CtKeyCode,
@@ -128,9 +92,8 @@ pub struct KeyMatch {
 impl KeyMatch {
     pub fn from_event(key: KeyEvent) -> Self {
         let shift = match key.code {
-            // A character's case already carries Shift; tracking the
-            // modifier too would split `H` into two identities depending
-            // on how the terminal reports it.
+            // A character's case already carries Shift. Tracking the
+            // modifier too would split `H` into two identities.
             CtKeyCode::Char(_) => false,
             _ => key.modifiers.contains(CtMods::SHIFT),
         };
@@ -141,14 +104,11 @@ impl KeyMatch {
         }
     }
 
-    /// The key's display label in the hint popup, matching the config
-    /// file's key-spec syntax (`x`, `C-x`) extended with arrow names
-    /// (`Left`, `S-Left`).
+    /// Hint-popup label in the config file's key syntax (`C-x`, `S-Left`).
     pub fn label(self) -> String {
         let key = match self.code {
             CtKeyCode::Char(c) => c.to_string(),
-            // The arrow keys Debug-format as their display names (Left,
-            // Down, Up, Right).
+            // Arrow keys Debug-format as Left, Down, Up, Right.
             other => format!("{other:?}"),
         };
         let key = if self.shift { format!("S-{key}") } else { key };
@@ -156,16 +116,12 @@ impl KeyMatch {
     }
 }
 
-/// Ctrl-b is the default prefix key.
 pub const DEFAULT_PREFIX: KeyMatch = KeyMatch {
     code: CtKeyCode::Char('b'),
     ctrl: true,
     shift: false,
 };
 
-/// One entry in the keybinding tree: a key resolves to
-/// either a command or a deeper node of further bindings, forming a
-/// recursive trie.
 #[derive(Clone, PartialEq, Debug)]
 pub enum KeyTrie {
     Command(Command),
@@ -173,8 +129,6 @@ pub enum KeyTrie {
 }
 
 impl KeyTrie {
-    /// The hint text for the key bound to this entry — the
-    /// command's description, or the node's for a chord that continues.
     pub fn description(&self) -> &'static str {
         match self {
             KeyTrie::Command(command) => command.description(),
@@ -183,17 +137,15 @@ impl KeyTrie {
     }
 }
 
-/// One node of the keybinding tree: the keys recognized at one level of a
-/// pending chord.
 #[derive(Clone, PartialEq, Debug)]
 pub struct KeyTrieNode {
-    /// The hint text for the key that enters this node.
+    /// Hint text for the key that enters this node.
     pub description: &'static str,
     pub bindings: Vec<(KeyMatch, KeyTrie)>,
 }
 
 impl KeyTrieNode {
-    /// The table's root: no key enters it, so it carries no description.
+    /// No key enters the root, so it has no description.
     pub fn root(bindings: Vec<(KeyMatch, KeyTrie)>) -> Self {
         Self {
             description: "",
@@ -201,8 +153,6 @@ impl KeyTrieNode {
         }
     }
 
-    /// The entry bound to `key` at this node. `None` means the pending
-    /// sequence dead-ends and is discarded.
     pub fn get(&self, key: KeyMatch) -> Option<&KeyTrie> {
         self.bindings
             .iter()
@@ -210,10 +160,8 @@ impl KeyTrieNode {
             .map(|(_, t)| t)
     }
 
-    /// The key-hint popup's rows for this node, at whichever
-    /// chord depth is pending, built directly from the
-    /// table so they cover exactly the keys `get` recognizes. Keys sharing
-    /// a description collapse into one row, in table order.
+    /// Hint-popup rows, with keys that share a description collapsed into
+    /// one row.
     pub fn hints(&self) -> Vec<(String, &'static str)> {
         let mut rows: Vec<(Vec<KeyMatch>, &'static str)> = Vec::new();
         for (key, trie) in &self.bindings {
@@ -229,19 +177,12 @@ impl KeyTrieNode {
     }
 }
 
-/// The active prefix key and keybinding table dispatch goes through:
-/// the hardcoded defaults, or defaults with config
-/// overrides applied.
 pub struct KeyTable {
     pub prefix: KeyMatch,
-    /// The root node: the keys recognized directly after the prefix.
     pub root: KeyTrieNode,
 }
 
 impl Default for KeyTable {
-    /// The hardcoded defaults, covering every prefix sequence for
-    /// splits, only-window, resize, tabs, directional focus,
-    /// the detach stub, the session switcher, and the ex command line.
     fn default() -> Self {
         fn plain(c: char) -> KeyMatch {
             KeyMatch {
@@ -253,7 +194,6 @@ impl Default for KeyTable {
         fn cmd(c: char, command: Command) -> (KeyMatch, KeyTrie) {
             (plain(c), KeyTrie::Command(command))
         }
-        // Arrow-key alternates for the vim directional letters.
         fn arrow(code: CtKeyCode, command: Command) -> (KeyMatch, KeyTrie) {
             (
                 KeyMatch {
@@ -298,8 +238,6 @@ impl Default for KeyTable {
             arrow(CtKeyCode::Down, Command::FocusDir(Dir::Down)),
             arrow(CtKeyCode::Up, Command::FocusDir(Dir::Up)),
             arrow(CtKeyCode::Right, Command::FocusDir(Dir::Right)),
-            // The shifted directional keys move the active tab into the
-            // adjacent window, where the unshifted ones move focus.
             cmd('H', Command::MoveTabDir(Dir::Left)),
             cmd('J', Command::MoveTabDir(Dir::Down)),
             cmd('K', Command::MoveTabDir(Dir::Up)),
@@ -318,16 +256,12 @@ impl Default for KeyTable {
                 },
                 KeyTrie::Command(Command::CycleAgent),
             ),
-            // `=` evokes making the splits equal.
             cmd('=', Command::Rebalance),
             cmd(',', Command::RenameTab),
             cmd('w', Command::CloseTab),
             cmd('x', Command::CloseWindow),
             cmd('y', Command::YankTab),
             cmd('P', Command::PasteTab),
-            // Prefix+m enters the swap submap; the direction key picks
-            // the spatially adjacent window the focused window trades
-            // places with.
             (
                 plain('m'),
                 KeyTrie::Node(KeyTrieNode {
@@ -344,9 +278,6 @@ impl Default for KeyTable {
                     ],
                 }),
             ),
-            // Prefix+r enters the resize submap; the same
-            // direction keys resize toward where the unshifted root keys
-            // focus.
             (
                 plain('r'),
                 KeyTrie::Node(KeyTrieNode {
@@ -364,7 +295,6 @@ impl Default for KeyTable {
                 }),
             ),
         ];
-        // Prefix+0-9 selects the tab at that index.
         for d in 0..=9 {
             let c = char::from_digit(d, 10).expect("single digit");
             bindings.push(cmd(c, Command::SelectTab(d as usize)));
@@ -377,13 +307,10 @@ impl Default for KeyTable {
 }
 
 impl KeyTable {
-    /// Whether `key` is the prefix key.
     pub fn is_prefix(&self, key: KeyEvent) -> bool {
         KeyMatch::from_event(key) == self.prefix
     }
 
-    /// Change the prefix key, rebinding its send-prefix root binding to
-    /// match.
     pub fn set_prefix(&mut self, prefix: KeyMatch) {
         for (key, trie) in &mut self.root.bindings {
             if *trie == KeyTrie::Command(Command::SendPrefix) {
@@ -393,9 +320,6 @@ impl KeyTable {
         self.prefix = prefix;
     }
 
-    /// The node a pending chord's accumulated keys lead to, walking from
-    /// the root. `None` when the path doesn't resolve to
-    /// a node.
     pub fn node_at(&self, path: &[KeyMatch]) -> Option<&KeyTrieNode> {
         let mut node = &self.root;
         for key in path {
@@ -408,9 +332,8 @@ impl KeyTable {
     }
 }
 
-/// Label a group of keys sharing one hint row: a run of consecutive plain
-/// characters (the digit row) reads as a range (`0-9`); anything else
-/// joins with commas.
+/// A run of consecutive plain characters, like the digit row, collapses to
+/// a range.
 fn key_group_label(keys: &[KeyMatch]) -> String {
     if keys.len() > 2 {
         let chars: Option<Vec<char>> = keys
@@ -441,8 +364,6 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
-    /// The command bound to `key` at the table's root; `None` for a chord
-    /// node or an unbound key.
     fn lookup(table: &KeyTable, key: KeyEvent) -> Option<Command> {
         match table.root.get(KeyMatch::from_event(key)) {
             Some(KeyTrie::Command(command)) => Some(*command),
@@ -452,8 +373,6 @@ mod tests {
 
     #[test]
     fn hjkl_focus_and_shifted_letters_move_tabs() {
-        // Lowercase h focuses; its shifted twin moves the active tab the
-        // same direction.
         let table = KeyTable::default();
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('h'), KeyModifiers::NONE)),
@@ -470,7 +389,6 @@ mod tests {
                 Some(Command::MoveTabDir(dir))
             );
         }
-        // No Ctrl chords remain in the default table.
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('h'), KeyModifiers::CONTROL)),
             None
@@ -483,8 +401,6 @@ mod tests {
 
     #[test]
     fn arrows_focus_and_shifted_arrows_move_tabs() {
-        // The arrow keys are alternates for the vim letters: bare arrows
-        // focus, shifted arrows move the active tab.
         let table = KeyTable::default();
         for (code, dir) in [
             (CtKeyCode::Left, Dir::Left),
@@ -501,7 +417,6 @@ mod tests {
                 Some(Command::MoveTabDir(dir))
             );
         }
-        // Ctrl-Arrow stays unbound.
         assert_eq!(
             lookup(&table, key(CtKeyCode::Left, KeyModifiers::CONTROL)),
             None
@@ -510,7 +425,6 @@ mod tests {
 
     #[test]
     fn maximize_and_rotate_are_bound() {
-        // z toggles maximize; i flips the enclosing split.
         let table = KeyTable::default();
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char('z'), KeyModifiers::NONE)),
@@ -585,7 +499,6 @@ mod tests {
 
     #[test]
     fn digits_select_tabs_by_index() {
-        // Every digit is bound to direct tab selection.
         let table = KeyTable::default();
         for d in 0..=9u32 {
             let c = char::from_digit(d, 10).unwrap();
@@ -602,7 +515,6 @@ mod tests {
 
     #[test]
     fn rename_and_close_window_are_bound() {
-        // Comma renames the active tab; x closes the window.
         let table = KeyTable::default();
         assert_eq!(
             lookup(&table, key(CtKeyCode::Char(','), KeyModifiers::NONE)),
@@ -647,7 +559,6 @@ mod tests {
             lookup(&table, key(CtKeyCode::Char('b'), KeyModifiers::CONTROL)),
             Some(Command::SendPrefix)
         );
-        // The binding follows a configured prefix.
         let mut table = KeyTable::default();
         let prefix = KeyMatch {
             code: CtKeyCode::Char('a'),
@@ -686,9 +597,6 @@ mod tests {
 
     #[test]
     fn prefix_m_is_a_chord_node_of_directional_swaps() {
-        // M resolves to a node, not a command, and its submap binds the
-        // four vim directions plus their arrow alternates, each swapping
-        // the focused window with its spatial neighbor on that side.
         let table = KeyTable::default();
         let plain = |c| KeyMatch {
             code: CtKeyCode::Char(c),
@@ -714,7 +622,6 @@ mod tests {
             assert_eq!(node.get(plain(c)), expect);
             assert_eq!(node.get(arrow(code)), expect);
         }
-        // Any other key dead-ends inside the node.
         assert_eq!(node.get(plain('x')), None);
         assert_eq!(node.get(plain('m')), None);
         assert_eq!(node.bindings.len(), 8);
@@ -722,8 +629,6 @@ mod tests {
 
     #[test]
     fn prefix_r_is_a_chord_node_of_directional_resizes() {
-        // R resolves to the resize submap, binding the four vim
-        // directions and their arrow alternates.
         let table = KeyTable::default();
         let plain = |c| KeyMatch {
             code: CtKeyCode::Char(c),
@@ -761,15 +666,11 @@ mod tests {
             ctrl: false,
             shift: false,
         };
-        // The empty path is the root (a bare prefix press).
         assert_eq!(
             table.node_at(&[]).expect("root").bindings.len(),
             table.root.bindings.len()
         );
-        // M leads one level deeper.
         assert!(table.node_at(&[plain('m')]).is_some());
-        // A command key ends a chord; an unbound key is
-        // never a node.
         assert!(table.node_at(&[plain('c')]).is_none());
         assert!(table.node_at(&[plain('x')]).is_none());
         assert!(table.node_at(&[plain('m'), plain('h')]).is_none());
@@ -777,8 +678,6 @@ mod tests {
 
     #[test]
     fn chord_node_hints_list_its_own_keys() {
-        // While a chord is pending the popup's rows come
-        // from the pending node, not the root.
         let table = KeyTable::default();
         let m = KeyMatch {
             code: CtKeyCode::Char('m'),
@@ -786,14 +685,11 @@ mod tests {
             shift: false,
         };
         let rows = table.node_at(&[m]).expect("m node").hints();
-        // Each direction's letter and arrow share a description and
-        // collapse into one row.
         assert_eq!(rows.len(), 4);
         assert!(rows.contains(&("h, Left".to_string(), "swap window left")));
         assert!(rows.contains(&("j, Down".to_string(), "swap window down")));
         assert!(rows.contains(&("k, Up".to_string(), "swap window up")));
         assert!(rows.contains(&("l, Right".to_string(), "swap window right")));
-        // The root's rows include the node entry itself.
         assert!(
             table
                 .root
@@ -804,10 +700,6 @@ mod tests {
 
     #[test]
     fn every_binding_has_a_description() {
-        // The table associates hint text with every entry
-        // it binds, at every depth (the exhaustive match guarantees
-        // command coverage at compile time; this pins that none of it —
-        // including node descriptions — is blank).
         fn check(node: &KeyTrieNode) {
             for (_, trie) in &node.bindings {
                 assert!(
@@ -824,8 +716,6 @@ mod tests {
 
     #[test]
     fn hints_cover_every_binding_without_duplicates() {
-        // Rows come straight from the table — every bound
-        // key appears in exactly one row's key label.
         let table = KeyTable::default();
         let rows = table.root.hints();
         let descs: Vec<_> = rows.iter().map(|(_, d)| *d).collect();
@@ -848,22 +738,17 @@ mod tests {
     fn hint_rows_group_and_label_keys() {
         let table = KeyTable::default();
         let rows = table.root.hints();
-        // The ten digit bindings share one description and collapse to a
-        // range label.
         assert!(rows.contains(&("0-9".to_string(), "select tab by index")));
         assert!(rows.contains(&("%".to_string(), "split side by side")));
-        // A vim letter and its arrow alternate share a row; shifted
-        // arrows label with the S- prefix.
         assert!(rows.contains(&("h, Left".to_string(), "focus window left")));
         assert!(rows.contains(&("H, S-Left".to_string(), "move tab left")));
-        // Ctrl chords label with the config file's C- syntax.
         let ctrl = KeyMatch {
             code: CtKeyCode::Char('x'),
             ctrl: true,
             shift: false,
         };
         assert_eq!(ctrl.label(), "C-x");
-        // Two keys on one description join with a comma, not a range.
+        // Two keys join with a comma, never a range.
         let pair = [
             KeyMatch {
                 code: CtKeyCode::Char('a'),

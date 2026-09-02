@@ -1,7 +1,4 @@
-//! Server-side terminal input decoding: raw bytes
-//! read from a client's passed stdin descriptor are parsed with termwiz's
-//! `InputParser` and converted to the crossterm-typed events the session
-//! layer already speaks, reproducing the single-process behavior.
+//! Decodes a client's raw terminal input into crossterm events.
 
 use ratatui::crossterm::event::{
     KeyCode as CtKeyCode, KeyEvent, KeyModifiers as CtMods, MouseButton as CtMouseButton,
@@ -15,13 +12,11 @@ use termwiz::input::{
 pub enum DecodedInput {
     Key(KeyEvent),
     Mouse(CtMouseEvent),
-    /// Bracketed paste from the client terminal.
     Paste(String),
 }
 
-/// The part of pasted text a single-line prompt can take: everything
-/// before the first line break or other control character, since a
-/// literally inserted line break would submit mid-paste.
+/// Pasted text up to the first control character, since a pasted newline
+/// would submit a single-line prompt.
 pub fn prompt_paste(text: &str) -> &str {
     let end = text.find(char::is_control).unwrap_or(text.len());
     &text[..end]
@@ -29,32 +24,25 @@ pub fn prompt_paste(text: &str) -> &str {
 
 pub struct InputDecoder {
     parser: InputParser,
-    /// Buttons held as of the previous mouse event, to derive
-    /// press/release/drag kinds from termwiz's stateless reports.
+    /// Buttons held at the last mouse event, since termwiz reports carry
+    /// no press or release state.
     buttons: TwButtons,
-    /// Bytes carried across reads: an in-flight paste's content while its
-    /// end marker hasn't arrived, or a partial paste-start marker cut off
-    /// by the end of a read.
+    /// Bytes carried to the next read: an unfinished paste, or a partial
+    /// paste-start marker.
     held: Vec<u8>,
-    /// Whether the byte stream is inside a bracketed paste.
     in_paste: bool,
 }
 
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
-/// Where a paste marker sits in a chunk of input, if anywhere.
 enum Marker {
-    /// The marker occurs whole at this offset.
     Full(usize),
-    /// A prefix of the marker runs from this offset to the end of the
-    /// input; the next read may complete it.
+    /// A prefix of the marker runs from this offset to the end of the input.
     Partial(usize),
     None,
 }
 
-/// The first occurrence of `marker` in `hay`, complete or cut off by the
-/// end of the input.
 fn find_marker(hay: &[u8], marker: &[u8]) -> Marker {
     for i in 0..hay.len() {
         if hay[i] != marker[0] {
@@ -84,9 +72,8 @@ impl Default for InputDecoder {
 }
 
 impl InputDecoder {
-    /// Decode one read's bytes, carrying paste state across reads: a
-    /// bracketed paste is delivered as a single event once its end marker
-    /// arrives, never as key events, however the stream is chunked.
+    /// A paste arrives as one event once its end marker does, however the
+    /// reads are chunked.
     pub fn decode(&mut self, bytes: &[u8]) -> Vec<DecodedInput> {
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(bytes);
@@ -101,8 +88,6 @@ impl InputDecoder {
                         self.in_paste = false;
                         rest = &rest[pos + PASTE_END.len()..];
                     }
-                    // Without the end marker the content is withheld —
-                    // it may even stop mid-marker.
                     _ => {
                         self.held = rest.to_vec();
                         return out;
@@ -115,8 +100,8 @@ impl InputDecoder {
                         self.in_paste = true;
                         rest = &rest[pos + PASTE_START.len()..];
                     }
-                    // The read stops mid-marker: hold the fragment until
-                    // the next read (or an idle flush) resolves it.
+                    // Hold the fragment until the next read or an idle
+                    // flush resolves it.
                     Marker::Partial(pos) => {
                         self.keys(&rest[..pos], &mut out);
                         self.held = rest[pos..].to_vec();
@@ -131,10 +116,8 @@ impl InputDecoder {
         }
     }
 
-    /// Resolve held bytes once the stream has gone idle: a paste-start
-    /// fragment that never completed was ordinary keys (e.g. a bare Esc).
-    /// An in-flight paste's content stays withheld — a paste is delivered
-    /// complete or not at all.
+    /// Call when the stream goes idle: a held marker fragment was really
+    /// keys, such as a bare Esc. An unfinished paste stays held.
     pub fn flush(&mut self) -> Vec<DecodedInput> {
         let mut out = Vec::new();
         if !self.in_paste && !self.held.is_empty() {
@@ -144,9 +127,8 @@ impl InputDecoder {
         out
     }
 
-    /// Parse non-paste bytes into key and mouse events. termwiz maps LF
-    /// and CR both to Enter, which would re-encode Ctrl-J (LF) as CR on
-    /// the pane pty; intercept LF so the two stay distinct keys.
+    /// termwiz turns LF into Enter, so LF is split out here to keep Ctrl-J
+    /// distinct from Enter.
     fn keys(&mut self, bytes: &[u8], out: &mut Vec<DecodedInput>) {
         let mut start = 0;
         let mut i = 0;
@@ -249,9 +231,8 @@ fn convert_mods(mods: TwMods) -> CtMods {
 fn convert_key(key: TwKeyEvent) -> Option<KeyEvent> {
     let mut mods = convert_mods(key.modifiers);
     let code = match key.key {
-        // Control bytes may surface as raw control chars; normalize them
-        // to what crossterm would have reported so the session layer (and
-        // the keybinding table's Ctrl matching) behaves identically.
+        // termwiz may surface control bytes as raw chars. Normalize them to
+        // crossterm's form so Ctrl bindings match.
         TwKey::Char('\r') => CtKeyCode::Enter,
         TwKey::Char('\t') => CtKeyCode::Tab,
         TwKey::Char('\u{7f}') | TwKey::Char('\u{8}') => CtKeyCode::Backspace,
@@ -300,24 +281,21 @@ mod tests {
         let mut d = InputDecoder::default();
         let evs = keys(&mut d, b"a");
         assert_eq!(evs[0].code, CtKeyCode::Char('a'));
-        // Ctrl-B (the default prefix) is byte 0x02.
+        // 0x02 is Ctrl-B.
         let evs = keys(&mut d, b"\x02");
         assert_eq!(evs[0].code, CtKeyCode::Char('b'));
         assert!(evs[0].modifiers.contains(CtMods::CONTROL));
         // Enter arrives as CR in raw mode.
         let evs = keys(&mut d, b"\r");
         assert_eq!(evs[0].code, CtKeyCode::Enter);
-        // Arrow key CSI.
         let evs = keys(&mut d, b"\x1b[A");
         assert_eq!(evs[0].code, CtKeyCode::Up);
     }
 
     #[test]
     fn shifted_arrows_keep_the_shift_modifier() {
-        // Shift-Arrow (CSI 1;2) must stay distinct from the bare arrow:
-        // the keybinding table binds focus to one and move-tab to the
-        // other.
         let mut d = InputDecoder::default();
+        // CSI 1;2D is Shift-Left.
         let evs = keys(&mut d, b"\x1b[1;2D");
         assert_eq!(evs[0].code, CtKeyCode::Left);
         assert!(evs[0].modifiers.contains(CtMods::SHIFT));
@@ -328,8 +306,6 @@ mod tests {
 
     #[test]
     fn bs_and_del_both_decode_as_backspace() {
-        // No binding distinguishes Ctrl-H from Backspace anymore; both bytes
-        // pass through as Backspace, matching termwiz's own collapsing.
         let mut d = InputDecoder::default();
         assert_eq!(keys(&mut d, b"\x08")[0].code, CtKeyCode::Backspace);
         assert_eq!(keys(&mut d, b"\x7f")[0].code, CtKeyCode::Backspace);
@@ -338,12 +314,9 @@ mod tests {
     #[test]
     fn lf_decodes_as_ctrl_j_not_enter() {
         let mut d = InputDecoder::default();
-        // Ctrl-J arrives as LF; it must stay distinct from Enter (CR) so
-        // apps that treat Ctrl-J as newline-insert don't see a submit.
         let evs = keys(&mut d, b"\n");
         assert_eq!(evs[0].code, CtKeyCode::Char('j'));
         assert!(evs[0].modifiers.contains(CtMods::CONTROL));
-        // Surrounding bytes keep their order.
         let evs = keys(&mut d, b"a\nb");
         let codes: Vec<_> = evs.iter().map(|e| e.code).collect();
         assert_eq!(
@@ -354,7 +327,6 @@ mod tests {
                 CtKeyCode::Char('b')
             ]
         );
-        // Alt-Ctrl-J arrives ESC-prefixed.
         let evs = keys(&mut d, b"\x1b\n");
         assert_eq!(evs[0].code, CtKeyCode::Char('j'));
         assert!(evs[0].modifiers.contains(CtMods::CONTROL | CtMods::ALT));
@@ -385,9 +357,6 @@ mod tests {
 
     #[test]
     fn paste_spanning_reads_arrives_as_one_event() {
-        // Content is withheld until the end marker arrives, then the
-        // whole paste is a single event, with the mid-paste LF as content
-        // rather than a keypress.
         let mut d = InputDecoder::default();
         assert!(d.decode(b"\x1b[200~one").is_empty());
         assert!(d.decode(b"\ntwo").is_empty());
@@ -397,9 +366,6 @@ mod tests {
 
     #[test]
     fn paste_markers_split_across_reads_still_frame_the_paste() {
-        // The start marker's tail and the end marker's head each arrive
-        // in a later read; neither fragment may leak as key events or
-        // literal text.
         let mut d = InputDecoder::default();
         let evs = d.decode(b"a\x1b[2");
         assert!(matches!(evs.as_slice(), [DecodedInput::Key(k)] if k.code == CtKeyCode::Char('a')));
@@ -429,21 +395,15 @@ mod tests {
 
     #[test]
     fn flush_resolves_a_held_marker_prefix_as_keys() {
-        // A bare Esc is indistinguishable from a paste marker's first
-        // byte until the stream goes idle; flush delivers it as the Esc
-        // key it was.
         let mut d = InputDecoder::default();
         assert!(d.decode(b"\x1b").is_empty());
         let evs = d.flush();
         assert!(matches!(evs.as_slice(), [DecodedInput::Key(k)] if k.code == CtKeyCode::Esc));
-        // Idle with nothing held stays silent.
         assert!(d.flush().is_empty());
     }
 
     #[test]
     fn flush_never_releases_an_unterminated_paste() {
-        // An in-flight paste survives idle: its content is delivered
-        // complete once the end marker arrives, or not at all.
         let mut d = InputDecoder::default();
         assert!(d.decode(b"\x1b[200~held\n").is_empty());
         assert!(d.flush().is_empty());
@@ -458,20 +418,20 @@ mod tests {
             Some(DecodedInput::Mouse(m)) => m,
             other => panic!("expected mouse event, got {:?}", other.is_some()),
         };
-        // Press left at 1-based (5, 3) → 0-based (4, 2).
+        // Left press at 1-based (5, 3).
         let m = ev(b"\x1b[<0;5;3M", &mut d);
         assert_eq!(m.kind, CtMouseKind::Down(CtMouseButton::Left));
         assert_eq!((m.column, m.row), (4, 2));
-        // Motion with left held (code 32) → drag.
+        // Code 32 is motion with left held.
         let m = ev(b"\x1b[<32;6;3M", &mut d);
         assert_eq!(m.kind, CtMouseKind::Drag(CtMouseButton::Left));
-        // Release (lowercase m).
+        // Lowercase m is a release.
         let m = ev(b"\x1b[<0;6;3m", &mut d);
         assert_eq!(m.kind, CtMouseKind::Up(CtMouseButton::Left));
-        // Wheel up (code 64).
+        // Code 64 is wheel up.
         let m = ev(b"\x1b[<64;6;3M", &mut d);
         assert_eq!(m.kind, CtMouseKind::ScrollUp);
-        // Wheel down (code 65).
+        // Code 65 is wheel down.
         let m = ev(b"\x1b[<65;6;3M", &mut d);
         assert_eq!(m.kind, CtMouseKind::ScrollDown);
     }

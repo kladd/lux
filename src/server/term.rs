@@ -1,15 +1,4 @@
 //! A ratatui backend over a client's passed stdout descriptor.
-//! CrosstermBackend writes escape sequences to any
-//! writer, but its `size()` queries the *server process's* stdout — which
-//! is /dev/null once daemonized — so this wrapper tracks the client
-//! terminal's size explicitly (updated via resize
-//! handling).
-//!
-//! Frames are bracketed in DEC 2026 synchronized updates with the cursor
-//! hidden while cells are written: ratatui only repositions the cursor
-//! *after* the diff, so without this the client terminal renders the
-//! cursor hopping across changing cells, and a resize's clear + full
-//! redraw shows up as a blank-screen flash.
 
 use std::fs::File;
 use std::io::{self, BufWriter};
@@ -23,17 +12,17 @@ use ratatui::layout::{Position, Size};
 
 pub struct FdBackend {
     inner: CrosstermBackend<BufWriter<File>>,
+    /// Tracked here because `CrosstermBackend::size()` queries the server's
+    /// own stdout, which is /dev/null once daemonized.
     size: Size,
-    /// Whether a synchronized update is open, i.e. we're mid-frame.
     synced: bool,
 }
 
 impl FdBackend {
     pub fn new(out: File, size: Size) -> Self {
         Self {
-            // Large enough to hold a typical full-screen redraw, so a
-            // frame reaches the terminal in one write even where DEC 2026
-            // isn't supported.
+            // Big enough that a full-screen redraw reaches the terminal in
+            // one write, even without DEC 2026.
             inner: CrosstermBackend::new(BufWriter::with_capacity(1 << 16, out)),
             size,
             synced: false,
@@ -44,9 +33,9 @@ impl FdBackend {
         self.size = size;
     }
 
-    /// Open the frame's synchronized update before its first byte of
-    /// output. The cursor stays hidden until ratatui re-shows it at its
-    /// final position after the diff.
+    /// Ratatui repositions the cursor only after the diff, so without a
+    /// synchronized update and a hidden cursor the cursor hops across
+    /// changing cells and a resize flashes blank.
     fn begin_sync(&mut self) -> io::Result<()> {
         if !self.synced {
             self.synced = true;
@@ -74,8 +63,8 @@ impl Backend for FdBackend {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        // Querying would require reading the client's tty; nothing calls
-        // this in lux's render path.
+        // The render path never calls this, and a real answer would need
+        // to read the client's tty.
         Ok(Position::ORIGIN)
     }
 
@@ -108,8 +97,6 @@ impl Backend for FdBackend {
     }
 }
 
-/// The client terminal's current dimensions, read from the passed
-/// descriptor itself.
 pub fn fd_size(fd: &impl std::os::fd::AsFd) -> Size {
     match rustix::termios::tcgetwinsize(fd) {
         Ok(ws) if ws.ws_col > 0 && ws.ws_row > 0 => Size::new(ws.ws_col, ws.ws_row),
@@ -143,8 +130,8 @@ mod tests {
             b.show_cursor().unwrap();
             b.flush().unwrap();
         });
-        // BSU then Hide open the frame, ESU closes it after the cursor is
-        // re-shown at its final position.
+        // BSU and Hide open the frame. ESU closes it after the cursor is
+        // re-shown.
         assert!(bytes.starts_with(b"\x1b[?2026h\x1b[?25l"));
         assert!(bytes.ends_with(b"\x1b[?2026l"));
         let show = bytes.windows(6).position(|w| w == b"\x1b[?25h");

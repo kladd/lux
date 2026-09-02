@@ -1,9 +1,5 @@
-//! A session: the server-owned unit of state a client attaches to — one
-//! layout tree of windows, each owning its tab list, plus the interaction
-//! modes (prefix, ex command line, scroll mode, selection) that Phases 2-7
-//! built. Sessions keep running whether or not a client is attached,
-//! and reproduce the single-process behavior for
-//! whichever client is.
+//! A session: one layout tree of windows plus the interaction modes a
+//! client drives. It outlives client attachments.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,83 +33,56 @@ use crate::server::term::FdBackend;
 use crate::server::window::{Notice, Tab, TabId, Window};
 use crate::server::{ServerEvent, SessionId};
 
-/// Minimum window size a split may produce.
+/// Minimum window size.
 const MIN_COLS: u16 = 10;
 const MIN_ROWS: u16 = 3;
 
-/// The resize submap's repeat deadline; restarted on each repeated
-/// resize dispatch.
 const RESIZE_REPEAT: Duration = Duration::from_millis(500);
 
-/// The move-tab repeat deadline; restarted on each repeated move-tab
-/// dispatch, matching the resize submap's timing.
 const MOVE_REPEAT: Duration = Duration::from_millis(500);
 
-/// The send-prefix repeat deadline; restarted on each repeated
-/// dispatch, matching the resize submap's timing.
 const SEND_PREFIX_REPEAT: Duration = Duration::from_millis(500);
 
-/// A session-level consequence the server must act on; everything else is
-/// handled inside the session.
+/// A consequence the server, not the session, must act on.
 pub enum Effect {
-    /// Detach the client driving this session.
     Detach,
-    /// Enter switcher mode for the driving client.
     OpenSwitcher,
-    /// Enter the CLAUDECOM grid for the driving client.
     OpenGrid,
-    /// Enter fuzzy tab-find mode for the driving client.
     OpenFinder,
-    /// Create a session — named, or auto-named when `None` — and attach
-    /// the driving client to it.
+    /// Create and attach to a session, auto-named when `None`.
     NewSession(Option<String>),
-    /// Rename the current session.
     RenameSession(String),
     /// Kill a named session, or the current one if `None`.
     KillSession(Option<String>),
-    /// Yanked text for the system clipboard.
     Copy(String),
-    /// Paste the system clipboard into this session.
     Paste,
-    /// Set the client terminal's mouse pointer shape (an OSC 22 name).
+    /// Mouse pointer shape, as an OSC 22 name.
     Pointer(&'static str),
-    /// Record this tab as the driving client's connection-scoped
-    /// pending yank.
+    /// Hold this tab as the client's pending yank.
     YankTab(TabId),
-    /// Move the driving client's pending yank into this session's
-    /// focused window.
     PasteTab,
-    /// Clear the driving client's pending yank, if any.
     ClearYank,
-    /// Land on the pending-agent indicator's tab, which may live in
-    /// another session.
+    /// Go to the indicator's tab, which may live in another session.
     GotoIndicator(Indicator),
-    /// Jump to the next agent tab in the done or blocked state across
-    /// every session on the server.
+    /// Jump to the next done or blocked agent tab, across all sessions.
     CycleAgent,
     /// The last window's last tab exited.
     Ended,
 }
 
-/// An in-progress mouse drag of a split boundary.
 struct BorderDrag {
-    /// Path from the layout tree's root to the dragged split.
+    /// Path from the tree root to the dragged split.
     path: Vec<Side>,
-    /// Whether any drag motion arrived; a press released without motion
-    /// is a click on the chrome underneath.
+    /// A press released without motion is a click on the chrome underneath.
     moved: bool,
 }
 
-/// A drag selection over one window's content, in
-/// content-relative cell coordinates. Linear: the text flows from `start`
-/// to `end` through intervening full rows.
+/// A linear text selection in content-relative cell coordinates.
 struct Selection {
     window: WindowId,
     start: (u16, u16),
     end: (u16, u16),
-    /// True from the anchoring press until the release that ends the
-    /// drag; a finished selection can outlive the drag (copy-on-select
-    /// keeps it highlighted after yanking).
+    /// Cleared on release. The selection itself can outlive the drag.
     dragging: bool,
 }
 
@@ -135,8 +104,7 @@ fn selection_span(row: u16, first: (u16, u16), last: (u16, u16)) -> (u16, u16) {
     (from, to)
 }
 
-/// Map an absolute screen position into content-relative cell coordinates,
-/// clamped inside the content rectangle.
+/// Screen position to content-relative cell, clamped inside `content`.
 fn clamp_to_content(pos: Position, content: Rect) -> (u16, u16) {
     if content.width == 0 || content.height == 0 {
         return (0, 0);
@@ -146,10 +114,8 @@ fn clamp_to_content(pos: Position, content: Rect) -> (u16, u16) {
     (x, y)
 }
 
-/// Forward a mouse event to a tab whose program handles the mouse itself;
-/// the engine encodes it per the protocol the program
-/// requested, and converts wheel ticks to arrow keys on the alternate
-/// screen.
+/// The engine encodes the event for the program's mouse protocol and turns
+/// wheel ticks into arrow keys on the alternate screen.
 fn forward_mouse(tab: &mut Tab, mouse: &CtMouseEvent, content: Rect) {
     use wezterm_term::{MouseButton as WzButton, MouseEventKind as WzKind};
     let (kind, button) = match mouse.kind {
@@ -181,7 +147,7 @@ fn wz_button(button: CtMouseButton) -> wezterm_term::MouseButton {
     }
 }
 
-/// A clickable window control in a tab bar's control group.
+/// A window control in the tab bar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Control {
     Minimize,
@@ -189,60 +155,42 @@ enum Control {
     Exit,
 }
 
-/// Width of the tab bar's control group: minimize, maximize/restore, and
-/// exit glyphs, each led by one space.
+/// Three control glyphs, each led by a space.
 const CONTROLS_WIDTH: u16 = 6;
 
-/// One tab's indicator in the bar: whether it's the active tab, its
-/// display name, plus its bracketed status text when the tab
-/// runs a detected agent.
 struct TabBadge {
     active: bool,
     name: String,
-    /// Marked while held as a pending yank.
     yanked: bool,
     agent: Option<agent::Visual>,
-    /// The x-extent this badge occupies in the bar, for click hit-tests;
-    /// mirrors render_tab_bar's layout.
+    /// Columns in the bar, for hit-tests. Must match render_tab_bar's layout.
     span: std::ops::Range<u16>,
 }
 
-/// Per-frame chrome geometry for one window, computed into state before
-/// drawing.
+/// One window's per-frame chrome geometry.
 struct Chrome {
     window: WindowId,
     tab_bar: Rect,
     tabs: Vec<TabBadge>,
-    /// Whether the active tab is in scroll mode.
     scroll: bool,
-    /// The active tab's status animation and status color, carried onto
-    /// the bar's rule while the window is focused.
+    /// The active tab's status animation, drawn on the rule while focused.
     rule_anim: Anim,
     rule_color: Color,
-    /// The six-cell control group at the bar's right edge; absent when
-    /// the bar is too narrow to hold it.
+    /// None when the bar is too narrow to hold it.
     controls: Option<Rect>,
-    /// Whether the window is maximized; its maximize control renders as
-    /// a restore icon.
     maximized: bool,
-    /// The control the mouse hovers over, rendered bright as a hover
-    /// cue.
     hover: Option<Control>,
 }
 
-/// A minimized window's clickable title in the session status line.
 struct MinimizedTitle {
     id: WindowId,
     name: String,
     span: std::ops::Range<u16>,
 }
 
-/// The session status line's neutral background — xterm-256
-/// grey 235 (#262626), distinct from the default background without a
-/// hue.
+/// Grey 235 (#262626), a neutral shade with no hue.
 pub(crate) const CHROME_BG: Color = Color::Indexed(235);
 
-/// The local hostname, fixed for the server's lifetime.
 static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     rustix::system::uname()
         .nodename()
@@ -250,11 +198,8 @@ static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         .into_owned()
 });
 
-/// The standing status-line indicator for an agent tab, anywhere on
-/// the server, that finished or got blocked while the user wasn't looking
-/// at it: the tab it points to and the display text (the tab's name plus
-/// its bracketed status). Computed by the server, since the tab may live
-/// in another session.
+/// Status-line pointer to an agent tab that finished or got blocked unseen,
+/// possibly in another session.
 #[derive(Clone, PartialEq)]
 pub struct Indicator {
     pub session: SessionId,
@@ -263,40 +208,27 @@ pub struct Indicator {
     pub text: String,
 }
 
-/// Per-frame session status line chrome, absent
-/// while the command line owns the bottom row.
 struct StatusChrome {
     row: Rect,
     name: String,
-    /// Minimized windows' clickable titles, right of the session name,
-    /// in minimize order.
     minimized: Vec<MinimizedTitle>,
     host: String,
     clock: String,
-    /// The pending-agent indicator's text and clickable span, shown in
-    /// place of the hostname; absent when nothing qualifies or the row
-    /// is too narrow to hold it with the clock.
+    /// Replaces the hostname when it fits alongside the clock.
     indicator: Option<(String, std::ops::Range<u16>)>,
 }
 
-/// What an open bottom-row prompt collects; both kinds share the same
-/// textarea-backed text entry rather than each hand-rolling an input
-/// widget.
 enum PromptKind {
-    /// The ex command line: parse and run the text on Enter.
     Ex,
-    /// Rename the focused window's active tab to the text on Enter.
     Rename,
 }
 
-/// The open bottom-row text prompt.
 struct Prompt {
     kind: PromptKind,
     textarea: TextArea<'static>,
 }
 
 impl Prompt {
-    /// The label drawn before the input area.
     fn label(&self) -> &'static str {
         match self.kind {
             PromptKind::Ex => ":",
@@ -304,106 +236,70 @@ impl Prompt {
         }
     }
 
-    /// The prompt's current text.
     fn text(&self) -> String {
         self.textarea.lines().first().cloned().unwrap_or_default()
     }
 }
 
-/// Per-frame prompt geometry, present while a prompt is open.
 struct PromptChrome {
-    /// The whole bottom row, including the label.
+    /// The whole row, label included.
     line: Rect,
-    /// The label drawn before the input area.
     label: &'static str,
-    /// Where the textarea widget renders (after the label).
     input: Rect,
-    /// Ex commands matching the typed text, on the row above; always
-    /// empty for the rename prompt.
     suggestions: Vec<&'static str>,
     suggestion_row: Option<Rect>,
 }
 
-/// Per-frame key-hint popup geometry, present while
-/// the prefix is pending.
 struct HintChrome {
     rect: Rect,
-    /// Width of the key column, so descriptions align across rows.
     key_width: u16,
-    /// `(keys, description)` per row, from `KeyTable::hints`.
+    /// `(keys, description)` per row.
     rows: Vec<(String, &'static str)>,
 }
 
-/// Everything the draw pass reads; recomputed once per frame.
+/// Everything the draw pass reads, recomputed each frame.
 #[derive(Default)]
 struct View {
     separators: Vec<Separator>,
     chrome: Vec<Chrome>,
     status: Option<StatusChrome>,
-    /// The status message owning the reserved bottom row this frame, in
-    /// place of the session status line.
     message: Option<(Rect, String)>,
     prompt: Option<PromptChrome>,
     hints: Option<HintChrome>,
-    /// The animation clock this frame renders at.
+    /// Animation clock for this frame.
     elapsed: Duration,
 }
 
 pub struct Session {
-    /// Stable handle for `-s`/`-t`/`ls` and the switcher.
     pub name: String,
     tree: Node,
     windows: HashMap<WindowId, Window>,
-    /// Exactly one focused window at any time.
     focus: WindowId,
-    /// The accumulated keys of a pending chord, walking the keybinding
-    /// tree from its root: `Some` while awaiting the next key,
-    /// empty directly after the prefix.
-    /// No timer expires it, except the resize submap's repeat deadline.
+    /// The pending chord's keys, `Some` and empty right after the prefix.
+    /// Only the resize repeat deadline expires it.
     chord: Option<Vec<KeyMatch>>,
-    /// The resize submap's repeat deadline: armed while the submap is
-    /// held pending after a resize dispatch, so a bare direction key
-    /// resizes again; elapsing closes the submap.
+    /// While armed, a bare direction key resizes again.
     resize_repeat: Option<Instant>,
-    /// The move-tab repeat deadline: armed after a move-tab dispatch, so
-    /// a bare `H`/`J`/`K`/`L` moves the tab again without the prefix;
-    /// elapsing (or any other key) closes the window.
+    /// While armed, a bare `H`/`J`/`K`/`L` moves the tab again.
     move_repeat: Option<Instant>,
-    /// The send-prefix repeat deadline: a bare prefix press before it
-    /// elapses forwards again.
+    /// While armed, a bare prefix press forwards again.
     send_prefix_repeat: Option<Instant>,
-    /// The maximized window, rendered over the whole layout area while
-    /// set. Purely a view state: the layout tree is untouched, focus
-    /// leaving the window clears it, and it is never persisted.
+    /// View state only: the tree is untouched, focus leaving clears it, and
+    /// it is never persisted.
     maximized: Option<WindowId>,
-    /// Minimized windows in minimize order: removed from the layout tree
-    /// with their processes still running, each shown as a clickable
-    /// title in the session status line.
+    /// Out of the layout tree but still running, in minimize order.
     minimized: Vec<WindowId>,
-    /// The window control under the mouse with no button held; the
-    /// hovered control renders bright.
     hover: Option<(WindowId, Control)>,
-    /// The open bottom-row prompt (ex command line or tab rename), if
-    /// any.
     prompt: Option<Prompt>,
-    /// The server's prefix and bindings (config may override both).
     keys: Arc<KeyTable>,
-    /// Whether a finished drag selection yanks on release (config
-    /// `copy-on-select`).
     copy_on_select: bool,
-    /// A transient message shown on the reserved bottom row in place of
-    /// the session status line, until the next key press.
+    /// Shown on the bottom row until the next key press.
     message: Option<String>,
-    /// The current drag selection, if any.
     selection: Option<Selection>,
-    /// The boundary drag in progress, if any.
     border_drag: Option<BorderDrag>,
-    /// The pending-agent indicator to show in the status line's
-    /// hostname block, set by the server each render pass.
+    /// Set by the server each render pass.
     indicator: Option<Indicator>,
-    /// Tabs in this session held as some connection's pending yank,
-    /// set by the server each render pass; their tab-bar indicators
-    /// carry a mark.
+    /// Tabs held as pending yanks, set by the server each render pass.
     yanked: Vec<TabId>,
     view: View,
     area: Rect,
@@ -422,8 +318,6 @@ impl Session {
         copy_on_select: bool,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
-        // The initial window's shell, sized to the viewport
-        // minus the session status row.
         let first = Window::new(0, tree_area(area), tx.clone())?;
         let mut windows = HashMap::new();
         windows.insert(first.id, first);
@@ -456,11 +350,8 @@ impl Session {
         })
     }
 
-    /// Rebuild a session from its persisted snapshot: the saved layout
-    /// tree and tab lists, each tab getting a fresh shell in its saved
-    /// working directory — or a resumed Claude Code session where one was
-    /// saved. Windows whose tabs all fail to spawn collapse out of the
-    /// tree; a session with none left is `None`.
+    /// Windows whose tabs all fail to spawn drop out of the tree. `None`
+    /// when no window is left.
     pub fn restore(
         snap: &persist::SessionSnapshot,
         area: Rect,
@@ -469,8 +360,7 @@ impl Session {
         tx: Sender<ServerEvent>,
     ) -> Option<Self> {
         let mut tree = Some(persist::restore_node(&snap.tree));
-        // Lay the tree out up front so each window's PTYs spawn at their
-        // final size rather than a placeholder.
+        // Lay out first so PTYs spawn at their final size.
         let rects: HashMap<WindowId, Rect> = layout::compute(tree.as_ref()?, tree_area(area))
             .0
             .into_iter()
@@ -478,7 +368,7 @@ impl Session {
         let mut windows = HashMap::new();
         for wsnap in &snap.windows {
             let Some(&rect) = rects.get(&wsnap.id) else {
-                // Not a leaf of the saved tree; nowhere to put it.
+                // Not a leaf of the saved tree.
                 continue;
             };
             if windows.contains_key(&wsnap.id) {
@@ -491,7 +381,7 @@ impl Session {
                 None => tree = layout::remove_leaf(tree.take()?, wsnap.id),
             }
         }
-        // Leaves with no window snapshot at all collapse the same way.
+        // Leaves with no snapshot drop out too.
         let mut tree = tree?;
         for id in layout::leaves(&tree) {
             if !windows.contains_key(&id) {
@@ -529,10 +419,6 @@ impl Session {
         })
     }
 
-    /// Capture this session's persistable state: name, layout tree, each
-    /// window's tab list and active tab, each tab's working directory,
-    /// and — for tabs identified as running Claude Code — a session
-    /// reference to resume it by.
     pub fn snapshot(&mut self) -> persist::SessionSnapshot {
         self.refresh_claude_sessions();
         let windows = layout::leaves(&self.tree)
@@ -544,8 +430,7 @@ impl Session {
                     .iter()
                     .map(|tab| {
                         let cwd = tab.working_dir().unwrap_or_else(|| {
-                            // No readable foreground process; the home
-                            // directory beats losing the tab.
+                            // No readable cwd. Home beats losing the tab.
                             std::env::var_os("HOME")
                                 .map(std::path::PathBuf::from)
                                 .unwrap_or_else(|| "/".into())
@@ -571,12 +456,8 @@ impl Session {
         }
     }
 
-    /// Refresh every Claude Code tab's session reference from the
-    /// session file its instance maintains, re-read per save so the
-    /// reference tracks the live session across `/clear`. A tab with no
-    /// readable file keeps the reference it already holds: the file
-    /// appears shortly after startup, and a restored tab holds the id it
-    /// was resumed with.
+    /// Re-read per save so the id tracks the live session across `/clear`.
+    /// A tab with no readable session file keeps the id it has.
     fn refresh_claude_sessions(&mut self) {
         for win in self.windows.values_mut() {
             for tab in win.tabs.iter_mut() {
@@ -596,18 +477,13 @@ impl Session {
             .any(|w| w.tabs.iter().any(|t| t.id == id))
     }
 
-    /// The window and tab-list position of the tab with `id`.
     pub fn locate_tab(&self, id: TabId) -> Option<(WindowId, usize)> {
         self.windows
             .iter()
             .find_map(|(&wid, w)| w.tabs.iter().position(|t| t.id == id).map(|i| (wid, i)))
     }
 
-    /// Advance the owning engine with PTY output, whether or
-    /// not that tab is currently visible, then re-derive the tab's name
-    /// and re-evaluate agent detection against the new
-    /// content. Returns a notice when the tab's agent reached done or
-    /// blocked.
+    /// Feed PTY output to the tab and re-run name and agent detection.
     pub fn pty_output(&mut self, id: TabId, bytes: &[u8]) -> Option<Notice> {
         let tab = self.find_tab_mut(id)?;
         tab.engine.advance_bytes(bytes);
@@ -618,26 +494,19 @@ impl Session {
         notice
     }
 
-    /// Any tab waiting out the idle debounce? The server
-    /// switches to a timed wait while one is.
     pub fn has_pending_idle(&self) -> bool {
         self.windows
             .values()
             .any(|w| w.tabs.iter().any(|t| t.agent_pending_idle()))
     }
 
-    /// Whether a repeat deadline (resize submap, move-tab, or
-    /// send-prefix) is armed. The server wakes on a timer while one is,
-    /// so the deadline can close its repeat window.
     pub fn has_pending_repeat(&self) -> bool {
         self.resize_repeat.is_some()
             || self.move_repeat.is_some()
             || self.send_prefix_repeat.is_some()
     }
 
-    /// Close repeat windows whose deadline elapsed with no keypress: the
-    /// resize submap (requiring prefix+r again) and the move-tab and
-    /// send-prefix windows (each requiring the prefix again).
+    /// Close any repeat window whose deadline passed.
     pub fn tick_repeats(&mut self, now: Instant) {
         if self.resize_repeat.is_some_and(|deadline| now >= deadline) {
             self.resize_repeat = None;
@@ -655,8 +524,7 @@ impl Session {
         }
     }
 
-    /// Commit idle debounces whose window elapsed without further output.
-    /// Returns a notice per tab whose agent landed in done.
+    /// Commit idle debounces that elapsed without more output.
     pub fn tick_agents(&mut self, now: std::time::Instant) -> Vec<Notice> {
         let mut notices = Vec::new();
         for win in self.windows.values_mut() {
@@ -671,9 +539,7 @@ impl Session {
         notices
     }
 
-    /// Resize everything to the attached client's
-    /// terminal; the tabs reconcile on the next
-    /// compute pass.
+    /// Tabs resize on the next compute pass.
     pub fn set_area(&mut self, area: Rect) {
         self.area = area;
         self.force_redraw = true;
@@ -687,16 +553,13 @@ impl Session {
         self.windows.len()
     }
 
-    /// Whether any tab is currently identified as running a detected agent.
     pub fn has_agent_tab(&self) -> bool {
         self.windows
             .values()
             .any(|w| w.tabs.iter().any(|t| t.agent.is_some()))
     }
 
-    /// The tabs currently identified as running a detected agent, in window
-    /// layout order then tab order: each as its window id and position in
-    /// that window's tab list.
+    /// In layout order, then tab order.
     pub fn agent_tabs(&self) -> Vec<(WindowId, usize)> {
         let mut out = Vec::new();
         for id in layout::leaves(&self.tree) {
@@ -712,18 +575,14 @@ impl Session {
         out
     }
 
-    /// On-screen windows in layout order, then minimized windows in
-    /// minimize order — the window order the CLAUDECOM surfaces sort by.
+    /// On-screen windows in layout order, then minimized ones.
     pub fn window_order(&self) -> Vec<WindowId> {
         let mut ids = layout::leaves(&self.tree);
         ids.extend(self.minimized.iter().copied());
         ids
     }
 
-    /// The agent tabs in the done or blocked
-    /// state — on-screen windows in layout order, then minimized windows
-    /// in minimize order — each as its window id and position in that
-    /// window's tab list.
+    /// Done or blocked agent tabs, in window order.
     pub fn attention_tabs(&self) -> Vec<(WindowId, usize)> {
         let mut out = Vec::new();
         for id in self.window_order() {
@@ -739,15 +598,11 @@ impl Session {
         out
     }
 
-    /// The focused window and its active tab's position — what the
-    /// attached client is looking at.
     pub fn focused_active(&self) -> (WindowId, usize) {
         let active = self.windows.get(&self.focus).map_or(0, |w| w.active);
         (self.focus, active)
     }
 
-    /// Set the pending-agent indicator the status line shows; a change
-    /// forces a redraw.
     pub fn set_indicator(&mut self, indicator: Option<Indicator>) {
         if self.indicator != indicator {
             self.indicator = indicator;
@@ -755,8 +610,6 @@ impl Session {
         }
     }
 
-    /// Set which of this session's tabs are held as pending yanks; a
-    /// change forces a redraw.
     pub fn set_yanked(&mut self, yanked: Vec<TabId>) {
         if self.yanked != yanked {
             self.yanked = yanked;
@@ -764,8 +617,7 @@ impl Session {
         }
     }
 
-    /// Every tab in window layout order then tab order, each as its
-    /// window id and position in that window's tab list.
+    /// In layout order, then tab order.
     pub fn all_tabs(&self) -> Vec<(WindowId, usize)> {
         let mut out = Vec::new();
         for id in layout::leaves(&self.tree) {
@@ -777,20 +629,14 @@ impl Session {
         out
     }
 
-    /// The tab at `index` in window `window`'s tab list.
     pub fn tab_at(&self, window: WindowId, index: usize) -> Option<&Tab> {
         self.windows.get(&window)?.tabs.get(index)
     }
 
-    /// Mutable access to that same tab, for views that resize it to their
-    /// own geometry (the CLAUDECOM grid's tiles).
     pub fn tab_at_mut(&mut self, window: WindowId, index: usize) -> Option<&mut Tab> {
         self.windows.get_mut(&window)?.tabs.get_mut(index)
     }
 
-    /// Encode `key` to the PTY of the tab at `index` in window `window`,
-    /// regardless of focus — the delivery path for a tab captured from
-    /// the CLAUDECOM grid.
     pub fn key_to_tab(&mut self, window: WindowId, index: usize, key: KeyEvent) {
         if let Some((code, mods)) = map_key(key)
             && let Some(win) = self.windows.get_mut(&window)
@@ -800,8 +646,6 @@ impl Session {
         }
     }
 
-    /// Write pasted text to that same tab's PTY, honoring bracketed
-    /// paste.
     pub fn paste_to_tab(&mut self, window: WindowId, index: usize, text: &str) {
         if text.is_empty() {
             return;
@@ -813,12 +657,6 @@ impl Session {
         }
     }
 
-    /// Land on `window`'s tab at `index`: a minimized window is
-    /// restored, focused, and maximized — in that order, so focusing
-    /// doesn't immediately un-maximize — landing the user on the tab
-    /// full-screen; any other window is simply focused with the tab made
-    /// active. A restore that fails (minimum window size) leaves the
-    /// window minimized and changes nothing else.
     pub fn goto_tab(&mut self, window: WindowId, index: usize) {
         if self.minimized.contains(&window) {
             self.restore_window(window);
@@ -832,7 +670,6 @@ impl Session {
         self.focus_tab(window, index);
     }
 
-    /// Focus `window` and make its tab at `index` active.
     pub fn focus_tab(&mut self, window: WindowId, index: usize) {
         let Some(win) = self.windows.get_mut(&window) else {
             return;
@@ -849,41 +686,31 @@ impl Session {
         if key.kind == KeyEventKind::Release {
             return None;
         }
-        // Any key press dismisses a status message.
         if self.message.take().is_some() {
             self.force_redraw = true;
         }
-        // While a prompt is open, every key press edits
-        // it instead of reaching the focused window's PTY.
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
         }
-        // An elapsed repeat deadline has already closed its repeat
-        // window; the tick normally does this on time, but a key racing
-        // the timer must not land in a window that should be gone.
+        // A key racing the timer must not land in a repeat window that
+        // already expired.
         self.tick_repeats(Instant::now());
         if let Some(mut path) = self.chord.take() {
-            // Any key either dispatches (re-arming the deadline below) or
-            // ends the sequence, so the armed deadline never outlives it.
+            // Re-armed below if this key resizes again.
             self.resize_repeat = None;
-            // Whatever this key does, the hint popup changes or closes.
+            // The hint popup changes or closes either way.
             self.force_redraw = true;
-            // Escape discards the pending sequence; directly after the
-            // prefix it also clears the connection's pending yank.
+            // Escape right after the prefix also clears the pending yank.
             if key.code == CtKeyCode::Esc {
                 return path.is_empty().then_some(Effect::ClearYank);
             }
-            // Every recognized sequence
-            // dispatches through the single, server-side keybinding table.
             let node = self
                 .keys
                 .node_at(&path)
                 .expect("pending chord path resolves to a node");
             match node.get(KeyMatch::from_event(key)) {
-                // A command at any depth dispatches and
-                // ends the sequence — except a resize, which holds its
-                // submap pending and arms the repeat deadline, so a bare
-                // direction key resizes again without prefix+r.
+                // A resize keeps the submap open so a bare direction key
+                // resizes again.
                 Some(&KeyTrie::Command(command)) => {
                     if matches!(command, Command::ResizeDir(_)) {
                         self.chord = Some(path);
@@ -891,76 +718,56 @@ impl Session {
                     }
                     return self.execute(command);
                 }
-                // A deeper node — keep waiting, scoped one
-                // level down.
                 Some(KeyTrie::Node(_)) => {
                     path.push(KeyMatch::from_event(key));
                     self.chord = Some(path);
                 }
-                // A dead-end key discards the whole
-                // accumulated sequence, dispatching nothing and writing
-                // nothing to the PTY.
+                // An unbound key ends the chord and goes nowhere.
                 None => {}
             }
             return None;
         }
-        // While the move-repeat deadline is armed, a bare `H`/`J`/`K`/`L`
-        // moves the tab again (a successful move re-arms the deadline);
-        // any other key is discarded — never reaching the PTY — and
-        // closes the window.
+        // Any other key closes the move-repeat window and goes nowhere.
         if self.move_repeat.take().is_some() {
             if let Some(dir) = move_repeat_dir(key) {
                 return self.execute(Command::MoveTabDir(dir));
             }
             return None;
         }
-        // While the send-prefix window is armed, a bare prefix press
-        // forwards again; any other key closes it and is handled normally.
         if self.send_prefix_repeat.take().is_some() && self.keys.is_prefix(key) {
             return self.execute(Command::SendPrefix);
         }
-        // The prefix key (Ctrl-b by default, config
-        // may override it) arms the prefix instead of
-        // reaching the focused window's PTY.
         if self.keys.is_prefix(key) {
             self.chord = Some(Vec::new());
-            // Show the hint popup without waiting on output.
             self.force_redraw = true;
             return None;
         }
-        // In scroll mode every key is consumed by history
-        // navigation; nothing reaches the PTY.
+        // Scroll mode swallows every key.
         if let Some(win) = self.windows.get_mut(&self.focus)
             && win.active_tab().scroll_mode()
         {
             let page = win.content_rect().height.max(1) as isize;
             let tab = win.active_tab_mut();
             match key.code {
-                // One line at a time.
                 CtKeyCode::Char('k') | CtKeyCode::Up => {
                     tab.scroll_by(-1);
                 }
                 CtKeyCode::Char('j') | CtKeyCode::Down => {
                     tab.scroll_by(1);
                 }
-                // One page at a time.
                 CtKeyCode::PageUp => {
                     tab.scroll_by(-page);
                 }
                 CtKeyCode::PageDown => {
                     tab.scroll_by(page);
                 }
-                // Back to following live output.
                 CtKeyCode::Esc | CtKeyCode::Char('q') => tab.exit_scroll_mode(),
                 _ => {}
             }
             self.force_redraw = true;
             return None;
         }
-        // Every other key goes only to the focused window's
-        // active tab; the engine encodes it per the live terminal modes and
-        // writes it to that tab's PTY. A write can fail when
-        // the child has already exited; the exit event follows.
+        // A write fails once the child exits. The exit event follows.
         if let Some((code, mods)) = map_key(key)
             && let Some(win) = self.windows.get_mut(&self.focus)
         {
@@ -969,8 +776,6 @@ impl Session {
         None
     }
 
-    /// Write the prefix key's encoded bytes to the focused window's
-    /// active tab's PTY.
     fn write_prefix_key(&mut self) {
         let prefix = self.keys.prefix;
         let mut mods = CtMods::NONE;
@@ -987,11 +792,7 @@ impl Session {
         }
     }
 
-    /// Deliver pasted text: into the open prompt at its cursor if one is
-    /// open, otherwise to the focused window's active tab's PTY,
-    /// honoring bracketed paste. Covers both terminal-level and
-    /// right-click pastes, so the two paths never disagree about their
-    /// destination.
+    /// Both terminal and right-click pastes come through here.
     pub fn paste_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -1008,42 +809,29 @@ impl Session {
 
     pub fn handle_mouse(&mut self, mouse: CtMouseEvent) -> Option<Effect> {
         let pos = Position::new(mouse.column, mouse.row);
-        // Shift bypasses a program's mouse grab, keeping selection,
-        // yank, and paste reachable inside mouse-aware programs.
+        // Shift bypasses a program's mouse grab.
         let shift = mouse.modifiers.contains(CtMods::SHIFT);
-        // An active boundary drag consumes every mouse event until the
-        // button is released.
         if self.border_drag.is_some() {
             return self.drag_border(&mouse, pos);
         }
         match mouse.kind {
             CtMouseKind::Down(button) => {
-                // A left click on a minimized window's title in the
-                // status line restores it.
                 if button == CtMouseButton::Left
                     && let Some(id) = self.minimized_title_at(pos)
                 {
                     self.restore_window(id);
                     return None;
                 }
-                // A left click on the pending-agent indicator lands on
-                // its tab; the server resolves it, since the tab may
-                // live in another session.
                 if button == CtMouseButton::Left
                     && let Some(indicator) = self.indicator_at(pos)
                 {
                     return Some(Effect::GotoIndicator(indicator));
                 }
-                // A left click on the menu icon opens the switcher.
                 if button == CtMouseButton::Left && self.menu_icon_at(pos) {
                     return Some(Effect::OpenSwitcher);
                 }
-                // A left press on a draggable boundary — a separator
-                // column, or the tab bar row bordering the window above —
-                // starts a boundary drag. Boundaries are lux chrome, so
-                // the press never reaches a mouse-grabbed program; click
-                // behavior on the row underneath happens on release when
-                // no drag follows.
+                // A press on a boundary starts a drag. A click on the chrome
+                // underneath resolves on release if nothing moved.
                 if button == CtMouseButton::Left
                     && self.maximized.is_none()
                     && let Some((path, _)) =
@@ -1053,22 +841,16 @@ impl Session {
                     return None;
                 }
                 let id = self.window_at(pos)?;
-                // Click-to-focus.
                 if self.focus != id {
                     self.set_focus(id);
                     self.force_redraw = true;
                 }
-                // A left click on the bar's window controls minimizes,
-                // toggles maximize, or closes. The bar is lux chrome, so
-                // the click never reaches a mouse-grabbed program.
                 if button == CtMouseButton::Left
                     && let Some(control) = self.control_at(id, pos)
                 {
                     self.click_control(id, control);
                     return None;
                 }
-                // A left click on a tab's indicator makes
-                // that tab active.
                 if button == CtMouseButton::Left
                     && let Some(index) = self.tab_badge_at(id, pos)
                 {
@@ -1078,13 +860,11 @@ impl Session {
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
-                // The program owns the mouse, unless Shift bypasses it.
                 if tab.engine.is_mouse_grabbed() && !shift {
                     forward_mouse(tab, &mouse, content);
                     return None;
                 }
                 match button {
-                    // Anchor a selection.
                     CtMouseButton::Left if content.contains(pos) => {
                         let cell = clamp_to_content(pos, content);
                         self.selection = Some(Selection {
@@ -1095,8 +875,6 @@ impl Session {
                         });
                         self.force_redraw = true;
                     }
-                    // With a selection, right-click yanks;
-                    // Without one, it pastes.
                     CtMouseButton::Right => {
                         return if self.selection.is_some() {
                             self.yank_selection()
@@ -1107,8 +885,6 @@ impl Session {
                     _ => {}
                 }
             }
-            // Extend the selection, clamped to the
-            // window where the drag began.
             CtMouseKind::Drag(CtMouseButton::Left) if self.selection.is_some() => {
                 let sel = self.selection.as_mut().expect("checked above");
                 let win = self.windows.get(&sel.window)?;
@@ -1116,15 +892,13 @@ impl Session {
                 self.force_redraw = true;
             }
             CtMouseKind::Up(_) | CtMouseKind::Drag(_) | CtMouseKind::Moved => {
-                // A click that never moved selects nothing.
+                // A click without motion selects nothing.
                 if matches!(mouse.kind, CtMouseKind::Up(CtMouseButton::Left))
                     && self.selection.as_ref().is_some_and(|s| s.start == s.end)
                 {
                     self.selection = None;
                     self.force_redraw = true;
                 }
-                // Releases and motion still reach a
-                // grabbed program, unless Shift bypasses it.
                 if let Some(id) = self.window_at(pos) {
                     let win = self.windows.get_mut(&id).expect("window exists");
                     let content = win.content_rect();
@@ -1133,9 +907,7 @@ impl Session {
                         forward_mouse(tab, &mouse, content);
                     }
                 }
-                // With copy-on-select, the release ending a drag
-                // selection yanks it right away, keeping the selection
-                // highlighted; without it, yanking stays on right-click.
+                // Copy-on-select yanks on release but keeps the highlight.
                 if matches!(mouse.kind, CtMouseKind::Up(CtMouseButton::Left))
                     && let Some(sel) = self.selection.as_mut()
                     && sel.dragging
@@ -1152,8 +924,6 @@ impl Session {
                         return Some(Effect::Copy(text));
                     }
                 }
-                // Hovering a window control brightens it; moving off
-                // restores its resting shade.
                 if mouse.kind == CtMouseKind::Moved {
                     let hover = self
                         .window_at(pos)
@@ -1162,8 +932,6 @@ impl Session {
                         self.hover = hover;
                         self.force_redraw = true;
                     }
-                    // Hovering a control shows a hand pointer, a
-                    // draggable boundary a resize pointer.
                     return Some(Effect::Pointer(self.pointer_shape(pos)));
                 }
             }
@@ -1172,23 +940,20 @@ impl Session {
                 let win = self.windows.get_mut(&id).expect("window exists");
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
-                // A grabbed program gets the wheel
-                // encoded; on the alternate screen the engine converts
-                // wheel ticks to arrow keys itself (alternateScroll).
+                // On the alternate screen the engine turns wheel ticks into
+                // arrow keys.
                 if tab.engine.is_mouse_grabbed() || tab.engine.is_alt_screen_active() {
                     forward_mouse(tab, &mouse, content);
                     return None;
                 }
-                // Focus, enter scroll mode, scroll 3 lines.
                 tab.enter_scroll_mode();
                 let delta = if mouse.kind == CtMouseKind::ScrollUp {
                     -3
                 } else {
                     3
                 };
-                // Wheeling down to the live bottom resumes following
-                // (entering scroll mode just to sit at the tail would trap
-                // accidental wheel-downs).
+                // Reaching the live bottom resumes following, so a stray
+                // wheel-down can't trap the view.
                 if tab.scroll_by(delta) {
                     tab.exit_scroll_mode();
                 }
@@ -1200,10 +965,7 @@ impl Session {
         None
     }
 
-    /// Continue or finish the boundary drag in progress: motion moves the
-    /// boundary to track the mouse, stopping at the minimum window size;
-    /// a release without motion is a plain click on the chrome
-    /// underneath (focus, tab select).
+    /// A release without motion is a plain click on the chrome underneath.
     fn drag_border(&mut self, mouse: &CtMouseEvent, pos: Position) -> Option<Effect> {
         let drag = self.border_drag.as_mut().expect("drag in progress");
         match mouse.kind {
@@ -1240,17 +1002,9 @@ impl Session {
         None
     }
 
-    /// The mouse pointer shape for `pos`: a hand pointer over a
-    /// clickable element — a window control, a tab's indicator, or the
-    /// status line's menu icon, minimized titles, and pending-agent
-    /// indicator — a resize shape over a draggable boundary, matching
-    /// the axis the boundary moves on, and the default anywhere else.
-    /// Shapes are OSC 22 names; terminals without pointer-shape support
-    /// ignore the sequence.
+    /// An OSC 22 pointer name. Terminals without pointer support ignore it.
     fn pointer_shape(&self, pos: Position) -> &'static str {
-        // Controls and tab badges win where a tab bar doubles as a drag
-        // boundary; they stay clickable there via the motionless-release
-        // path.
+        // Controls and badges win over a tab bar's drag boundary.
         if self.window_at(pos).is_some_and(|id| {
             self.control_at(id, pos).is_some() || self.tab_badge_at(id, pos).is_some()
         }) {
@@ -1273,8 +1027,7 @@ impl Session {
     }
 
     fn window_at(&self, pos: Position) -> Option<WindowId> {
-        // While a window is maximized it is the only one on screen, so
-        // hidden windows' stale rectangles never take a click.
+        // Only the maximized window is on screen. The rest keep stale rects.
         if let Some(id) = self.maximized {
             return self
                 .windows
@@ -1284,14 +1037,11 @@ impl Session {
         }
         self.windows
             .values()
-            // A minimized window's stale rectangle never takes a click.
+            // Minimized windows keep stale rects too.
             .find(|w| w.rect.contains(pos) && !self.minimized.contains(&w.id))
             .map(|w| w.id)
     }
 
-    /// Yank the selected text and clear the selection;
-    /// yanking never writes to a PTY. The server puts the text on the
-    /// system clipboard.
     fn yank_selection(&mut self) -> Option<Effect> {
         let text = self.selection_text();
         self.selection = None;
@@ -1299,8 +1049,6 @@ impl Session {
         text.map(Effect::Copy)
     }
 
-    /// The text under the current selection, read from the selection
-    /// window's active tab's current view.
     fn selection_text(&self) -> Option<String> {
         let sel = self.selection.as_ref()?;
         let win = self.windows.get(&sel.window)?;
@@ -1328,89 +1076,62 @@ impl Session {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Apply one dispatched command. Tab commands act only on the focused
-    /// window.
     fn execute(&mut self, command: Command) -> Option<Effect> {
         match command {
             Command::SplitSideBySide => self.split(SplitKind::SideBySide),
             Command::SplitStacked => self.split(SplitKind::Stacked),
             Command::NewTab => self.new_tab(),
             Command::NextTab => self.cycle_tab(1),
-            // Previous tab, wrapping.
             Command::PrevTab => self.cycle_tab(-1),
-            // Direct selection by displayed index.
             Command::SelectTab(index) => self.select_tab(index),
             Command::OnlyWindow => self.only_window(),
             Command::FocusDir(dir) => self.focus_dir(dir),
             Command::ResizeDir(dir) => self.resize_focused(dir),
-            // Reset every split to an even ratio.
             Command::Rebalance => {
                 layout::rebalance(&mut self.tree);
                 self.force_redraw = true;
             }
-            // Prefix+H/J/K/L moves the active tab into the adjacent
-            // window; a successful move opens the repeat window so a bare
-            // direction key moves again. A press with no adjacent window
-            // arms nothing.
             Command::MoveTabDir(dir) => {
                 if self.move_tab_dir(dir) {
                     self.move_repeat = Some(Instant::now() + MOVE_REPEAT);
                 }
             }
-            // Prefix+m then a direction key exchanges the focused window
-            // with the spatially adjacent one; at a screen edge the
-            // sequence is discarded.
             Command::SwapDir(dir) => self.swap_dir(dir),
-            // Prefix+z toggles the focused window's maximized state.
             Command::Maximize => {
                 self.maximized = (self.maximized != Some(self.focus)).then_some(self.focus);
                 self.force_redraw = true;
             }
-            // Prefix+i flips the orientation of the split immediately
-            // containing the focused window; a lone window has none.
             Command::Rotate => {
                 if layout::rotate(&mut self.tree, self.focus) {
                     self.force_redraw = true;
                 }
             }
-            // Real detach, dispatched server-side.
             Command::Detach => return Some(Effect::Detach),
             Command::CycleAgent => return Some(Effect::CycleAgent),
-            // Switcher mode is the server's to run.
             Command::Switcher => return Some(Effect::OpenSwitcher),
-            // So is the grid.
             Command::Grid => return Some(Effect::OpenGrid),
-            // And the fuzzy tab finder.
             Command::FindTab => return Some(Effect::OpenFinder),
             Command::OpenEx => self.open_prompt(PromptKind::Ex, String::new()),
-            // Prefix+, prompts for the active tab's new name.
             Command::RenameTab => {
                 let name = self.windows[&self.focus].active_tab().name.clone();
                 self.open_prompt(PromptKind::Rename, name);
             }
-            // Prefix+w terminates the active tab's process; exit-driven
-            // removal takes it from there.
+            // The exit event removes the tab.
             Command::CloseTab => {
                 if let Some(win) = self.windows.get_mut(&self.focus) {
                     win.active_tab_mut().kill();
                 }
             }
-            // Prefix+x closes the focused window outright.
             Command::CloseWindow => self.close_window(),
-            // The pending yank is connection state; the server records
-            // and moves it.
             Command::YankTab => {
                 let id = self.windows[&self.focus].active_tab().id;
                 return Some(Effect::YankTab(id));
             }
             Command::PasteTab => return Some(Effect::PasteTab),
-            // Prefix+prefix forwards a literal prefix key press, arming
-            // the repeat window.
             Command::SendPrefix => {
                 self.write_prefix_key();
                 self.send_prefix_repeat = Some(Instant::now() + SEND_PREFIX_REPEAT);
             }
-            // Prefix+[ enters scroll mode.
             Command::ScrollMode => {
                 if let Some(win) = self.windows.get_mut(&self.focus) {
                     win.active_tab_mut().enter_scroll_mode();
@@ -1421,13 +1142,10 @@ impl Session {
         None
     }
 
-    /// Open a bottom-row prompt pre-filled with `text`, cursor at the
-    /// end.
     fn open_prompt(&mut self, kind: PromptKind, text: String) {
         let mut textarea = TextArea::from([text]);
         textarea.move_cursor(tui_textarea::CursorMove::End);
-        // The default cursor-line underline reads as stray chrome in a
-        // one-line input.
+        // The default cursor-line underline looks like stray chrome here.
         textarea.set_cursor_line_style(Style::default());
         self.prompt = Some(Prompt { kind, textarea });
         self.force_redraw = true;
@@ -1436,11 +1154,9 @@ impl Session {
     fn handle_prompt_key(&mut self, key: KeyEvent) -> Option<Effect> {
         self.force_redraw = true;
         match key.code {
-            // Close without executing anything.
             CtKeyCode::Esc => {
                 self.prompt = None;
             }
-            // Commit (or discard) and close.
             CtKeyCode::Enter => {
                 let prompt = self.prompt.take().expect("prompt is open");
                 let text = prompt.text();
@@ -1458,7 +1174,6 @@ impl Session {
                         Some(ExCommand::KillSession(name)) => {
                             return Some(Effect::KillSession(name));
                         }
-                        // Unrecognized text closes with no action.
                         None => {}
                     },
                     PromptKind::Rename => {
@@ -1475,8 +1190,6 @@ impl Session {
                     }
                 }
             }
-            // The rest of line editing goes via tui-textarea: character
-            // insertion, Backspace, cursor motion.
             _ => {
                 let prompt = self.prompt.as_mut().expect("prompt is open");
                 prompt.textarea.input(tui_textarea::Input::from(key));
@@ -1485,17 +1198,12 @@ impl Session {
         None
     }
 
-    /// Write the focused window's active tab's entire terminal content,
-    /// scrollback included, to `path`, confirming a successful write
-    /// with a status message. A leading `~/` expands to the user's home
-    /// directory. There is no error surface yet, so a failed write is
-    /// dropped.
+    /// Scrollback included. A failed write is dropped, since there is no
+    /// error surface yet.
     fn write_tab_content(&mut self, path: &std::path::Path) {
         let tab = self.windows[&self.focus].active_tab();
         let screen = tab.engine.screen();
-        // Every physical row: scrollback plus the visible grid.
-        // (`scrollback_rows` counts all rows, not just the scrolled-off
-        // ones.)
+        // `scrollback_rows` counts every row, visible grid included.
         let all = 0..screen.scrollback_rows();
         let mut out = String::new();
         for line in screen.lines_in_phys_range(all) {
@@ -1513,8 +1221,8 @@ impl Session {
         if std::fs::write(&path, &out).is_err() {
             return;
         }
-        // The canonical form names where the write really landed, even
-        // for a relative path resolved against the server's directory.
+        // A relative path resolves against the server's directory, so show
+        // where it really landed.
         let full = std::fs::canonicalize(&path).unwrap_or(path);
         self.message = Some(format!(
             "wrote {} ({})",
@@ -1529,23 +1237,19 @@ impl Session {
     }
 
     fn split(&mut self, kind: SplitKind) {
-        // The tree's rectangle, not the window's — a maximized window's
-        // full-area override must not change what fits.
+        // The tree's rectangle, not the maximized override, decides what
+        // fits.
         let Some(&(_, rect)) = self.layout_rects().iter().find(|(id, _)| *id == self.focus) else {
             return;
         };
         let (first, second, _) = layout::split_areas(kind, 0.5, rect);
-        // Never create a window under 10 cols or 3 rows.
         for half in [first, second] {
             if half.width < MIN_COLS || half.height < MIN_ROWS {
                 return;
             }
         }
         let id = self.next_window_id;
-        // The new window gets one active
-        // tab with its own shell and engine sized to its content rectangle.
-        // If the shell can't spawn, keep the current layout rather than
-        // tearing the session down.
+        // If the shell can't spawn, keep the current layout.
         let Ok(win) = Window::new(id, second, self.tx.clone()) else {
             return;
         };
@@ -1556,30 +1260,21 @@ impl Session {
         self.force_redraw = true;
     }
 
-    /// Append a new tab to the focused window's list and make
-    /// it active.
     fn new_tab(&mut self) {
         let win = self
             .windows
             .get_mut(&self.focus)
             .expect("focused window exists");
-        // The new shell starts in the working directory of
-        // the tab that was active until now.
         let cwd = win.active_tab().working_dir();
-        // The tab gets its own shell and engine sized to
-        // the window's content rectangle.
         let Ok(tab) = Tab::spawn(win.content_rect(), cwd, self.tx.clone()) else {
             return;
         };
         win.tabs.push(tab);
         win.active = win.tabs.len() - 1;
         self.drop_selection_in(self.focus);
-        // Show the switch without waiting on PTY output.
         self.force_redraw = true;
     }
 
-    /// Cycle the focused window's active tab, wrapping in
-    /// either direction.
     fn cycle_tab(&mut self, step: isize) {
         let win = self
             .windows
@@ -1588,12 +1283,9 @@ impl Session {
         let len = win.tabs.len() as isize;
         win.active = (win.active as isize + step).rem_euclid(len) as usize;
         self.drop_selection_in(self.focus);
-        // Show the switch without waiting on PTY output.
         self.force_redraw = true;
     }
 
-    /// Make the focused window's tab at `index` active; an
-    /// out-of-range index is discarded silently.
     fn select_tab(&mut self, index: usize) {
         let win = self
             .windows
@@ -1604,12 +1296,9 @@ impl Session {
         }
         win.active = index;
         self.drop_selection_in(self.focus);
-        // Show the switch without waiting on PTY output.
         self.force_redraw = true;
     }
 
-    /// The index of the tab badge at `pos` in window `id`'s tab bar, from
-    /// the last computed view's geometry.
     fn tab_badge_at(&self, id: WindowId, pos: Position) -> Option<usize> {
         let chrome = self.view.chrome.iter().find(|c| c.window == id)?;
         let bar = chrome.tab_bar;
@@ -1619,9 +1308,7 @@ impl Session {
         chrome.tabs.iter().position(|b| b.span.contains(&pos.x))
     }
 
-    /// The control under `pos` in window `id`'s tab bar, from the last
-    /// computed view's geometry. Each control's click target is its
-    /// glyph cell plus the space leading it.
+    /// Each control's click target is its glyph plus the space before it.
     fn control_at(&self, id: WindowId, pos: Position) -> Option<Control> {
         let chrome = self.view.chrome.iter().find(|c| c.window == id)?;
         let controls = chrome.controls?;
@@ -1635,8 +1322,6 @@ impl Session {
         })
     }
 
-    /// The minimized window whose status-line title is under `pos`, from
-    /// the last computed view's geometry.
     fn minimized_title_at(&self, pos: Position) -> Option<WindowId> {
         let status = self.view.status.as_ref()?;
         if pos.y != status.row.y {
@@ -1649,7 +1334,6 @@ impl Session {
             .map(|t| t.id)
     }
 
-    /// Whether the status line's menu icon is under `pos`.
     fn menu_icon_at(&self, pos: Position) -> bool {
         self.view
             .status
@@ -1657,8 +1341,6 @@ impl Session {
             .is_some_and(|s| pos.y == s.row.y && pos.x == s.row.x)
     }
 
-    /// The pending-agent indicator, when its status-line span is under
-    /// `pos`, from the last computed view's geometry.
     fn indicator_at(&self, pos: Position) -> Option<Indicator> {
         let status = self.view.status.as_ref()?;
         let (_, span) = status.indicator.as_ref()?;
@@ -1668,9 +1350,6 @@ impl Session {
         self.indicator.clone()
     }
 
-    /// The minimized windows' status-line titles: each window's active
-    /// tab's display name, in minimize order, laid out after `x` with
-    /// the status line's two-space separation.
     fn minimized_titles(&self, row: Rect, mut x: u16) -> Vec<MinimizedTitle> {
         let mut titles = Vec::new();
         for &id in &self.minimized {
@@ -1692,31 +1371,22 @@ impl Session {
         titles
     }
 
-    /// Apply a clicked window control.
     fn click_control(&mut self, id: WindowId, control: Control) {
         match control {
             Control::Minimize => self.minimize_window(id),
-            // Same toggle as prefix+z.
             Control::Maximize => {
                 self.maximized = (self.maximized != Some(id)).then_some(id);
                 self.force_redraw = true;
             }
-            // Same close as prefix+x, scoped to the clicked window; the
-            // exit events collapse it through the ordinary removal path.
             Control::Exit => self.kill_window(id),
         }
     }
 
-    /// Remove window `id` from the layout tree, giving its space to its
-    /// sibling, with its tabs' processes left running; the window
-    /// reappears as a clickable title in the session status line. A lone
-    /// window has nowhere to give its space, so the click is discarded.
     fn minimize_window(&mut self, id: WindowId) {
         let ids = layout::leaves(&self.tree);
         if ids.len() <= 1 || !ids.contains(&id) {
             return;
         }
-        // A minimized window can no longer fill the layout area.
         if self.maximized == Some(id) {
             self.maximized = None;
         }
@@ -1733,11 +1403,8 @@ impl Session {
         self.force_redraw = true;
     }
 
-    /// Reinsert minimized window `id` by splitting the focused window —
-    /// side by side if it is wider than it is tall, stacked otherwise —
-    /// and focusing the restored window. A restore that would violate
-    /// the minimum window size fails silently, leaving the window
-    /// minimized.
+    /// Splits the focused window. Fails silently if the halves would be
+    /// too small.
     fn restore_window(&mut self, id: WindowId) {
         let Some(pos) = self.minimized.iter().position(|m| *m == id) else {
             return;
@@ -1762,8 +1429,6 @@ impl Session {
         self.force_redraw = true;
     }
 
-    /// Terminate every tab's child process in window `id`, with no
-    /// confirmation.
     fn kill_window(&mut self, id: WindowId) {
         if let Some(win) = self.windows.get_mut(&id) {
             for tab in &mut win.tabs {
@@ -1772,16 +1437,13 @@ impl Session {
         }
     }
 
-    /// A selection describes cells of the window's currently visible tab;
-    /// drop it when that content is replaced or the window goes away.
+    /// Call when the window's visible content changes.
     fn drop_selection_in(&mut self, window: WindowId) {
         if self.selection.as_ref().is_some_and(|s| s.window == window) {
             self.selection = None;
         }
     }
 
-    /// Move focus to `id`, exiting the maximized state when focus leaves
-    /// the maximized window.
     fn set_focus(&mut self, id: WindowId) {
         self.focus = id;
         if self.maximized.is_some_and(|m| m != id) {
@@ -1789,15 +1451,11 @@ impl Session {
         }
     }
 
-    /// Every window's rectangle computed from the layout tree — the
-    /// geometry directional commands navigate by, unaffected by the
-    /// maximized window's full-area override.
+    /// From the tree, ignoring the maximized override.
     fn layout_rects(&self) -> Vec<(WindowId, Rect)> {
         layout::compute(&self.tree, tree_area(self.area)).0
     }
 
-    /// Move focus to the window spatially adjacent in `dir`;
-    /// at a screen edge focus stays put.
     fn focus_dir(&mut self, dir: Dir) {
         let rects = self.layout_rects();
         let Some(&(_, from)) = rects.iter().find(|(id, _)| *id == self.focus) else {
@@ -1809,18 +1467,12 @@ impl Session {
         }
     }
 
-    /// Move the focused window's active tab into the
-    /// window spatially adjacent in `dir`, appended as that window's active
-    /// tab. Focus follows the
-    /// moved tab, keeping exactly one focused window
-    /// whether or not the source window survives. Returns whether a tab
-    /// moved.
+    /// Focus follows the moved tab.
     fn move_tab_dir(&mut self, dir: Dir) -> bool {
         let rects = self.layout_rects();
         let Some(&(_, from)) = rects.iter().find(|(id, _)| *id == self.focus) else {
             return false;
         };
-        // No adjacent window — discard, move nothing.
         let Some(dest) = layout::spatial_neighbor(&rects, from, dir) else {
             return false;
         };
@@ -1834,19 +1486,15 @@ impl Session {
             win.active -= 1;
         }
         let emptied = win.tabs.is_empty();
-        // Both windows' visible content changes.
         self.drop_selection_in(source);
         self.drop_selection_in(dest);
         let dest_win = self.windows.get_mut(&dest).expect("adjacent window exists");
         dest_win.tabs.push(tab);
         dest_win.active = dest_win.tabs.len() - 1;
-        // The tab renders into a new rectangle now.
         let content = dest_win.content_rect();
         dest_win.active_tab_mut().resize(content);
         self.set_focus(dest);
         if emptied {
-            // A window left with no tabs collapses — the
-            // sibling subtree inherits its space.
             self.windows.remove(&source);
             let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
             if let Some(tree) = layout::remove_leaf(tree, source) {
@@ -1857,16 +1505,11 @@ impl Session {
         true
     }
 
-    /// Exchange the focused window with the window spatially adjacent in
-    /// `dir`; focus stays with the moved window. Both windows' PTYs and
-    /// engines resize to their new rectangles on the next frame's
-    /// reconcile.
     fn swap_dir(&mut self, dir: Dir) {
         let rects = self.layout_rects();
         let Some(&(_, from)) = rects.iter().find(|(id, _)| *id == self.focus) else {
             return;
         };
-        // No adjacent window — discard, swap nothing.
         let Some(other) = layout::spatial_neighbor(&rects, from, dir) else {
             return;
         };
@@ -1875,16 +1518,11 @@ impl Session {
         }
     }
 
-    /// Terminate the focused window's child processes,
-    /// with no confirmation; the resulting exit events collapse the
-    /// window through the ordinary removal path.
     fn close_window(&mut self) {
         self.kill_window(self.focus);
     }
 
-    /// Vim's "only" — terminate every other window's
-    /// child processes; the resulting exit events collapse the tree
-    /// through the ordinary removal path.
+    /// Kill every other window's processes. The exit events collapse the tree.
     fn only_window(&mut self) {
         let focus = self.focus;
         for (_, win) in self.windows.iter_mut().filter(|(id, _)| **id != focus) {
@@ -1894,16 +1532,13 @@ impl Session {
         }
     }
 
-    /// Move the boundary between the focused window and
-    /// its adjacent sibling one cell in `dir`.
+    /// Move the focused window's boundary one cell in `dir`.
     fn resize_focused(&mut self, dir: Dir) {
         if layout::resize_toward(&mut self.tree, tree_area(self.area), self.focus, dir) {
             self.force_redraw = true;
         }
     }
 
-    /// A tab's PTY hit EOF. Returns `Effect::Ended` when this was the
-    /// session's last window's last tab.
     pub fn pty_exited(&mut self, id: TabId) -> Option<Effect> {
         let win_id = self
             .windows
@@ -1912,7 +1547,6 @@ impl Session {
             .id;
         let win = self.windows.get_mut(&win_id).expect("window exists");
         if win.tabs.len() > 1 {
-            // Prune the tab and keep the window on a live one.
             let idx = win
                 .tabs
                 .iter()
@@ -1930,32 +1564,26 @@ impl Session {
             self.force_redraw = true;
             return None;
         }
-        // A window's last tab exiting collapses the window.
         let mut win = self.windows.remove(&win_id).expect("window exists");
         win.tabs.pop().expect("last tab exists").wait();
         self.collapse_window(win_id)
     }
 
-    /// Collapse a window already removed from the window map: its space
-    /// goes to its sibling subtree, focus moves off it if needed, and a
-    /// minimized window just drops its status-line title. Returns
-    /// `Effect::Ended` when it was the session's last window.
+    /// The window must already be out of `windows`.
     fn collapse_window(&mut self, win_id: WindowId) -> Option<Effect> {
         if self.windows.is_empty() {
             return Some(Effect::Ended);
         }
         self.drop_selection_in(win_id);
-        // A minimized window collapsing just drops its status-line
-        // title; the layout tree never held it.
+        // The tree never held a minimized window.
         if let Some(pos) = self.minimized.iter().position(|m| *m == win_id) {
             self.minimized.remove(pos);
             self.force_redraw = true;
             return None;
         }
         let ids = layout::leaves(&self.tree);
-        // The last on-screen window collapsed while minimized windows
-        // keep running; the oldest minimized window takes the whole
-        // tree rather than the session ending under it.
+        // The oldest minimized window takes over rather than the session
+        // ending under it.
         if ids == [win_id] {
             let restored = self.minimized.remove(0);
             self.tree = Node::Leaf(restored);
@@ -1963,13 +1591,11 @@ impl Session {
             self.force_redraw = true;
             return None;
         }
-        // Refocus before the leaf disappears from the tree; a maximized
-        // window collapsing this way also exits the maximized state.
+        // Refocus before the leaf leaves the tree.
         if self.focus == win_id {
             let pos = ids.iter().position(|i| *i == win_id).unwrap_or(0);
             self.set_focus(ids[(pos + 1) % ids.len()]);
         }
-        // The sibling subtree inherits the space.
         let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
         if let Some(tree) = layout::remove_leaf(tree, win_id) {
             self.tree = tree;
@@ -1978,11 +1604,7 @@ impl Session {
         None
     }
 
-    /// Remove the tab with `id` from its window and hand it over for
-    /// relocation into another window, possibly in another session. A
-    /// window left with no tabs collapses through the same removal path
-    /// as a process exit; `true` alongside the tab means the collapse
-    /// emptied the whole session.
+    /// The flag is true when removing the tab emptied the session.
     pub fn extract_tab(&mut self, id: TabId) -> Option<(Tab, bool)> {
         let (win_id, idx) = self.locate_tab(id)?;
         let win = self.windows.get_mut(&win_id).expect("window exists");
@@ -2005,8 +1627,6 @@ impl Session {
         Some((tab, ended))
     }
 
-    /// Append a relocated tab to the focused window's tab list as its
-    /// active tab, resized to that window's content rectangle.
     pub fn insert_tab(&mut self, tab: Tab) {
         self.drop_selection_in(self.focus);
         let win = self
@@ -2022,11 +1642,10 @@ impl Session {
 
     pub fn needs_redraw(&self) -> bool {
         self.force_redraw
-            // The status line's clock rolled over a minute.
             || self.clock != clock_now()
             || self.has_animation()
             || self.windows.values().any(|w| {
-                // A minimized window's output draws nothing.
+                // Minimized windows don't draw.
                 if self.minimized.contains(&w.id) {
                     return false;
                 }
@@ -2035,11 +1654,7 @@ impl Session {
             })
     }
 
-    /// Any badge in a tab bar currently animated or carrying a ticking
-    /// elapsed time — or the status line's pending-agent indicator,
-    /// which always shimmers? While one is on screen, the server redraws
-    /// on its timer tick so the animation and elapsed time advance
-    /// without waiting on PTY output.
+    /// The indicator always shimmers, so it counts on its own.
     pub fn has_animation(&self) -> bool {
         self.indicator.is_some()
             || self.windows.values().any(|w| {
@@ -2050,8 +1665,6 @@ impl Session {
             })
     }
 
-    /// One frame to an attached client's terminal: compute geometry into
-    /// state, then draw purely from that state (a compute/draw split).
     pub fn draw_frame(&mut self, tui: &mut Terminal<FdBackend>) -> anyhow::Result<()> {
         self.compute_view();
         tui.draw(|frame| self.render(frame))?;
@@ -2063,9 +1676,7 @@ impl Session {
         Ok(())
     }
 
-    /// Render this session cropped into `area` of `buf` for the session
-    /// switcher's live preview. Doesn't disturb the
-    /// seqno bookkeeping an attached client's redraws rely on.
+    /// Unlike `draw_frame`, leaves the seqno bookkeeping alone.
     pub fn render_preview(&mut self, buf: &mut Buffer, area: Rect) {
         self.compute_view();
         let full = Rect::new(0, 0, self.area.width, self.area.height);
@@ -2086,12 +1697,7 @@ impl Session {
         }
     }
 
-    /// Compute this frame's window and tab bar geometry into `self.view`,
-    /// reconciling every window's tabs with their rectangles.
     fn compute_view(&mut self) {
-        // A maximized window takes the whole layout area by itself; the
-        // tree is untouched, so toggling back simply resumes computing
-        // from it. Hidden windows keep their engines as they were.
         let (rects, separators) = match self.maximized {
             Some(id) => (vec![(id, tree_area(self.area))], Vec::new()),
             None => layout::compute(&self.tree, tree_area(self.area)),
@@ -2105,8 +1711,7 @@ impl Session {
             };
             win.rect = rect;
             win.reconcile();
-            // The focused window's displayed tab counts as
-            // seen the moment it's rendered.
+            // The focused tab counts as seen once rendered.
             if id == self.focus
                 && let Some(tracker) = &mut win.active_tab_mut().agent
             {
@@ -2114,8 +1719,7 @@ impl Session {
             }
             let active = win.active;
             let bar = win.tab_bar_rect();
-            // The right-edge control group, when the bar can hold it
-            // beyond the two-cell rule lead-in.
+            // Room for the controls past the two-cell rule lead-in.
             let controls = (bar.height > 0 && bar.width >= CONTROLS_WIDTH + 2)
                 .then(|| Rect::new(bar.right() - CONTROLS_WIDTH, bar.y, CONTROLS_WIDTH, 1));
             let badges_end = controls.map_or(bar.right(), |c| c.x);
@@ -2139,10 +1743,7 @@ impl Session {
             let name_lens: Vec<usize> = win.tabs.iter().map(|t| t.name.chars().count()).collect();
             let avail = badges_end.saturating_sub(bar.x.saturating_add(2)) as usize;
             let widths = allocate_name_widths(&name_lens, avail.saturating_sub(fixed));
-            // Badge spans track render_tab_bar's layout: the two-cell
-            // rule lead-in, then per badge " i:name", the
-            // agent text when present, and the trailing separator space,
-            // stopping short of the controls.
+            // Spans must match render_tab_bar's layout.
             let mut next_x = bar.x.saturating_add(2).min(badges_end);
             let tabs: Vec<TabBadge> = win
                 .tabs
@@ -2190,8 +1791,7 @@ impl Session {
         }
         self.clock = clock_now();
         let prompt = self.compute_prompt_chrome();
-        // A status message takes the reserved bottom row in place of the
-        // session status line; an open prompt outranks both.
+        // A prompt outranks a message, which outranks the status line.
         let message = (prompt.is_none() && self.area.height > 0 && self.area.width > 0)
             .then(|| {
                 self.message.as_ref().map(|text| {
@@ -2200,8 +1800,6 @@ impl Session {
                 })
             })
             .flatten();
-        // The reserved bottom row, unless a prompt or message owns it
-        // this frame.
         let status =
             (prompt.is_none() && message.is_none() && self.area.height > 0 && self.area.width > 0)
                 .then(|| {
@@ -2210,9 +1808,6 @@ impl Session {
                         .x
                         .saturating_add(2 + self.name.chars().count() as u16)
                         .min(row.right());
-                    // The pending-agent indicator takes the hostname's place
-                    // when it fits alongside the clock; too narrow a row falls
-                    // back to the hostname block as usual.
                     let indicator = self.indicator.as_ref().and_then(|ind| {
                         let ind_len = ind.text.chars().count() as u16;
                         let len = ind_len + 2 + self.clock.chars().count() as u16 + 1;
@@ -2241,11 +1836,7 @@ impl Session {
         };
     }
 
-    /// Geometry for the key-hint popup while a chord is pending:
-    /// rows from the pending chord's current node, at any
-    /// depth, sized to those rows, in the bottom-right
-    /// corner one row above the reserved status row,
-    /// clipped to the viewport.
+    /// Bottom-right corner, one row above the status row.
     fn compute_hint_chrome(&self) -> Option<HintChrome> {
         let path = self.chord.as_ref()?;
         let rows = self.keys.node_at(path)?.hints();
@@ -2271,8 +1862,6 @@ impl Session {
         })
     }
 
-    /// Geometry for the open prompt: the bottom row — label then input —
-    /// and, for the ex command line, the suggestion row above it.
     fn compute_prompt_chrome(&self) -> Option<PromptChrome> {
         let prompt = self.prompt.as_ref()?;
         let label = prompt.label();
@@ -2301,13 +1890,8 @@ impl Session {
         })
     }
 
-    /// Draw purely from `self.view` and engine state into a buffer; no
-    /// geometry math or state mutation here.
+    /// Draws from `self.view` and engine state only, with no geometry math.
     fn render_to_buffer(&self, buf: &mut Buffer) {
-        // Each window confined to its own rectangle;
-        // the active tab's content below the tab bar. While a window is
-        // maximized, it is the only one drawn; minimized windows have no
-        // rectangle at all.
         for win in self.windows.values() {
             if self.maximized.is_some_and(|id| id != win.id) || self.minimized.contains(&win.id) {
                 continue;
@@ -2317,22 +1901,15 @@ impl Session {
         for chrome in &self.view.chrome {
             render_tab_bar(chrome, self.focus, buf, self.view.elapsed);
         }
-        // Highlight the selected text, unless its window is hidden behind
-        // a maximized one.
         if let Some(sel) = &self.selection
             && self.maximized.is_none_or(|id| id == sel.window)
             && let Some(win) = self.windows.get(&sel.window)
         {
             render_selection(sel, win.content_rect(), buf);
         }
-        // Separators between side-by-side windows,
-        // uniformly dim.
         for sep in &self.view.separators {
             render_separator(sep, buf);
         }
-        // The session status line on the reserved bottom
-        // row; absent while a prompt or status message renders there
-        // instead.
         if let Some(status) = &self.view.status {
             render_status(status, self.view.elapsed, buf);
         }
@@ -2345,7 +1922,6 @@ impl Session {
                 prompt.textarea.render(chrome.input, buf);
             }
         }
-        // The key-hint popup draws over everything else.
         if let Some(hints) = &self.view.hints {
             render_hints(hints, buf);
         }
@@ -2353,15 +1929,12 @@ impl Session {
 
     fn render(&self, frame: &mut Frame) {
         self.render_to_buffer(frame.buffer_mut());
-        // While a prompt is open its textarea draws its own block
-        // cursor; the host cursor stays hidden.
+        // The prompt's textarea draws its own cursor.
         if self.prompt.is_some() {
             return;
         }
-        // The host cursor tracks the focused window's
-        // active tab's engine cursor only while it reports it visible. The
-        // engine cursor belongs to the live view, so a scrolled tab shows
-        // no cursor.
+        // The engine cursor belongs to the live view, so a scrolled tab
+        // shows none.
         let win = &self.windows[&self.focus];
         if win.active_tab().scroll_mode() {
             return;
@@ -2383,11 +1956,9 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
         return;
     }
     let screen = tab.engine.screen();
-    // The scroll-mode anchor or the live tail.
     let visible = tab.view_range();
     // Not `with_phys_lines`: at the pinned rev it mis-indexes the second
-    // half of a wrapped line deque and panics (its `_mut` twin subtracts
-    // `first_len`; the non-mut version forgets to).
+    // half of a wrapped line deque and panics.
     for (y, line) in screen.lines_in_phys_range(visible).iter().enumerate() {
         if y >= rect.height as usize {
             break;
@@ -2400,23 +1971,19 @@ fn render_tab(tab: &Tab, buf: &mut Buffer) {
             let pos = Position::new(rect.x + x as u16, rect.y + y as u16);
             if let Some(dst) = buf.cell_mut(pos) {
                 dst.set_symbol(cell.str());
-                // Colors and text attributes.
                 dst.set_style(cell_style(cell.attrs()));
             }
         }
     }
 }
 
-/// Split `budget` cells among names of the given lengths: every name
-/// that fits keeps its full length, and the rest share the width the
-/// fitting names don't use.
+/// Names that fit keep their full length, and the rest share what's left.
 fn allocate_name_widths(lens: &[usize], budget: usize) -> Vec<usize> {
     let total: usize = lens.iter().sum();
     if total <= budget {
         return lens.to_vec();
     }
-    // The largest uniform cap that fits; names shorter than the cap
-    // keep their full length, so the cap absorbs the width they free.
+    // Binary search for the largest cap that fits.
     let fits = |cap: usize| lens.iter().map(|&l| l.min(cap)).sum::<usize>() <= budget;
     let (mut lo, mut hi) = (0, budget);
     while lo < hi {
@@ -2428,8 +1995,7 @@ fn allocate_name_widths(lens: &[usize], budget: usize) -> Vec<usize> {
         }
     }
     let mut alloc: Vec<usize> = lens.iter().map(|&l| l.min(lo)).collect();
-    // Cells the cap's granularity leaves over go one each to the
-    // capped names, left to right.
+    // Leftover cells go one each to the capped names, left to right.
     let mut spare = budget - alloc.iter().sum::<usize>();
     for (a, &l) in alloc.iter_mut().zip(lens) {
         if spare == 0 {
@@ -2443,8 +2009,6 @@ fn allocate_name_widths(lens: &[usize], budget: usize) -> Vec<usize> {
     alloc
 }
 
-/// The name cut to `width` cells, ending in an ellipsis when anything
-/// was cut.
 fn truncate_name(name: &str, width: usize) -> String {
     if name.chars().count() <= width {
         return name.to_string();
@@ -2457,19 +2021,13 @@ fn truncate_name(name: &str, width: usize) -> String {
     out
 }
 
-/// Draw one window's tab bar: a two-cell rule lead-in, an
-/// indicator per tab (the active one visually distinct), and the
-/// remainder ruled. The rule is uniformly thin,
-/// its brightness marking window focus;
-/// the bar doubles as the boundary with a stacked window above.
+/// Rule brightness marks window focus.
 fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: Duration) {
     let bar = chrome.tab_bar;
     if bar.height == 0 || bar.width == 0 {
         return;
     }
     let focused = chrome.window == focus;
-    // Badges and the rule stop short of the control group's reserved
-    // width.
     let badges_end = chrome.controls.map_or(bar.right(), |c| c.x);
     let mut x = bar.x;
     let mut put = |x: &mut u16, ch: char, style: Style| -> bool {
@@ -2483,12 +2041,8 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         *x += 1;
         true
     };
-    // One thin rule weight; brightness signals focus.
-    // Focused inherits the terminal's default foreground rather than
-    // hardcoding white. The focused bar's rule also carries the active
-    // tab's status animation in its status color — working shimmers,
-    // blocked breathes — indexed by bar position so the effect sweeps
-    // the whole width.
+    // Focused uses the terminal's default foreground, not hardcoded white.
+    // The animation indexes by bar position so it sweeps the whole width.
     let rule_at = |x: u16| -> Style {
         let base = if focused {
             Color::Reset
@@ -2507,9 +2061,8 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         };
         Style::default().fg(color)
     };
-    // Badges stop where the bar runs out; the controls still draw.
+    // Badges stop where the bar runs out, but the controls still draw.
     'badges: {
-        // Two cells of rule anchor the bar's left edge.
         for _ in 0..2 {
             let style = rule_at(x);
             if !put(&mut x, '─', style) {
@@ -2517,19 +2070,12 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
             }
         }
         for (i, badge) in chrome.tabs.iter().enumerate() {
-            // Active is bright, inactive dimmed, no
-            // background fill — neutral shades only, matching the
-            // brightness-only chrome convention.
             let style = if badge.active {
-                // Focused+active inherits the terminal's default foreground
-                // instead of hardcoding white, so it respects the user's
-                // terminal theme.
                 let color = if focused { Color::Reset } else { Color::Gray };
                 Style::default().fg(color)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            // `<index>:<name>`, indexed from 0.
             for ch in format!(" {}:{}", i, badge.name).chars() {
                 if !put(&mut x, ch, style) {
                     break 'badges;
@@ -2538,9 +2084,6 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
             if badge.yanked && !put(&mut x, '*', style.fg(Color::Yellow)) {
                 break 'badges;
             }
-            // The bracketed status text, in its
-            // state's color, only for tabs identified as running a detected agent;
-            // working shimmers and blocked breathes.
             if let Some(visual) = &badge.agent {
                 if !put(&mut x, ' ', style) {
                     break 'badges;
@@ -2562,7 +2105,6 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
             }
         }
     }
-    // The unused width up to the controls, same thin rule.
     let indicators_end = x;
     while x < badges_end {
         if let Some(dst) = buf.cell_mut(Position::new(x, bar.y)) {
@@ -2571,9 +2113,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         }
         x += 1;
     }
-    // Mark a scrolled tab so a frozen view isn't mistaken
-    // for the live tail. Drawn over the rule, right-aligned against the
-    // controls.
+    // So a frozen view isn't mistaken for the live tail.
     if chrome.scroll {
         let label = " scroll ";
         let len = label.len() as u16;
@@ -2590,12 +2130,8 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
             }
         }
     }
-    // The control group: minimize, maximize/restore, exit, in standard
-    // Unicode glyphs any monospace font covers, brightness following
-    // window focus like the rest of the bar.
+    // Glyphs any monospace font covers.
     if let Some(controls) = chrome.controls {
-        // A hovered control brightens one step above its resting shade,
-        // per the bar's bright/dim convention.
         let (rest, bright) = if focused {
             (Color::Reset, Color::White)
         } else {
@@ -2624,9 +2160,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
     }
 }
 
-/// The direction a key repeats a move-tab dispatch in while the
-/// move-repeat deadline is armed: the same shifted `H`/`J`/`K`/`L` or
-/// Shift-Arrow the prefixed bindings use, without the prefix.
+/// The same keys the prefixed move-tab bindings use.
 fn move_repeat_dir(key: KeyEvent) -> Option<Dir> {
     let m = KeyMatch::from_event(key);
     if m.ctrl {
@@ -2641,8 +2175,7 @@ fn move_repeat_dir(key: KeyEvent) -> Option<Dir> {
     }
 }
 
-/// The layout tree's area: the viewport minus the bottom row reserved
-/// for the session status line.
+/// The viewport minus the status row.
 fn tree_area(area: Rect) -> Rect {
     Rect {
         height: area.height.saturating_sub(1),
@@ -2650,13 +2183,11 @@ fn tree_area(area: Rect) -> Rect {
     }
 }
 
-/// The status line's clock text, formatted `%H:%M`.
 fn clock_now() -> String {
     chrono::Local::now().format("%H:%M").to_string()
 }
 
-/// Expand a leading `~/` to the user's home directory; the server has no
-/// shell to do it. Any other path passes through unchanged.
+/// The server has no shell to expand `~`.
 fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
     if let Ok(rest) = path.strip_prefix("~")
         && let Some(home) = std::env::var_os("HOME")
@@ -2666,14 +2197,11 @@ fn expand_tilde(path: &std::path::Path) -> std::path::PathBuf {
     path.to_path_buf()
 }
 
-/// `n` with its pluralized unit, e.g. "1 byte", "42 bytes".
 fn count(n: usize, unit: &str) -> String {
     let s = if n == 1 { "" } else { "s" };
     format!("{n} {unit}{s}")
 }
 
-/// Draw a status message on the reserved bottom row, in place of the
-/// session status line.
 fn render_message(row: Rect, text: &str, buf: &mut Buffer) {
     if row.height == 0 || row.width == 0 {
         return;
@@ -2698,8 +2226,6 @@ fn render_message(row: Rect, text: &str, buf: &mut Buffer) {
     }
 }
 
-/// Draw the session status line: name left, clock right,
-/// on the neutral chrome background.
 fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
     let row = status.row;
     if row.height == 0 || row.width == 0 {
@@ -2712,7 +2238,7 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
             dst.set_style(fill);
         }
     }
-    // Menu icon: clicking it opens the switcher.
+    // The menu icon.
     if let Some(dst) = buf.cell_mut(Position::new(row.x, row.y)) {
         dst.set_char('☢');
         dst.set_style(fill.fg(Color::Gray));
@@ -2728,7 +2254,6 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
             dst.set_style(name_style);
         }
     }
-    // Minimized windows' titles, clickable to restore.
     let title_style = fill.fg(Color::Gray);
     for title in &status.minimized {
         for (i, ch) in title.name.chars().enumerate() {
@@ -2742,9 +2267,6 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
             }
         }
     }
-    // Hostname two spaces left of the clock — or, in its place, the
-    // pending-agent indicator, shimmering in the same neutral
-    // foreground.
     let clock_style = fill.fg(Color::Gray);
     let (text, ind_len) = match &status.indicator {
         Some((ind, _)) => (format!("{}  {} ", ind, status.clock), ind.chars().count()),
@@ -2766,9 +2288,6 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
     }
 }
 
-/// Draw the key-hint popup: a bordered box on the neutral
-/// chrome background, one row per table entry — keys bright, description
-/// dimmed — matching the brightness-only chrome convention.
 fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
     let rect = chrome.rect;
     if rect.width < 2 || rect.height < 2 {
@@ -2805,7 +2324,7 @@ fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
         if y >= rect.bottom() - 1 {
             break;
         }
-        // Border plus one margin cell, keys padded to the shared column.
+        // Border plus one margin cell on each side.
         let text = format!("{:width$}  {desc}", keys, width = chrome.key_width as usize);
         let styled = keys.chars().count() as u16 + 2;
         for (x, (j, ch)) in (rect.x + 2..rect.right() - 2).zip(text.chars().enumerate()) {
@@ -2821,9 +2340,8 @@ fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
     }
 }
 
-/// Invert the selected cells; toggling rather than
-/// setting REVERSED keeps the highlight visible over already-reversed
-/// content.
+/// Toggles REVERSED rather than setting it, so already-reversed content
+/// stays visible.
 fn render_selection(sel: &Selection, content: Rect, buf: &mut Buffer) {
     if content.width == 0 || content.height == 0 {
         return;
@@ -2846,9 +2364,7 @@ fn render_selection(sel: &Selection, content: Rect, buf: &mut Buffer) {
     }
 }
 
-/// Draw the prompt row — cleared, with its label —
-/// and the suggestion row above it. The textarea widget itself
-/// renders separately, over the cleared input area.
+/// The textarea renders separately, over the cleared input area.
 fn render_prompt_chrome(chrome: &PromptChrome, buf: &mut Buffer) {
     for x in chrome.line.left()..chrome.line.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, chrome.line.y)) {
@@ -2879,9 +2395,7 @@ fn render_prompt_chrome(chrome: &PromptChrome, buf: &mut Buffer) {
     }
 }
 
-/// The vertical separator between side-by-side windows —
-/// the only separator kind left. Always dimmed;
-/// the tab bar's rule brightness alone marks focus.
+/// Always dim, since the tab bar's rule marks focus.
 fn render_separator(sep: &Separator, buf: &mut Buffer) {
     let style = Style::default().fg(Color::DarkGray);
     for y in sep.rect.top()..sep.rect.bottom() {
@@ -2894,8 +2408,7 @@ fn render_separator(sep: &Separator, buf: &mut Buffer) {
     }
 }
 
-/// Map a crossterm key event to the engine's key type. Returns `None` for
-/// keys that have no terminal input encoding.
+/// `None` for keys with no terminal input encoding.
 fn map_key(key: KeyEvent) -> Option<(KeyCode, KeyModifiers)> {
     let mut mods = convert_mods(key.modifiers);
 
@@ -2963,8 +2476,8 @@ pub(crate) fn cell_style(attrs: &CellAttributes) -> Style {
     style
 }
 
-/// Map an engine color to ratatui, deferring palette resolution to the
-/// client's terminal so default and indexed colors follow the user's theme.
+/// Palette resolution is left to the client's terminal so colors follow
+/// its theme.
 fn cell_color(attr: ColorAttribute) -> Color {
     match attr {
         ColorAttribute::Default => Color::Reset,

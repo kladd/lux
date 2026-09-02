@@ -1,19 +1,4 @@
-//! Config file loading (Phase 6): a TOML file overriding the prefix key,
-//! the session-restore toggle, the desktop-notification toggle, the
-//! auto-mode toggle, and the copy-on-select toggle. The keybinding table
-//! itself is hardcoded and non-configurable. No other settings, and no
-//! live reloading.
-//!
-//! ```toml
-//! # ~/.config/lux/config.toml
-//! prefix = "C-a"    # "C-" prefix means Ctrl is held
-//! restore = false   # skip restoring persisted sessions at startup
-//! notify = false    # no desktop notifications for Claude Code tabs
-//! automode = true   # CLAUDECOM opens auto mode instead of the grid
-//! copy-on-select = false   # selections yank only on right-click
-//! ```
-//!
-//! The key spec is a single character, optionally prefixed with `C-`.
+//! Loads the TOML config file once at startup.
 
 use std::path::PathBuf;
 
@@ -21,21 +6,15 @@ use ratatui::crossterm::event::KeyCode as CtKeyCode;
 
 use crate::server::keys::{KeyMatch, KeyTable};
 
-/// The loaded settings. Every field has a default, so a missing or
-/// broken config file still yields a working server.
 pub struct Config {
     pub keys: KeyTable,
-    /// Whether the server restores persisted session state at startup;
-    /// saving is unconditional either way. Absent means restore.
+    /// Restore persisted sessions at startup. Saving happens either way.
     pub restore: bool,
-    /// Whether the server raises desktop notifications when a Claude
-    /// Code tab reaches done or blocked. Absent means notify.
+    /// Send a desktop notification when an agent tab reaches done or blocked.
     pub notify: bool,
-    /// Whether the CLAUDECOM entry points open auto mode instead of the
-    /// grid. Absent means the grid.
+    /// CLAUDECOM opens auto mode instead of the grid.
     pub automode: bool,
-    /// Whether a finished drag selection yanks to the system clipboard
-    /// on release. Absent means it does.
+    /// Yank a drag selection to the system clipboard on release.
     pub copy_on_select: bool,
 }
 
@@ -51,8 +30,6 @@ impl Default for Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/lux/config.toml`, falling back to
-/// `~/.config/lux/config.toml`.
 fn config_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -61,8 +38,6 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("lux").join("config.toml"))
 }
 
-/// Load the settings at startup. Every failure path
-/// falls back to the hardcoded defaults.
 pub fn load() -> Config {
     let Some(path) = config_path() else {
         return Config::default();
@@ -82,7 +57,6 @@ fn from_toml(text: &str, origin: &str) -> Config {
     let doc: toml::Table = match toml::from_str(text) {
         Ok(doc) => doc,
         Err(err) => {
-            // Report the parse error, run on defaults.
             eprintln!("lux: {origin}: {err}");
             return Config::default();
         }
@@ -90,7 +64,6 @@ fn from_toml(text: &str, origin: &str) -> Config {
     let mut config = Config::default();
     if let Some(value) = doc.get("prefix") {
         match value.as_str().and_then(parse_key_spec) {
-            // The configured prefix replaces the default.
             Some(key) => config.keys.set_prefix(key),
             None => eprintln!("lux: {origin}: invalid prefix key {value}"),
         }
@@ -166,41 +139,33 @@ mod tests {
 
     #[test]
     fn restore_option_parses_and_defaults_on() {
-        // Absent means restore.
         assert!(from_toml("prefix = \"C-a\"", "test").restore);
         assert!(!from_toml("restore = false", "test").restore);
         assert!(from_toml("restore = true", "test").restore);
-        // A non-boolean value keeps the default.
         assert!(from_toml("restore = \"no\"", "test").restore);
     }
 
     #[test]
     fn notify_option_parses_and_defaults_on() {
-        // Absent means notify.
         assert!(from_toml("prefix = \"C-a\"", "test").notify);
         assert!(!from_toml("notify = false", "test").notify);
         assert!(from_toml("notify = true", "test").notify);
-        // A non-boolean value keeps the default.
         assert!(from_toml("notify = \"no\"", "test").notify);
     }
 
     #[test]
     fn automode_option_parses_and_defaults_off() {
-        // Absent means the grid.
         assert!(!from_toml("prefix = \"C-a\"", "test").automode);
         assert!(from_toml("automode = true", "test").automode);
         assert!(!from_toml("automode = false", "test").automode);
-        // A non-boolean value keeps the default.
         assert!(!from_toml("automode = \"yes\"", "test").automode);
     }
 
     #[test]
     fn copy_on_select_option_parses_and_defaults_on() {
-        // Absent means copy on select.
         assert!(from_toml("prefix = \"C-a\"", "test").copy_on_select);
         assert!(!from_toml("copy-on-select = false", "test").copy_on_select);
         assert!(from_toml("copy-on-select = true", "test").copy_on_select);
-        // A non-boolean value keeps the default.
         assert!(from_toml("copy-on-select = \"no\"", "test").copy_on_select);
     }
 
@@ -235,7 +200,6 @@ mod tests {
 
     #[test]
     fn keybinding_overrides_are_not_a_setting() {
-        // Per-command keybinding overrides are prohibited: a `[keys]` table changes nothing.
         let t = table("prefix = \"C-a\"\n[keys]\nnew-tab = \"t\"");
         let prefix = KeyMatch {
             code: CtKeyCode::Char('a'),

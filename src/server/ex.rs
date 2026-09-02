@@ -1,6 +1,4 @@
-//! Ex command verbs: parsing typed command text and prefix-matching
-//! suggestions. The recognized verb set is exactly `vs`, `sp`, `w`,
-//! `new`, and `new-session`.
+//! Ex command verbs: parsing and prefix suggestions.
 
 use std::path::PathBuf;
 
@@ -16,25 +14,16 @@ pub const COMMANDS: &[&str] = &[
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExCommand {
-    /// `vs`: split side-by-side.
     SplitSideBySide,
-    /// `sp`: split stacked.
     SplitStacked,
-    /// `w <path>`: write the tab's entire terminal content, scrollback
-    /// included.
+    /// Write the tab's content, scrollback included.
     Write(PathBuf),
-    /// `new`/`new-session [name]`: create a session — named, or
-    /// auto-named when no name is given — and attach to it.
     NewSession(Option<String>),
-    /// `rename-session <name>`: rename the current session.
     RenameSession(String),
-    /// `kill-session [name]`: kill a named session, or the current one if
-    /// no name is given.
+    /// `None` kills the current session.
     KillSession(Option<String>),
 }
 
-/// Parse the command line's text on Enter. `None` means unrecognized —
-/// including `w` with no path argument — and nothing runs.
 pub fn parse(text: &str) -> Option<ExCommand> {
     match text {
         "vs" => Some(ExCommand::SplitSideBySide),
@@ -60,13 +49,11 @@ pub fn parse(text: &str) -> Option<ExCommand> {
     }
 }
 
-/// The non-empty argument following `verb `, if the text is that form.
 fn arg<'a>(text: &'a str, verb: &str) -> Option<&'a str> {
     let rest = text.strip_prefix(verb)?.strip_prefix(' ')?.trim();
     (!rest.is_empty()).then_some(rest)
 }
 
-/// The recognized commands whose names start with the text typed so far.
 pub fn suggestions(text: &str) -> Vec<&'static str> {
     COMMANDS
         .iter()
@@ -102,7 +89,6 @@ mod tests {
             parse("new-session work"),
             Some(ExCommand::NewSession(Some("work".into())))
         );
-        // A trailing space with no name is unrecognized, like `vs `.
         assert_eq!(parse("new "), None);
         assert_eq!(parse("new-session  "), None);
     }
@@ -115,7 +101,6 @@ mod tests {
         assert_eq!(parse(" vs"), None);
         assert_eq!(parse("q"), None);
         assert_eq!(parse("news"), None);
-        // `w` with no path argument.
         assert_eq!(parse("w"), None);
         assert_eq!(parse("w   "), None);
     }

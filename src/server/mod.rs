@@ -1,9 +1,5 @@
-//! The lux server: owns every session's layout tree, windows, tabs, PTYs,
-//! and terminal engines, independent of attached clients, decodes all
-//! terminal input, and renders directly to
-//! each attached client's passed descriptors. The
-//! client side lives in `crate::client`; the two communicate only through
-//! `crate::protocol`.
+//! The lux server: owns every session, decodes client input, and renders
+//! to each attached client's descriptors.
 
 pub mod agent;
 pub mod anim;
@@ -54,11 +50,8 @@ type ConnId = u64;
 type SessionId = usize;
 
 pub enum ServerEvent {
-    /// Output bytes read from a tab's PTY.
     PtyOutput(TabId, Vec<u8>),
-    /// A tab's PTY reached EOF: the child's side is closed.
     PtyExited(TabId),
-    /// A client finished its attach handshake.
     Attach {
         conn: ConnId,
         stream: UnixStream,
@@ -66,65 +59,49 @@ pub enum ServerEvent {
         stdin: OwnedFd,
         stdout: OwnedFd,
     },
-    /// `ls` over a fresh connection.
     Ls(UnixStream),
-    /// `kill-server` over a fresh connection.
     Kill(UnixStream),
-    /// `kill-session` over a fresh connection.
     KillSession(UnixStream, String),
-    /// The client relayed a SIGWINCH.
     Resized(ConnId),
-    /// The control connection ended, for any reason.
     ConnGone(ConnId),
-    /// Raw bytes read from an attached client's stdin descriptor.
     Input(ConnId, Vec<u8>),
-    /// The client's stdin went quiet after input: resolve any bytes the
-    /// decoder held back waiting for more (a partial paste marker).
+    /// Stdin went quiet, so flush the bytes the decoder held back as a
+    /// possible paste marker.
     InputIdle(ConnId),
     /// A tab's program set the clipboard via OSC 52.
     ProgramCopy(TabId, String),
-    /// SIGTERM or SIGHUP: persist and exit.
+    /// SIGTERM or SIGHUP.
     Shutdown,
 }
 
-/// Where a captured grid tab's prefix command sent the connection, when
-/// it left the grid.
 enum GridExit {
     Switcher,
     Finder,
 }
 
-/// One attached client (at most one per session).
+/// An attached client. Each session has at most one.
 struct Client {
     control: UnixStream,
     terminal: Terminal<FdBackend>,
-    /// A second handle on the client's stdout for raw escape writes
-    /// (OSC 52 clipboard mirroring).
+    /// A second handle on stdout for raw escape writes.
     raw_out: File,
     decoder: InputDecoder,
-    /// Stops the stdin reader thread so a detached client's keystrokes
-    /// are never consumed by a stale read.
     stdin_stop: Arc<AtomicBool>,
     attached: SessionId,
-    /// `Some(highlighted index)` while in switcher mode.
+    /// The highlighted index while in switcher mode.
     switcher: Option<usize>,
-    /// `Some` while viewing the CLAUDECOM grid.
     grid: Option<GridState>,
-    /// `Some` while in auto mode.
     auto: Option<AutoState>,
-    /// `Some` while in fuzzy tab-find mode.
     finder: Option<find::FinderState>,
-    /// The tab held as this connection's pending yank; the tab keeps
-    /// running in place until paste moves it.
+    /// The pending yank, which stays in place until paste moves it.
     yank: Option<TabId>,
-    /// The pointer shape last written to the client's terminal (an OSC
-    /// 22 name), so hover updates only write changes.
+    /// The OSC 22 pointer shape last written, so hover only writes changes.
     pointer: &'static str,
 }
 
 pub fn run() -> i32 {
-    // Detach from the controlling terminal so the server
-    // outlives it. Fails harmlessly if already a session leader.
+    // Detach from the controlling terminal so the server outlives it.
+    // Fails harmlessly if already a session leader.
     let _ = rustix::process::setsid();
 
     let dir = protocol::socket_dir();
@@ -135,7 +112,6 @@ pub fn run() -> i32 {
     let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
     let path = protocol::socket_path();
     let _ = std::fs::remove_file(&path);
-    // The well-known per-user socket.
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
         Err(err) => {
@@ -144,8 +120,6 @@ pub fn run() -> i32 {
         }
     };
 
-    // The keybinding table lives server-side; config is
-    // loaded here.
     let config = config::load();
     let keys = Arc::new(config.keys);
     let (tx, rx) = mpsc::channel::<ServerEvent>();
@@ -160,9 +134,8 @@ pub fn run() -> i32 {
         }
     });
 
-    // Logout, reboot, and service teardown terminate the server by
-    // signal rather than through kill-server; persist before exiting
-    // instead of losing the last debounce window's changes.
+    // Logout and reboot end the server by signal. Save first so the last
+    // debounce window's changes aren't lost.
     let signal_tx = tx.clone();
     if let Ok(mut signals) = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGTERM,
@@ -189,19 +162,12 @@ pub fn run() -> i32 {
         last_saved: None,
         tx,
     };
-    // Bring back every persisted session before any client
-    // attaches; disabled restore starts empty, as if no state existed.
     if config.restore
         && let Some(snapshot) = persist::load()
     {
         server.restore_sessions(&snapshot);
     }
     loop {
-        // While an idle debounce is pending or an
-        // attached client is showing an animated status text, wake on a
-        // short timer so the debounce can
-        // commit and the animation advances; otherwise block until
-        // something happens.
         let event = if server.needs_timed_tick() {
             match rx.recv_timeout(std::time::Duration::from_millis(60)) {
                 Ok(event) => Some(event),
@@ -209,8 +175,7 @@ pub fn run() -> i32 {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
             }
         } else {
-            // Even fully quiet, wake at the next wall-clock
-            // minute so the session status line's clock advances.
+            // Wake at the next minute so the status line clock advances.
             match rx.recv_timeout(until_next_minute()) {
                 Ok(event) => Some(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -231,12 +196,10 @@ pub fn run() -> i32 {
     }
 }
 
-/// How long after a state-changing event the automatic save runs,
-/// coalescing bursts (keystrokes, streaming output) into one write.
 const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Time until the next wall-clock minute boundary. Sub-second
-/// truncation lands the wake just past the boundary, never before it.
+/// Truncating to whole seconds lands the wake just past the minute
+/// boundary, never before it.
 fn until_next_minute() -> std::time::Duration {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,8 +207,6 @@ fn until_next_minute() -> std::time::Duration {
     std::time::Duration::from_secs(60 - secs % 60)
 }
 
-/// Per-connection thread: read the handshake (with any passed fds), then
-/// keep relaying control lines until the peer goes away.
 fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) {
     let Ok((line, fds)) = protocol::recv_request_with_fds(&stream) else {
         return;
@@ -301,28 +262,18 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
 }
 
 struct Server {
-    /// Creation-ordered, the order `ls` and the switcher present.
+    /// Keyed in creation order, which `ls` and the switcher present.
     sessions: BTreeMap<SessionId, Session>,
     clients: HashMap<ConnId, Client>,
-    /// Sessions in attachment order, most recent last — the fallback
-    /// targets for an attach with no name. Ended sessions are skipped on
-    /// lookup rather than eagerly pruned.
+    /// Most recent last. Ended sessions are skipped on lookup, not pruned.
     attach_order: Vec<SessionId>,
     keys: Arc<KeyTable>,
     clipboard: Option<arboard::Clipboard>,
-    /// Whether desktop notifications are enabled (config `notify`).
     notify: bool,
-    /// Whether the CLAUDECOM entry points open auto mode instead of the
-    /// grid (config `auto`).
     auto_enabled: bool,
-    /// Whether a finished drag selection yanks on release (config
-    /// `copy-on-select`).
     copy_on_select: bool,
     next_session_id: SessionId,
-    /// When the pending automatic save runs; armed by any event that can
-    /// change persisted state.
     save_deadline: Option<std::time::Instant>,
-    /// The last snapshot written, to skip writes when nothing changed.
     last_saved: Option<String>,
     tx: Sender<ServerEvent>,
 }
@@ -332,11 +283,8 @@ impl Server {
         self.sessions.values().any(|s| s.has_pending_idle())
     }
 
-    /// Whether the event loop should wake on a timer rather than block:
-    /// an idle debounce is waiting to commit, a repeat deadline (resize
-    /// submap or move-tab) is armed, an automatic save is pending, or a
-    /// session some client is viewing — attached or as a live switcher
-    /// preview — has an animated status text to advance.
+    /// The switcher, grid, and blank auto screen show every session, so
+    /// any session's animation counts there.
     fn needs_timed_tick(&self) -> bool {
         self.has_pending_idle()
             || self.save_deadline.is_some()
@@ -355,9 +303,6 @@ impl Server {
             })
     }
 
-    /// Commit any idle debounces whose window elapsed, and close any
-    /// repeat window whose deadline did. Agents landing in done raise
-    /// desktop notifications.
     fn tick_agents(&mut self) {
         let now = std::time::Instant::now();
         let mut notices = Vec::new();
@@ -372,12 +317,8 @@ impl Server {
         }
     }
 
-    /// Raise a desktop notification for an agent tab that reached
-    /// done or blocked: forward it as a plain OSC 9 escape to every
-    /// attached client's terminal — whichever terminal the user is
-    /// looking at displays it, even for a background session. With no
-    /// client attached the notification is discarded; there is no
-    /// history to hold it.
+    /// Writes an OSC 9 notification to every attached client, so whichever
+    /// terminal the user is watching shows it.
     fn raise_notification(&mut self, session: &str, notice: &window::Notice) {
         if !self.notify {
             return;
@@ -392,8 +333,7 @@ impl Server {
             text.push_str(": ");
             text.push_str(summary);
         }
-        // OSC string content must stay free of control bytes; a stray
-        // ESC or BEL in a name would cut the sequence short.
+        // A stray ESC or BEL in a name would cut the OSC sequence short.
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         for client in self.clients.values_mut() {
             let _ = write!(client.raw_out, "\x1b]9;{text}\x1b\\");
@@ -401,11 +341,9 @@ impl Server {
         }
     }
 
-    /// The system clipboard's current text. A connection dropped or
-    /// never acquired is re-established first: acquisition at server
-    /// startup can fail in an environment where a later attempt would
-    /// succeed, and the daemonized server outlives the one it started
-    /// in.
+    /// Retries the clipboard connection. The daemon outlives the
+    /// environment it started in, so a later attempt can succeed where
+    /// startup failed.
     fn clipboard_text(&mut self) -> Option<String> {
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
@@ -413,15 +351,12 @@ impl Server {
         self.clipboard.as_mut().and_then(|c| c.get_text().ok())
     }
 
-    /// Arm the automatic save; the debounce coalesces event bursts into
-    /// one write.
     fn mark_dirty(&mut self) {
         if self.save_deadline.is_none() {
             self.save_deadline = Some(std::time::Instant::now() + SAVE_DEBOUNCE);
         }
     }
 
-    /// Run a pending automatic save whose debounce elapsed.
     fn tick_save(&mut self) {
         if self
             .save_deadline
@@ -432,8 +367,6 @@ impl Server {
         }
     }
 
-    /// Persist every session's state now, skipping the
-    /// write when nothing changed since the last save.
     fn save_sessions(&mut self) {
         let snapshot = persist::StateSnapshot {
             sessions: self.sessions.values_mut().map(Session::snapshot).collect(),
@@ -448,10 +381,8 @@ impl Server {
         self.last_saved = Some(json);
     }
 
-    /// Recreate every persisted session at startup; clients then attach
-    /// to them by name as usual.
     fn restore_sessions(&mut self, snapshot: &persist::StateSnapshot) {
-        // No client is attached yet; a plausible size until one is.
+        // A placeholder size until a client attaches.
         let area = Rect::new(0, 0, 80, 24);
         for snap in &snapshot.sessions {
             if self.session_by_name(&snap.name).is_some() {
@@ -473,8 +404,7 @@ impl Server {
     }
 
     fn handle(&mut self, event: ServerEvent) {
-        // Anything a client does, and anything a tab's process does, can
-        // change persisted state; connection lifecycle and reads can't.
+        // Only client input and tab activity can change persisted state.
         match event {
             ServerEvent::PtyOutput(..)
             | ServerEvent::PtyExited(_)
@@ -518,15 +448,12 @@ impl Server {
                 self.attach(conn, stream, request, stdin, stdout);
             }
             ServerEvent::Ls(mut stream) => {
-                // One name per line.
                 for session in self.sessions.values() {
                     let _ = protocol::write_line(&mut stream, &session.name);
                 }
             }
             ServerEvent::Kill(mut stream) => {
-                // End every session, disconnect every
-                // client, terminate. A final save first, so the killed
-                // sessions restore when the server next starts.
+                // Save first so the killed sessions restore on the next start.
                 self.save_sessions();
                 let _ = protocol::write_line(&mut stream, "ok");
                 let conns: Vec<ConnId> = self.clients.keys().copied().collect();
@@ -549,8 +476,6 @@ impl Server {
                 }
             },
             ServerEvent::Resized(conn) => {
-                // Read the real dimensions from the
-                // client's descriptor and resize the attached session.
                 let Some(client) = self.clients.get_mut(&conn) else {
                     return;
                 };
@@ -561,16 +486,10 @@ impl Server {
                 }
             }
             ServerEvent::ConnGone(conn) => {
-                // The session lives on regardless of why
-                // the connection ended.
                 self.detach(conn);
             }
             ServerEvent::Input(conn, bytes) => self.client_input(conn, bytes),
             ServerEvent::InputIdle(conn) => self.client_input_idle(conn),
-            // A program inside a tab copied: put the text on the system
-            // clipboard and mirror it via OSC 52 to the terminal of the
-            // client attached to that tab's session, matching the yank
-            // path.
             ServerEvent::ProgramCopy(tab, text) => {
                 if let Some(clipboard) = &mut self.clipboard {
                     let _ = clipboard.set_text(text.clone());
@@ -587,8 +506,6 @@ impl Server {
                     osc52_copy(&mut client.raw_out, &text);
                 }
             }
-            // Terminated by signal: the same save-and-exit as
-            // kill-server, minus the requesting connection.
             ServerEvent::Shutdown => {
                 self.save_sessions();
                 let conns: Vec<ConnId> = self.clients.keys().copied().collect();
@@ -614,15 +531,11 @@ impl Server {
         let area = Rect::new(0, 0, size.width, size.height);
 
         let sid = match request {
-            // Bare connect creates an auto-named session.
             Request::New => self.create_session(None, area),
-            // A name attaches to its session, or creates it.
             Request::Session(name) => match self.session_by_name(&name) {
                 Some(sid) => Ok(sid),
                 None => self.create_session(Some(name), area),
             },
-            // No target falls back to the most recently attached
-            // session, or starts fresh when there is none.
             Request::Recent => match self.recent_session() {
                 Some(sid) => Ok(sid),
                 None => self.create_session(None, area),
@@ -641,8 +554,6 @@ impl Server {
             return;
         }
 
-        // Attachment is exclusive; the old client is
-        // disconnected first.
         if let Some(&old) = self
             .clients
             .iter()
@@ -659,8 +570,6 @@ impl Server {
             Ok(terminal) => terminal,
             Err(_) => return,
         };
-        // Start from a clean screen (the client just entered the alternate
-        // screen).
         let _ = terminal.clear();
 
         let stdin_stop = Arc::new(AtomicBool::new(false));
@@ -691,8 +600,6 @@ impl Server {
     }
 
     fn create_session(&mut self, name: Option<String>, area: Rect) -> Result<SessionId, String> {
-        // Generate a name when none was requested — the
-        // smallest unused non-negative integer.
         let name = match name {
             Some(name) => name,
             None => (0..)
@@ -714,13 +621,11 @@ impl Server {
         Ok(sid)
     }
 
-    /// Record `sid` as the most recently attached session.
     fn note_attached(&mut self, sid: SessionId) {
         self.attach_order.retain(|&id| id != sid);
         self.attach_order.push(sid);
     }
 
-    /// The most recently attached session still running.
     fn recent_session(&self) -> Option<SessionId> {
         self.attach_order
             .iter()
@@ -736,26 +641,22 @@ impl Server {
             .map(|(&sid, _)| sid)
     }
 
-    /// End a client's connection, keeping its session running.
-    /// The client restores its own terminal on
-    /// seeing the stream close.
+    /// Drops the connection but not the session. The client restores its
+    /// own terminal when the stream closes.
     fn detach(&mut self, conn: ConnId) {
         let Some(client) = self.clients.remove(&conn) else {
             return;
         };
-        // Stop the stdin reader before dropping our fds so a lingering
-        // read can't swallow keystrokes meant for the user's shell.
+        // Stop the reader before dropping fds, or a lingering read swallows
+        // keystrokes meant for the user's shell.
         client.stdin_stop.store(true, Ordering::Relaxed);
         let _ = client.control.shutdown(Shutdown::Both);
     }
 
-    /// A session that ended takes its attached
-    /// client's connection with it.
     fn end_session(&mut self, sid: SessionId) {
         self.sessions.remove(&sid);
-        // A removal changes persisted state like any other structural
-        // change; without this, a CLI kill-session only sticks if some
-        // unrelated event saves before the server exits.
+        // Without this a CLI kill-session only persists if some other event
+        // saves before the server exits.
         self.mark_dirty();
         if let Some(&conn) = self
             .clients
@@ -765,7 +666,6 @@ impl Server {
         {
             self.detach(conn);
         }
-        // Clamp switcher highlights that pointed past the removed session.
         let remaining = self.pinned_entries() + self.sessions.len();
         for client in self.clients.values_mut() {
             if let Some(highlight) = client.switcher.as_mut() {
@@ -774,9 +674,8 @@ impl Server {
         }
     }
 
-    /// How many pinned entries precede the sessions in the switcher's
-    /// list: the CLAUDECOM entry while any tab anywhere is
-    /// identified as running a detected agent.
+    /// The CLAUDECOM entry leads the switcher list while any agent tab
+    /// exists.
     fn pinned_entries(&self) -> usize {
         self.sessions.values().any(Session::has_agent_tab) as usize
     }
@@ -789,8 +688,6 @@ impl Server {
         self.route_input(conn, events);
     }
 
-    /// The stdin stream went idle: input the decoder held back as a
-    /// possible paste marker turned out to be ordinary keys.
     fn client_input_idle(&mut self, conn: ConnId) {
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
@@ -816,8 +713,7 @@ impl Server {
                 self.switcher_input(conn, &event);
                 continue;
             }
-            // Auto mode intercepts input only on its blank screen; a
-            // presented tab is an ordinary attached view.
+            // Auto mode only intercepts input on its blank screen.
             if client.auto.is_some_and(|a| a.presented.is_none()) {
                 self.auto_input(conn, &event);
                 continue;
@@ -843,11 +739,7 @@ impl Server {
     fn apply_effect(&mut self, conn: ConnId, sid: SessionId, effect: Effect) {
         match effect {
             Effect::Detach => self.detach(conn),
-            // Switcher mode is per-connection.
             Effect::OpenSwitcher => self.open_switcher(conn),
-            // The grid opens directly, without passing through the
-            // switcher; with auto mode enabled, every grid entry point
-            // begins auto mode instead.
             Effect::OpenGrid => {
                 if self.auto_enabled {
                     self.begin_auto(conn);
@@ -855,7 +747,6 @@ impl Server {
                     client.grid = Some(GridState::default());
                 }
             }
-            // So does the fuzzy tab finder.
             Effect::OpenFinder => self.open_finder(conn),
             Effect::NewSession(name) => self.new_session_for(conn, name),
             Effect::RenameSession(name) => {
@@ -873,8 +764,7 @@ impl Server {
                     self.end_session(target_sid);
                 }
             }
-            // Native clipboard plus OSC 52 so the client's
-            // terminal (or an outer multiplexer/SSH hop) mirrors it.
+            // OSC 52 too, so an outer terminal or SSH hop sees it.
             Effect::Copy(text) => {
                 if let Some(clipboard) = &mut self.clipboard {
                     let _ = clipboard.set_text(text.clone());
@@ -883,7 +773,6 @@ impl Server {
                     osc52_copy(&mut client.raw_out, &text);
                 }
             }
-            // Paste the system clipboard's current text.
             Effect::Paste => {
                 let Some(text) = self.clipboard_text() else {
                     return;
@@ -893,9 +782,6 @@ impl Server {
                 }
             }
             Effect::Pointer(shape) => self.set_pointer(conn, shape),
-            // The indicator's tab may be in another session; landing on
-            // it reuses the finder/grid attach path, restoring and
-            // maximizing its window if minimized.
             Effect::GotoIndicator(ind) => {
                 self.attach_to_tab(conn, ind.session, ind.window, ind.tab);
             }
@@ -919,8 +805,6 @@ impl Server {
         let key = match event {
             DecodedInput::Key(key) => key,
             DecodedInput::Mouse(mouse) => {
-                // Hovering the menu icon or a list entry shows the same
-                // hand pointer the attached view's clickable chrome gets.
                 if mouse.kind == CtMouseKind::Moved {
                     let clickable = self.switcher_icon_at(conn, mouse.column, mouse.row)
                         || self
@@ -951,21 +835,18 @@ impl Server {
         let Some(highlight) = client.switcher else {
             return;
         };
-        // The pinned entry can disappear under an open switcher; a stale
-        // highlight clamps rather than pointing past the list.
+        // The pinned entry can vanish while the switcher is open.
         let highlight = highlight.min(count.saturating_sub(1));
         let ctrl = key
             .modifiers
             .contains(ratatui::crossterm::event::KeyModifiers::CONTROL);
         match key.code {
-            // `k`, Up, or Ctrl-p moves the highlight up, wrapping to the last.
             CtKeyCode::Up | CtKeyCode::Char('k') if !ctrl => {
                 client.switcher = Some(highlight.checked_sub(1).unwrap_or(count.saturating_sub(1)));
             }
             CtKeyCode::Char('p') if ctrl => {
                 client.switcher = Some(highlight.checked_sub(1).unwrap_or(count.saturating_sub(1)));
             }
-            // `j`, Down, or Ctrl-n moves the highlight down, wrapping to the first.
             CtKeyCode::Down | CtKeyCode::Char('j') if !ctrl => {
                 client.switcher = Some(if count == 0 {
                     0
@@ -980,14 +861,12 @@ impl Server {
                     (highlight + 1) % count
                 });
             }
-            // Back out without changing attachment.
             CtKeyCode::Esc => self.switcher_cancel(conn),
             CtKeyCode::Enter => self.switcher_select(conn, highlight),
             _ => {}
         }
     }
 
-    /// Leave switcher mode without changing attachment.
     fn switcher_cancel(&mut self, conn: ConnId) {
         let Some(client) = self.clients.get_mut(&conn) else {
             return;
@@ -999,8 +878,7 @@ impl Server {
         }
     }
 
-    /// Set the client terminal's mouse pointer shape, written only on
-    /// change so plain mouse motion doesn't spam escape sequences.
+    /// Sets the pointer shape via OSC 22.
     fn set_pointer(&mut self, conn: ConnId, shape: &'static str) {
         if let Some(client) = self.clients.get_mut(&conn)
             && client.pointer != shape
@@ -1010,7 +888,6 @@ impl Server {
         }
     }
 
-    /// Whether the switcher frame's menu icon is at a clicked position.
     fn switcher_icon_at(&self, conn: ConnId, column: u16, row: u16) -> bool {
         let Some(client) = self.clients.get(&conn) else {
             return false;
@@ -1019,9 +896,6 @@ impl Server {
         size.height > 0 && column == 0 && row == size.height - 1
     }
 
-    /// Leave switcher mode and act on the entry at `highlight`: the
-    /// pinned CLAUDECOM entry opens its grid (or auto mode), a session
-    /// entry re-attaches the connection.
     fn switcher_select(&mut self, conn: ConnId, highlight: usize) {
         let pinned = self.pinned_entries();
         let Some(client) = self.clients.get_mut(&conn) else {
@@ -1043,7 +917,6 @@ impl Server {
         let current = client.attached;
         let size = term::fd_size(&client.raw_out);
         if target != current {
-            // Exclusive attachment.
             if let Some(other) = self
                 .clients
                 .iter()
@@ -1063,7 +936,6 @@ impl Server {
         }
     }
 
-    /// The switcher list entry at a clicked screen position, if any.
     fn switcher_entry_at(&self, conn: ConnId, column: u16, row: u16) -> Option<usize> {
         let count = self.pinned_entries() + self.sessions.len();
         let client = self.clients.get(&conn)?;
@@ -1075,21 +947,13 @@ impl Server {
         (index < count).then_some(index)
     }
 
-    /// Input while the fuzzy tab finder is open: Ctrl-p/Up and Ctrl-n/Down
-    /// move the highlighted match with wrap, Enter attaches to the
-    /// highlighted match's tab, Escape closes without changing which
-    /// session the connection is attached to, and every other key edits
-    /// the query, re-narrowing the matched list.
     fn finder_input(&mut self, conn: ConnId, event: &DecodedInput) {
         let key = match event {
             DecodedInput::Key(key) => key,
-            // A bracketed paste from the client's terminal belongs to
-            // the query, not to any tab.
             DecodedInput::Paste(text) => {
                 self.finder_paste(conn, text.clone());
                 return;
             }
-            // So does a right-click paste of the system clipboard.
             DecodedInput::Mouse(mouse) => {
                 if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Right))
                     && let Some(text) = self.clipboard_text()
@@ -1124,7 +988,6 @@ impl Server {
             return;
         }
         match key.code {
-            // Back out without changing attachment.
             CtKeyCode::Esc => {
                 client.finder = None;
                 let sid = client.attached;
@@ -1132,10 +995,8 @@ impl Server {
                     session.request_redraw();
                 }
             }
-            // Attach to the highlighted match's home session, focused on
-            // its tab, leaving auto mode — the user navigated away from
-            // what it was presenting. With nothing matched there is
-            // nothing to select.
+            // Leaves auto mode too: the user navigated away from what it
+            // presented.
             CtKeyCode::Enter => {
                 let Some(&idx) = matched.get(highlight) else {
                     return;
@@ -1146,9 +1007,8 @@ impl Server {
                 client.auto = None;
                 self.attach_to_tab(conn, sid, window, tab);
             }
-            // Everything else edits the query. The highlight follows the
-            // match it was on through the re-narrowed list; a match that
-            // narrowed away resets it to the top one.
+            // The highlight follows its match through the re-narrowed list,
+            // or resets to the top.
             _ => {
                 let followed = matched.get(highlight).map(|&i| items[i].id);
                 state.textarea.input(tui_textarea::Input::from(*key));
@@ -1160,8 +1020,6 @@ impl Server {
         }
     }
 
-    /// Insert pasted text into the finder query at its cursor; the
-    /// highlight follows the re-narrowed list as for typed edits.
     fn finder_paste(&mut self, conn: ConnId, text: String) {
         let items = find::items(&self.sessions);
         let Some(client) = self.clients.get_mut(&conn) else {
@@ -1180,7 +1038,7 @@ impl Server {
             .unwrap_or(0);
     }
 
-    /// Session ids in name order — the CLAUDECOM grid's session order.
+    /// The CLAUDECOM grid's session order.
     fn sessions_by_name(&self) -> Vec<SessionId> {
         let mut by_name: Vec<(&str, SessionId)> = self
             .sessions
@@ -1191,15 +1049,13 @@ impl Server {
         by_name.into_iter().map(|(_, sid)| sid).collect()
     }
 
-    /// The session, window, and tab-list position of the tab with `id`.
     fn locate(&self, id: TabId) -> Option<(SessionId, layout::WindowId, usize)> {
         self.sessions
             .iter()
             .find_map(|(&sid, s)| s.locate_tab(id).map(|(window, index)| (sid, window, index)))
     }
 
-    /// A tab's sortable position in the CLAUDECOM grid's
-    /// session/window/tab order.
+    /// A tab's position in the CLAUDECOM grid's session/window/tab order.
     fn order_key(&self, id: TabId) -> Option<(usize, usize, usize)> {
         let (sid, window, index) = self.locate(id)?;
         let spos = self.sessions_by_name().iter().position(|&s| s == sid)?;
@@ -1208,10 +1064,7 @@ impl Server {
         Some((spos, wpos, index))
     }
 
-    /// The first agent tab in the done or blocked state sorting after
-    /// `cursor` in the CLAUDECOM grid's order, wrapping to the first
-    /// such tab when none does (a `None` cursor sorts before
-    /// everything).
+    /// The first attention tab after `cursor` in grid order, wrapping.
     fn next_attention(
         &self,
         cursor: Option<(usize, usize, usize)>,
@@ -1232,13 +1085,6 @@ impl Server {
             .map(|&(_, sid, window, index)| (sid, window, index))
     }
 
-    /// Jump to the next agent tab in the done or blocked state across
-    /// every session, in the CLAUDECOM grid's session/window/tab order:
-    /// the first qualifying tab sorting after the client's focused
-    /// window's active tab, wrapping to the first qualifying tab when
-    /// none does. With no qualifying tab at all, focus is left
-    /// unchanged. Arrival reuses the same attach-and-focus (and
-    /// restore-and-maximize) path as the status-line indicator's click.
     fn cycle_agent(&mut self, conn: ConnId) {
         let Some(client) = self.clients.get(&conn) else {
             return;
@@ -1259,9 +1105,6 @@ impl Server {
         }
     }
 
-    /// Move the connection's pending yank into its attached session's
-    /// focused window. No pending yank discards the key; a yank whose
-    /// tab is gone, or already in the focused window, just clears.
     fn paste_yank(&mut self, conn: ConnId) {
         let Some(client) = self.clients.get(&conn) else {
             return;
@@ -1297,9 +1140,6 @@ impl Server {
         }
     }
 
-    /// Enter auto mode for `conn`, leaving any other full-screen mode;
-    /// the next tick selects and presents the first attention tab, or
-    /// falls back to the blank screen when none qualifies.
     fn begin_auto(&mut self, conn: ConnId) {
         if let Some(client) = self.clients.get_mut(&conn) {
             client.grid = None;
@@ -1309,12 +1149,8 @@ impl Server {
         }
     }
 
-    /// Advance every auto-mode client: a presented tab is kept until
-    /// its agent starts working again or the tab stops existing, then
-    /// the next attention tab in the grid's order is presented,
-    /// wrapping; with none, the blank screen shows until a tab needs
-    /// attention again. Clients browsing the switcher or finder are
-    /// left alone until they come back.
+    /// Moves each auto-mode client on once its presented tab is gone or
+    /// its agent is working again.
     fn tick_auto(&mut self) {
         let conns: Vec<ConnId> = self
             .clients
@@ -1349,11 +1185,6 @@ impl Server {
         }
     }
 
-    /// Input while auto mode shows the blank screen. Escape or `q`
-    /// leaves auto mode and resumes the session this connection stayed
-    /// attached to underneath it, the prefix key leads `s` (switcher)
-    /// or `f` (finder), and everything else — mouse included — is
-    /// discarded.
     fn auto_input(&mut self, conn: ConnId, event: &DecodedInput) {
         let Some(mut state) = self.clients.get(&conn).and_then(|c| c.auto) else {
             return;
@@ -1391,17 +1222,12 @@ impl Server {
         }
     }
 
-    /// Write an auto-mode state copy back to the connection, if it is
-    /// still in auto mode.
     fn store_auto_state(&mut self, conn: ConnId, state: AutoState) {
         if let Some(auto) = self.clients.get_mut(&conn).and_then(|c| c.auto.as_mut()) {
             *auto = state;
         }
     }
 
-    /// Re-attach `conn` to `sid`, focused on `window`'s tab at `index`:
-    /// attachment stays exclusive, is recorded as most recent, and the
-    /// session takes the client's terminal size.
     fn attach_to_tab(
         &mut self,
         conn: ConnId,
@@ -1428,14 +1254,14 @@ impl Server {
         }
         self.note_attached(sid);
         if let Some(session) = self.sessions.get_mut(&sid) {
-            // Area first: a minimized window's restore checks minimum
-            // sizes against the session's layout area.
+            // Set the area first: restoring a minimized window checks
+            // minimum sizes against it.
             session.set_area(Rect::new(0, 0, size.width, size.height));
             session.goto_tab(window, index);
             session.request_redraw();
         }
-        // A landing while in auto mode becomes the presented tab, so
-        // the next hand-off advances from it.
+        // In auto mode the landing tab becomes the presented one, so the
+        // next hand-off advances from it.
         let id = self
             .sessions
             .get(&sid)
@@ -1446,8 +1272,6 @@ impl Server {
         }
     }
 
-    /// Enter switcher mode for `conn`, leaving the grid if it was open;
-    /// the highlight starts on the connection's attached session.
     fn open_switcher(&mut self, conn: ConnId) {
         let Some(client) = self.clients.get(&conn) else {
             return;
@@ -1461,11 +1285,8 @@ impl Server {
         }
     }
 
-    /// Enter fuzzy tab-find mode for `conn`, leaving the grid if it was
-    /// open. The attached session's content is snapshotted here as the
-    /// finder's backdrop — the content behind the floating window stays
-    /// as it was at entry, so the finder's preview is the only view
-    /// resizing tabs while it is open.
+    /// Snapshots the attached session as a backdrop, so the finder's
+    /// preview is the only view resizing tabs while it is open.
     fn open_finder(&mut self, conn: ConnId) {
         let Some(client) = self.clients.get(&conn) else {
             return;
@@ -1483,10 +1304,6 @@ impl Server {
         }
     }
 
-    /// Create a session — named, or auto-named when `name` is `None` —
-    /// and attach `conn` to it. A name already in use closes with no
-    /// other action, mirroring the ex command line's silent-discard
-    /// handling.
     fn new_session_for(&mut self, conn: ConnId, name: Option<String>) {
         if let Some(name) = &name
             && self.session_by_name(name).is_some()
@@ -1511,22 +1328,13 @@ impl Server {
         }
     }
 
-    /// Input while viewing the CLAUDECOM grid. Outside capture mode grid
-    /// items are non-interactive: directional keys move the highlight,
-    /// Enter enters capture mode for the highlighted tile's tab, `g`
-    /// attaches to the highlighted tile's tab in its home session,
-    /// Escape or `q` leaves the grid and resumes the session this
-    /// connection stayed attached to underneath it, the prefix key leads
-    /// `s` (switcher) or `f` (finder), and everything else — mouse
-    /// included — is discarded; nothing reaches any tab's PTY.
     fn grid_input(&mut self, conn: ConnId, event: &DecodedInput) {
         let Some(mut state) = self.clients.get(&conn).and_then(|c| c.grid) else {
             return;
         };
         let items = grid::items(&self.sessions);
-        // A captured tab owns the input. The tab can leave the grid (its
-        // process exited or stopped being a detected agent); capture ends
-        // with it and the event falls through to grid navigation.
+        // A captured tab that left the grid ends capture, and the event
+        // falls through to navigation.
         if let Some(id) = state.capture {
             let target = items.iter().copied().find(|item| {
                 self.sessions
@@ -1553,9 +1361,6 @@ impl Server {
             self.store_grid_state(conn, state);
             return;
         }
-        // A pending prefix resolves to the switcher or finder shortcut;
-        // any other follow-up discards both keys, mirroring the
-        // unrecognized-sequence handling everywhere else.
         if state.pending_prefix {
             state.pending_prefix = false;
             if plain_char(key, 's') {
@@ -1589,9 +1394,6 @@ impl Server {
             return;
         }
         match key.code {
-            // Leave the grid, resuming the session the connection was
-            // attached to before opening it — attachment never changed
-            // while the grid rendered over it.
             CtKeyCode::Esc | CtKeyCode::Char('q') => {
                 let Some(client) = self.clients.get_mut(&conn) else {
                     return;
@@ -1602,8 +1404,6 @@ impl Server {
                     session.request_redraw();
                 }
             }
-            // Capture the highlighted tile's tab for direct interaction
-            // in place. An empty grid has nothing to capture.
             CtKeyCode::Enter => {
                 let highlight = state.highlight.min(items.len().saturating_sub(1));
                 if let Some(item) = items.get(highlight)
@@ -1617,9 +1417,6 @@ impl Server {
                 }
                 self.store_grid_state(conn, state);
             }
-            // Attach to the highlighted tile's tab in its home session —
-            // `g` inverts prefix+g's "go to the grid" sense. An empty
-            // grid has nowhere to go.
             CtKeyCode::Char('g') => {
                 let highlight = state.highlight.min(items.len().saturating_sub(1));
                 let Some(item) = items.get(highlight).copied() else {
@@ -1635,13 +1432,6 @@ impl Server {
         }
     }
 
-    /// One input event for a captured grid tab: key presses are routed
-    /// to its PTY, except that the prefix key always leads a command
-    /// rather than ever reaching the tab raw — `g` or Escape exits
-    /// capture back to grid navigation, `s` and `f` leave the grid for
-    /// the switcher or finder (the returned `GridExit`), and any other
-    /// follow-up discards both keys. Pastes reach the tab; mouse input
-    /// is discarded.
     fn capture_input(
         &mut self,
         state: &mut GridState,
@@ -1677,20 +1467,14 @@ impl Server {
         None
     }
 
-    /// Write a grid state copy back to the connection's open grid, if it
-    /// is still open.
     fn store_grid_state(&mut self, conn: ConnId, state: GridState) {
         if let Some(grid) = self.clients.get_mut(&conn).and_then(|c| c.grid.as_mut()) {
             *grid = state;
         }
     }
 
-    /// The pending-agent indicator for a client attached to `attached`:
-    /// the first done-or-blocked agent tab across every session,
-    /// ordered by session name then window and tab position (the
-    /// CLAUDECOM grid's order), skipping the tab the client is already
-    /// looking at — its attached session's focused window's active tab,
-    /// whose status is visible in its own tab bar.
+    /// The first attention tab in grid order, skipping the one in view
+    /// (its own tab bar already shows its status).
     fn pending_indicator(&self, attached: SessionId) -> Option<session::Indicator> {
         let looking_at = self.sessions.get(&attached).map(Session::focused_active);
         let mut by_name: Vec<(&str, SessionId)> = self
@@ -1723,14 +1507,11 @@ impl Server {
         None
     }
 
-    /// Draw every attached client that needs it: switcher and grid frames
-    /// render each pass (their content is live); attached
-    /// sessions render when their state advanced.
+    /// Full-screen modes redraw every pass. Attached sessions redraw only
+    /// when they changed.
     fn render_all(&mut self) {
-        // The pending-agent indicator is cross-session state, so it is
-        // computed here — per client viewing its attached session — and
-        // handed to that session to render; every other session's
-        // indicator is cleared.
+        // The indicator spans sessions, so compute it here and hand it to
+        // the session to render.
         let indicators: Vec<(SessionId, session::Indicator)> = self
             .clients
             .values()
@@ -1749,8 +1530,8 @@ impl Server {
                 .map(|(_, ind)| ind.clone());
             session.set_indicator(indicator);
         }
-        // Pending yanks are connection state; hand each session the ones
-        // pointing at its tabs so their indicators carry the mark.
+        // Yanks are client state, so hand each session the ones pointing
+        // at its tabs.
         let yanks: Vec<TabId> = self.clients.values().filter_map(|c| c.yank).collect();
         for session in self.sessions.values_mut() {
             let held = yanks
@@ -1781,9 +1562,6 @@ impl Server {
     }
 }
 
-/// The fuzzy tab finder frame: the backdrop snapshotted at entry — the
-/// content as it was before the finder opened — with the finder's
-/// floating window rendered over its center.
 fn render_finder(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>) {
     let Client {
         finder, terminal, ..
@@ -1809,8 +1587,6 @@ fn render_finder(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session
     });
 }
 
-/// The auto-mode blank frame: the fallback message and the live list of
-/// working agent tabs, rendered each pass like the grid.
 fn render_auto_blank(client: &mut Client, sessions: &BTreeMap<SessionId, Session>) {
     let _ = client.terminal.draw(|frame| {
         let area = frame.area();
@@ -1818,8 +1594,6 @@ fn render_auto_blank(client: &mut Client, sessions: &BTreeMap<SessionId, Session
     });
 }
 
-/// The CLAUDECOM frame: the live grid over the whole
-/// viewport.
 fn render_grid(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>) {
     let Client { grid, terminal, .. } = client;
     let Some(state) = grid.as_mut() else {
@@ -1831,12 +1605,8 @@ fn render_grid(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>)
     });
 }
 
-/// Width of the switcher's session-list column.
 const SWITCHER_LIST_WIDTH: u16 = 28;
 
-/// The switcher frame: session list on the left — the pinned CLAUDECOM
-/// entry first while any agent tab exists — and a live
-/// preview of the highlighted entry on the right.
 fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
@@ -1885,14 +1655,13 @@ fn render_switcher(
                 }
             }
         }
-        // Menu icon in its switcher-active state; clicking it exits.
+        // The menu icon, which exits on click.
         if area.height > 0
             && let Some(dst) = buf.cell_mut(Position::new(area.x, area.bottom() - 1))
         {
             dst.set_char('○');
             dst.set_style(Style::default().fg(Color::Green));
         }
-        // Divider and preview pane.
         if area.width > list_w {
             for y in area.top()..area.bottom() {
                 if let Some(dst) = buf.cell_mut(Position::new(area.x + list_w, y)) {
@@ -1924,10 +1693,9 @@ pub(crate) fn clear_region(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// Read raw input from a client's passed stdin descriptor.
-/// Poll with a short timeout so `stop` can end the
-/// thread promptly on detach — a blocked read would otherwise race the
-/// user's shell for the keystrokes typed after detach.
+/// Polls with a short timeout so `stop` ends the thread promptly. A
+/// blocked read would race the user's shell for keystrokes typed after
+/// detach.
 fn spawn_stdin_reader(
     conn: ConnId,
     stdin: OwnedFd,
@@ -1936,9 +1704,7 @@ fn spawn_stdin_reader(
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
-        // Whether input was sent since the stream last went quiet; the
-        // first poll timeout after a burst signals idle exactly once, so
-        // the decoder can resolve bytes it held waiting for more.
+        // The first timeout after a burst signals idle exactly once.
         let mut busy = false;
         loop {
             if stop.load(Ordering::Relaxed) {
@@ -1975,7 +1741,6 @@ fn spawn_stdin_reader(
     });
 }
 
-/// Whether `key` is the unmodified character `ch`.
 fn plain_char(key: &KeyEvent, ch: char) -> bool {
     KeyMatch::from_event(*key)
         == KeyMatch {
@@ -1985,7 +1750,6 @@ fn plain_char(key: &KeyEvent, ch: char) -> bool {
         }
 }
 
-/// OSC 52 written straight to the client's terminal.
 fn osc52_copy(out: &mut File, text: &str) {
     use base64::Engine as _;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);

@@ -1,8 +1,5 @@
-//! Session persistence: automatic JSON snapshots of every session's
-//! layout and each tab's working directory, restored at server startup
-//! unless the config disables it. Deliberately narrow: no scrollback
-//! replay, and agent-session resume covers only Claude Code, the one
-//! agent lux detects.
+//! JSON snapshots of each session's layout and tab working directories,
+//! restored at startup.
 
 use std::path::{Path, PathBuf};
 
@@ -10,8 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::server::layout::{Node, Split, SplitKind, WindowId};
 
-/// Everything the server persists: one entry per session, in the order
-/// `ls` and the switcher present them.
+/// Sessions in the order `ls` and the switcher show them.
 #[derive(Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub sessions: Vec<SessionSnapshot>,
@@ -28,7 +24,6 @@ pub struct SessionSnapshot {
 pub struct WindowSnapshot {
     /// The leaf id this window occupies in `tree`.
     pub id: WindowId,
-    /// Index of the active tab.
     pub active: usize,
     pub tabs: Vec<TabSnapshot>,
 }
@@ -36,17 +31,15 @@ pub struct WindowSnapshot {
 #[derive(Serialize, Deserialize)]
 pub struct TabSnapshot {
     pub cwd: PathBuf,
-    /// Claude Code session id to resume, present when the tab was
-    /// identified as running Claude Code at save time.
+    /// Claude Code session id to resume.
     pub claude_session: Option<String>,
-    /// Manual display name set via the rename prompt; absent when the
-    /// name tracks the foreground process automatically.
+    /// Manual name from the rename prompt, absent when the name tracks the
+    /// foreground process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 
-/// The layout tree, decoupled from the in-memory `Node` so the on-disk
-/// format doesn't shift under refactors.
+/// Mirrors `Node` so refactors don't change the on-disk format.
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 pub enum NodeSnapshot {
     Leaf(WindowId),
@@ -99,8 +92,6 @@ pub fn restore_node(snap: &NodeSnapshot) -> Node {
     }
 }
 
-/// `$XDG_STATE_HOME/lux/session.json`, falling back to
-/// `~/.local/state/lux/session.json`.
 fn state_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_STATE_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -109,8 +100,8 @@ fn state_path() -> Option<PathBuf> {
     Some(base.join("lux").join("session.json"))
 }
 
-/// Write the serialized snapshot, atomically via a temp-file rename so a
-/// crash mid-write never leaves a truncated file.
+/// Writes through a temp file and rename so a crash never leaves a
+/// truncated file.
 pub fn save(json: &str) {
     let Some(path) = state_path() else {
         return;
@@ -133,8 +124,6 @@ fn save_to(path: &Path, json: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Load the persisted snapshot; any failure (no file, unreadable,
-/// unparsable) means starting fresh.
 pub fn load() -> Option<StateSnapshot> {
     let path = state_path()?;
     let text = match std::fs::read_to_string(&path) {

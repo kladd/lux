@@ -1,11 +1,4 @@
-//! The fuzzy tab finder: a helix-style picker over every tab across
-//! every session, opened with the prefix key followed by `f`. It
-//! renders as a bordered floating window centered over the connection's
-//! current content, the way helix's own picker floats over the buffer.
-//! Typing a query narrows a list of tabs by display name, ranked by
-//! match quality, with a live preview of the highlighted match in a
-//! second pane; selecting a match attaches the client to that tab's
-//! home session, focused on that tab. Session layout is never touched.
+//! The fuzzy tab finder: a floating picker over every tab in every session.
 
 use std::collections::BTreeMap;
 
@@ -21,8 +14,6 @@ use crate::server::session::Session;
 use crate::server::window::TabId;
 use crate::server::{SessionId, clear_region};
 
-/// One selectable entry: a tab addressed by its home session, window,
-/// and position, with the display name the query matches against.
 pub struct FindItem {
     pub session: SessionId,
     pub window: WindowId,
@@ -32,9 +23,8 @@ pub struct FindItem {
     pub session_name: String,
 }
 
-/// A client's finder state: the query input, the highlighted match's
-/// position in the matched list, and the content snapshotted at entry
-/// that stays rendered behind the floating window.
+/// Per-client finder state. `highlight` indexes the matched list, not all
+/// items.
 pub struct FinderState {
     pub textarea: TextArea<'static>,
     pub highlight: usize,
@@ -44,7 +34,7 @@ pub struct FinderState {
 impl FinderState {
     pub fn new(backdrop: Buffer) -> Self {
         let mut textarea = TextArea::default();
-        // The default cursor-line underline reads as stray chrome in a
+        // The default cursor-line underline looks like stray chrome in a
         // one-line input.
         textarea.set_cursor_line_style(Style::default());
         Self {
@@ -54,15 +44,13 @@ impl FinderState {
         }
     }
 
-    /// The query text typed so far.
     pub fn query(&self) -> String {
         self.textarea.lines().first().cloned().unwrap_or_default()
     }
 }
 
-/// Every tab across every session, ordered by home session name then
-/// window and tab position — the same stable order the CLAUDECOM grid
-/// uses, without the Claude Code restriction.
+/// Every tab in every session, ordered by session name, then window and
+/// tab position.
 pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<FindItem> {
     let mut by_name: Vec<(&str, SessionId)> = sessions
         .iter()
@@ -89,9 +77,8 @@ pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<FindItem> {
     out
 }
 
-/// Rank `items` against `query`: the index of every item whose display
-/// name fuzzy-matches, best match first, ties in the items' own stable
-/// order. An empty query matches everything.
+/// Indices of the items whose names fuzzy-match `query`, best first. An
+/// empty query matches everything.
 pub fn matches(items: &[FindItem], query: &str) -> Vec<usize> {
     let mut scored: Vec<(i32, usize)> = items
         .iter()
@@ -102,10 +89,8 @@ pub fn matches(items: &[FindItem], query: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
-/// Fuzzy-match `query` against `name`, case-insensitively: every query
-/// character must appear in `name` in order (greedy, leftmost). `None`
-/// means no match; higher scores are better — consecutive matched
-/// characters score extra and a later first hit costs.
+/// Case-insensitive subsequence match, scored higher for consecutive hits
+/// and an early first hit.
 fn score(query: &str, name: &str) -> Option<i32> {
     let name: Vec<char> = name.to_lowercase().chars().collect();
     let mut score = 0i32;
@@ -127,11 +112,6 @@ fn score(query: &str, name: &str) -> Option<i32> {
     Some(score - first as i32)
 }
 
-/// Render the finder as a floating window centered over `area`, leaving
-/// the content around it untouched: a border encloses the query line and
-/// matched list in one pane and a live preview of the highlighted
-/// match's tab in the other, side by side while the window is wider than
-/// it is tall, stacked while taller than wide.
 pub fn render(
     buf: &mut Buffer,
     area: Rect,
@@ -210,8 +190,6 @@ pub fn render(
     }
 }
 
-/// The floating window's rectangle: 90% of the viewport in each
-/// dimension, centered — the fraction helix's own picker floats at.
 fn float_rect(area: Rect) -> Rect {
     let width = (area.width as u32 * 9 / 10) as u16;
     let height = (area.height as u32 * 9 / 10) as u16;
@@ -223,7 +201,6 @@ fn float_rect(area: Rect) -> Rect {
     )
 }
 
-/// The list pane: the query line on top of the matched tabs, best first.
 fn render_list(
     buf: &mut Buffer,
     area: Rect,
@@ -235,8 +212,6 @@ fn render_list(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // The query line: a prompt, then the textarea's own rendering
-    // (including its cursor).
     if let Some(dst) = buf.cell_mut(Position::new(area.x, area.y)) {
         dst.set_char('>');
         dst.set_style(Style::default().fg(Color::Green));
@@ -248,9 +223,8 @@ fn render_list(
         area.height.min(1),
     );
     state.textarea.render(input, buf);
-    // The list holds no scroll state of its own: once the highlight
-    // passes the visible rows the window slides to keep it on the last
-    // one.
+    // Without scroll state, the visible window slides to keep the highlight
+    // on its last row.
     let visible = area.height.saturating_sub(1) as usize;
     let start = (highlight + 1).saturating_sub(visible);
     for (row, &idx) in matched.iter().enumerate().skip(start) {
@@ -260,9 +234,6 @@ fn render_list(
         }
         let item = &items[idx];
         let selected = row == highlight;
-        // The highlighted row matches the switcher's marking; on
-        // unhighlighted rows the home session context stays dim so the
-        // display name the query matches against dominates.
         let (name_style, session_style) = if selected {
             let style = Style::default()
                 .fg(Color::Green)
@@ -297,10 +268,8 @@ fn render_list(
     }
 }
 
-/// The preview pane: the highlighted match's tab, resized to the pane
-/// so its content reflows to fit rather than showing a crop of a layout
-/// made for some other size; the home window's reconcile restores the
-/// real size on the next direct render.
+/// Resizes the previewed tab to fit the pane. The home window restores the
+/// real size on its next render.
 fn render_match_preview(
     buf: &mut Buffer,
     area: Rect,
@@ -362,11 +331,9 @@ mod tests {
     fn floating_window_takes_ninety_percent_centered() {
         let win = float_rect(Rect::new(0, 0, 100, 40));
         assert_eq!((win.x, win.y, win.width, win.height), (5, 2, 90, 36));
-        // An offset viewport centers within itself.
         let win = float_rect(Rect::new(10, 4, 100, 40));
         assert_eq!((win.x, win.y), (15, 6));
-        // A tiny viewport yields a window too small to draw; render
-        // bails on it rather than panicking.
+        // Too small to draw, so render bails instead of panicking.
         let win = float_rect(Rect::new(0, 0, 4, 3));
         assert!(win.width < 4);
     }
@@ -379,14 +346,10 @@ mod tests {
 
     #[test]
     fn consecutive_and_earlier_matches_rank_higher() {
-        // "cl" runs consecutively from the start of "claude"; in "calc"
-        // the two hits are split.
         let items = [item("calc"), item("claude")];
         assert_eq!(matches(&items, "cl"), vec![1, 0]);
-        // An earlier first hit outranks a later one.
         let items = [item("watch-vim"), item("vim")];
         assert_eq!(matches(&items, "vim"), vec![1, 0]);
-        // Non-matches drop out entirely.
         let items = [item("zsh"), item("claude"), item("vim")];
         assert_eq!(matches(&items, "cd"), vec![1]);
     }

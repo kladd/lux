@@ -1,11 +1,5 @@
-//! Auto mode: a config-gated replacement for the CLAUDECOM grid that
-//! presents one done-or-blocked agent tab at a time by attaching
-//! straight to it, handing off to the next in the grid's order once the
-//! presented tab starts working again or goes away. With no qualifying
-//! tab it shows a fallback screen instead: a centered message plus a
-//! reflowing list of the agent tabs still working. The hand-off logic
-//! lives in the server's tick; this module holds the per-client state
-//! and the fallback screen.
+//! Auto mode: attaches to one done-or-blocked agent tab at a time. The
+//! hand-off itself runs in the server tick.
 
 use std::collections::BTreeMap;
 
@@ -19,36 +13,23 @@ use crate::server::session::Session;
 use crate::server::window::TabId;
 use crate::server::{SessionId, clear_region};
 
-/// The fallback screen's message.
 const MESSAGE: &str = "Claude doesn't need you right now";
 
-/// Shown in the list's place when no agent is working either.
 const ALL_IDLE: &str = "All agents are idle";
 
-/// The widest column the fallback screen's working list occupies.
 const LIST_WIDTH: u16 = 80;
 
-/// A client's auto-mode state.
 #[derive(Clone, Copy, Default)]
 pub struct AutoState {
-    /// The tab auto mode is presenting; `None` while the fallback
-    /// screen shows.
     pub presented: Option<TabId>,
-    /// A prefix key held back pending its follow-up on the fallback
-    /// screen, which selects the switcher or finder or discards the
-    /// sequence.
+    /// Set while the fallback screen waits for a prefix key's follow-up.
     pub pending_prefix: bool,
 }
 
-/// One styled line (or list entry) of the fallback screen.
 type Run = Vec<(char, Style)>;
 
-/// Render the fallback screen: the message centered both ways — its
-/// position fixed regardless of what renders below — and the
-/// working-agent list (or a placeholder confirming every agent is idle)
-/// bottom-aligned against the screen's last row, left-justified and
-/// reflowing in a centered column, growing upward and dropping trailing
-/// lines sooner than touching the row under the message.
+/// Draws the fallback screen. The working list grows up from the bottom
+/// and drops lines before it reaches the message.
 pub fn render_blank(buf: &mut Buffer, area: Rect, sessions: &BTreeMap<SessionId, Session>) {
     clear_region(buf, area);
     if area.width == 0 || area.height == 0 {
@@ -93,10 +74,8 @@ pub fn render_blank(buf: &mut Buffer, area: Rect, sessions: &BTreeMap<SessionId,
     }
 }
 
-/// Every working agent tab in the grid's order, each formatted as its
-/// CLAUDECOM tile header — bracketed status, home session name, tab
-/// name — except with the status in the default foreground instead of
-/// the state color, its animation retained.
+/// Working agent tabs in grid order, formatted like the grid's tile headers
+/// but with the status uncolored.
 fn working_entries(sessions: &BTreeMap<SessionId, Session>) -> Vec<Run> {
     let now = std::time::Instant::now();
     let elapsed = anim::elapsed();
@@ -130,9 +109,8 @@ fn working_entries(sessions: &BTreeMap<SessionId, Session>) -> Vec<Run> {
         .collect()
 }
 
-/// Pack comma-separated entries into lines at most `width` wide,
-/// breaking between entries and hard-wrapping any single entry wider
-/// than the column.
+/// Join entries with commas into lines at most `width` wide, hard-wrapping
+/// any entry wider than that.
 fn pack(entries: Vec<Run>, width: usize) -> Vec<Run> {
     let last = entries.len().saturating_sub(1);
     let mut lines: Vec<Run> = Vec::new();

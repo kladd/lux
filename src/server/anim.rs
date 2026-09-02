@@ -1,15 +1,11 @@
-//! Time-driven status-text animations, modeled on
-//! Codex's shimmer (`~/src/codex/codex-rs/tui/src/shimmer.rs`): a
-//! highlight band sweeping across the text for shimmer, an intensity
-//! pulse for breathing, both keyed off elapsed wall time rather than
-//! frame count so their speed doesn't depend on render rate.
+//! Status-text animations keyed to wall time, so their speed doesn't depend
+//! on render rate.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use ratatui::style::Color;
 
-/// How a status text's color moves over time.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Anim {
     None,
@@ -17,24 +13,20 @@ pub enum Anim {
     Breathe,
 }
 
-/// Elapsed time since the server's first frame: the shared clock every
-/// animation phase derives from.
+/// The shared animation clock, started on first call.
 pub fn elapsed() -> Duration {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed()
 }
 
-/// Seconds per shimmer sweep and per breath.
+/// Seconds per sweep or breath.
 const PERIOD: f32 = 2.0;
-/// The band fades over this many cells to either side of its center.
 const BAND_HALF_WIDTH: f32 = 5.0;
-/// Off-text lead-in/out cells, so the band slides in from beyond one edge
-/// and fully exits past the other instead of wrapping abruptly.
+/// Cells beyond each edge, so the band slides fully off instead of
+/// snapping back.
 const PADDING: usize = 10;
 
-/// The shimmer band's color for character `i` of `len`: a
-/// raised-cosine highlight band sweeping the text, blending the state
-/// color toward white under the band's center.
+/// The color of character `i` of `len` as a highlight band sweeps past.
 pub fn shimmer(base: Color, i: usize, len: usize, elapsed: Duration) -> Color {
     let period_cells = (len + 2 * PADDING) as f32;
     let pos = (elapsed.as_secs_f32() % PERIOD) / PERIOD * period_cells;
@@ -46,8 +38,7 @@ pub fn shimmer(base: Color, i: usize, len: usize, elapsed: Duration) -> Color {
     blend(rgb(base), (255, 255, 255), t * 0.9)
 }
 
-/// The whole text's color mid-breath: a raised-cosine pulse
-/// between the state color's dimmed and full intensity.
+/// The text's color as it pulses between dim and full intensity.
 pub fn breathe(base: Color, elapsed: Duration) -> Color {
     let phase = (elapsed.as_secs_f32() % PERIOD) / PERIOD;
     let t = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * phase).cos());
@@ -62,8 +53,7 @@ fn blend(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
     Color::Rgb(ch(from.0, to.0), ch(from.1, to.1), ch(from.2, to.2))
 }
 
-/// The xterm palette value for the named colors status text uses; the
-/// blend needs concrete channels.
+/// Concrete channels for the named colors, since blending needs them.
 fn rgb(color: Color) -> (u8, u8, u8) {
     match color {
         Color::Rgb(r, g, b) => (r, g, b),
@@ -82,9 +72,6 @@ mod tests {
     #[test]
     fn shimmer_band_sweeps_with_time() {
         let len = "[working]".len();
-        // Far from the band, the base color is untouched; as the band
-        // reaches a cell its color lifts toward white, so two instants a
-        // quarter-period apart style some cell differently.
         let a: Vec<Color> = (0..len)
             .map(|i| shimmer(Color::Yellow, i, len, Duration::ZERO))
             .collect();
@@ -107,7 +94,6 @@ mod tests {
 
     #[test]
     fn breathe_pulses_between_dim_and_full() {
-        // Phase 0 is the dim end, half-period the full state color.
         assert_eq!(breathe(Color::Red, Duration::ZERO), Color::Rgb(68, 0, 0));
         assert_eq!(
             breathe(Color::Red, Duration::from_secs(1)),

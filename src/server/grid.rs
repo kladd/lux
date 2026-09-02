@@ -1,11 +1,5 @@
-//! The CLAUDECOM grid: a pinned, non-attachable session
-//! switcher entry showing a live tile for every tab across
-//! every session currently identified as running a detected agent. The grid
-//! owns no layout tree, windows, or PTYs — each tile resizes an existing
-//! tab's engine and PTY to its own interior so the content reflows to
-//! fit rather than showing a garbled crop; the next direct render in the
-//! tab's home window reconciles it back to its real size. Capturing a
-//! tile routes input to the tab it shows.
+//! The CLAUDECOM grid: a pinned switcher entry that tiles every agent tab
+//! across all sessions.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -20,34 +14,27 @@ use crate::server::session::{Session, cell_style};
 use crate::server::window::{Tab, TabId};
 use crate::server::{SessionId, clear_region};
 
-/// The pinned switcher entry's display name.
 pub const ENTRY_NAME: &str = "*CLAUDECOM*";
 
-/// Every tile is this many rows tall and at least this many columns
-/// wide — enough to show a recognizable slice of an agent tab.
-/// Deriving tile height from the screen made tiles taller than reads
-/// well; width, unlike height, grows past the minimum to consume
-/// whatever the packed columns leave unused.
+// Tile height is fixed because screen-derived heights made tiles too
+// tall to read.
 const MIN_TILE_COLS: u16 = 60;
 const TILE_ROWS: u16 = 24;
 
-/// A client's view of the grid: the highlighted tile, the first visible
-/// tile row, and the captured tab, if any.
+/// A client's view of the grid.
 #[derive(Clone, Copy, Default)]
 pub struct GridState {
     pub highlight: usize,
     scroll: usize,
-    /// The tab whose tile is in capture mode: key presses are routed to
-    /// its PTY instead of grid navigation.
+    /// The tab receiving key presses instead of grid navigation.
     pub capture: Option<TabId>,
-    /// A prefix key held back pending its follow-up, which selects a
-    /// grid command (exit capture, switcher, finder) or discards the
-    /// sequence; in capture mode the prefix never reaches the tab.
+    /// A prefix key awaiting its follow-up. In capture mode the prefix
+    /// never reaches the tab.
     pub pending_prefix: bool,
 }
 
-/// One tile's target: an agent tab addressed by its home session,
-/// window, and position in that window's tab list.
+/// An agent tab, addressed by session, window, and position in the
+/// window's tab list.
 #[derive(Clone, Copy)]
 pub struct GridItem {
     pub session: SessionId,
@@ -55,9 +42,8 @@ pub struct GridItem {
     pub tab: usize,
 }
 
-/// Every agent tab across every session, ordered by home session
-/// name, then window and tab position within the session — a stable
-/// order, so a tile stays put as unrelated tabs elsewhere update.
+/// Every agent tab in a stable order, so a tile stays put as unrelated
+/// tabs change.
 pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<GridItem> {
     let mut by_name: Vec<(&str, SessionId)> = sessions
         .iter()
@@ -79,25 +65,21 @@ pub fn items(sessions: &BTreeMap<SessionId, Session>) -> Vec<GridItem> {
         .collect()
 }
 
-/// Tile geometry for `count` items in `area`: the largest number of
-/// minimum-width tile columns that fit the screen width, every tile
-/// widened evenly to consume the remaining width. Excess items wrap
-/// into rows below; rows past the screenful scroll.
+/// Tile geometry: as many minimum-width columns as fit, widened evenly to
+/// fill the width.
 struct Layout {
     cols: usize,
-    /// Base tile width; the first `wide` columns are one cell wider so
-    /// the columns consume the full width.
+    /// Base width. The first `wide` columns are one cell wider.
     tile_w: u16,
     wide: usize,
     tile_h: u16,
-    /// Tile rows the items need in total.
     rows: usize,
-    /// Whole tile rows the area fits.
+    /// Rows that fit on screen.
     visible: usize,
 }
 
 impl Layout {
-    /// The rectangle of the tile at grid column `col`, visible row `row`.
+    /// `row` counts from the first visible row.
     fn tile_rect(&self, area: Rect, col: usize, row: usize) -> Rect {
         Rect::new(
             area.x + col as u16 * self.tile_w + col.min(self.wide) as u16,
@@ -125,8 +107,6 @@ fn layout(area: Rect, count: usize) -> Option<Layout> {
     })
 }
 
-/// Move the highlight to the tile spatially adjacent in `dir`, if one
-/// exists; at a grid edge the highlight stays put.
 pub fn navigate(state: &mut GridState, area: Rect, count: usize, dir: Dir) {
     let Some(l) = layout(area, count) else {
         return;
@@ -142,8 +122,6 @@ pub fn navigate(state: &mut GridState, area: Rect, count: usize, dir: Dir) {
     state.highlight = target.unwrap_or(i);
 }
 
-/// Keep the highlighted tile's row inside the visible rows, carrying the
-/// view along as the highlight moves past either edge.
 fn ensure_visible(state: &mut GridState, l: &Layout) {
     let row = state.highlight / l.cols;
     state.scroll = state.scroll.min(l.rows - l.visible).min(row);
@@ -152,8 +130,6 @@ fn ensure_visible(state: &mut GridState, l: &Layout) {
     }
 }
 
-/// Render the grid over `area`, first clamping `state` to the current
-/// items and scrolling the highlighted tile's row into view.
 pub fn render(
     buf: &mut Buffer,
     area: Rect,
@@ -177,8 +153,6 @@ pub fn render(
     );
 }
 
-/// Render the grid with no highlight, scroll, or capture, for the
-/// session switcher's preview pane.
 pub fn render_preview(buf: &mut Buffer, area: Rect, sessions: &mut BTreeMap<SessionId, Session>) {
     let items = items(sessions);
     draw(buf, area, sessions, &items, None, 0, None);
@@ -218,10 +192,9 @@ fn draw(
         let Some(tab) = session.tab_at_mut(item.window, item.tab) else {
             continue;
         };
-        // Reflow the tab to the tile's interior so its content fits the
-        // tile instead of showing a garbled crop of the full-size layout;
-        // the home window's reconcile restores the real size on the next
-        // direct render.
+        // Resize the tab to the tile so its content reflows instead of
+        // cropping. The home window restores the real size on its next
+        // render.
         let inner = Rect::new(
             rect.x + 1,
             rect.y + 1,
@@ -247,8 +220,7 @@ fn draw(
     }
 }
 
-/// The grid with no items left stays on screen rather than ejecting its
-/// viewer; a dim notice marks it deliberate.
+/// An emptied grid stays on screen, so tell the viewer why it's blank.
 fn draw_empty(buf: &mut Buffer, area: Rect) {
     let msg = "no agent tabs";
     let len = msg.chars().count() as u16;
@@ -266,8 +238,8 @@ fn draw_empty(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// Render the tail of `tab`'s live content — where fresh output lands —
-/// cropped into `area`, without touching the tab's real size.
+/// Draw the last rows of `tab`'s live screen into `area`, cropped rather
+/// than resized.
 pub fn render_tail(buf: &mut Buffer, area: Rect, tab: &Tab) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -293,15 +265,9 @@ pub fn render_tail(buf: &mut Buffer, area: Rect, tab: &Tab) {
     }
 }
 
-/// One tile: a border colored to match the tab's status (its animation
-/// carried onto the border, so working shimmers and blocked breathes at
-/// tile size), the tail of the tab's live content inside, and the tab's
-/// bracketed status text, home session name, and tab name drawn over the
-/// top edge like a title. The highlighted tile's border is double-lined,
-/// marking the highlight through line weight so it collides with neither
-/// the status coloring nor the border color; a captured tile carries a
-/// right-aligned label on top of that, since capture is entered on the
-/// highlighted tile and the border alone can't tell the two apart.
+/// The highlight uses line weight, not color, so it never fights the
+/// status color. A captured tile is also highlighted, so it needs its own
+/// label.
 fn draw_tile(
     buf: &mut Buffer,
     rect: Rect,
@@ -328,8 +294,6 @@ fn draw_tile(
         Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2),
         tab,
     );
-    // Chrome text over the top edge, inside the corner, on the
-    // terminal's default background.
     let base = Style::default();
     let mut x = rect.x + 1;
     let mut put = |x: &mut u16, ch: char, style: Style| -> bool {
@@ -343,7 +307,6 @@ fn draw_tile(
         *x += 1;
         true
     };
-    // The same status coloring and animation the tab's home tab bar shows.
     if let Some(tracker) = &tab.agent {
         let visual = tracker.visual(now);
         let len = visual.text.chars().count();
@@ -364,17 +327,13 @@ fn draw_tile(
             break;
         }
     }
-    // The tab name after the session name, tmux-target style
-    // (`session:tab`), dimmer so the session name stays dominant.
     put(&mut x, ':', base.fg(Color::DarkGray));
     for ch in tab.name.chars() {
         if !put(&mut x, ch, base.fg(Color::DarkGray)) {
             break;
         }
     }
-    // The capture-mode label, right-aligned on the top edge inside the
-    // corner, mirroring the tab bar's scroll label; cyan so it collides
-    // with no agent-status color.
+    // Cyan so the label never matches an agent status color.
     if captured {
         let label = " capture ";
         let len = label.chars().count() as u16;
@@ -393,9 +352,7 @@ fn draw_tile(
     }
 }
 
-/// Draw a tile's border in `color`, double-lined when highlighted. The
-/// status animation is applied per border cell, indexed clockwise around
-/// the perimeter so a shimmer band sweeps the tile's edge.
+/// Border cells are indexed clockwise so a shimmer sweeps around the edge.
 fn draw_border(
     buf: &mut Buffer,
     rect: Rect,
@@ -421,8 +378,6 @@ fn draw_border(
         };
         (x, y, ch)
     };
-    // The perimeter walked clockwise from the top-left corner; corners
-    // belong to the horizontal edges.
     let cells: Vec<(u16, u16, char)> = (left..=right)
         .map(|x| horizontal(x, top))
         .chain((top + 1..bottom).map(|y| (right, y, v)))
@@ -453,17 +408,12 @@ mod tests {
 
     #[test]
     fn columns_pack_at_minimum_width_and_tiles_grow_to_fill() {
-        // 150 wide fits two minimum-width columns; each tile widens to
-        // 75 so no width is left over. Height stays fixed at 24, and
-        // neither depends on the item count.
         for count in [1, 3, 9] {
             let l = layout(area(150, 70), count).unwrap();
             assert_eq!((l.cols, l.tile_w, l.wide, l.tile_h), (2, 75, 0, 24));
         }
-        // 300 wide fits five columns exactly at the minimum width.
         let l = layout(area(300, 150), 3).unwrap();
         assert_eq!((l.cols, l.tile_w, l.wide), (5, 60, 0));
-        // Smaller than one minimum tile lays out nothing.
         assert!(layout(area(59, 70), 3).is_none());
         assert!(layout(area(120, 23), 3).is_none());
         assert!(layout(area(120, 70), 0).is_none());
@@ -471,8 +421,6 @@ mod tests {
 
     #[test]
     fn leftover_width_spreads_across_the_columns() {
-        // 131 wide: two columns, base width 65, the first one cell
-        // wider — the tiles consume all 131 columns between them.
         let l = layout(area(131, 70), 4).unwrap();
         assert_eq!((l.cols, l.tile_w, l.wide), (2, 65, 1));
         let a = area(131, 70);
@@ -481,20 +429,15 @@ mod tests {
         assert_eq!((first.x, first.width), (0, 66));
         assert_eq!((second.x, second.width), (66, 65));
         assert_eq!(second.right(), 131);
-        // The second row sits one tile height down.
         assert_eq!(l.tile_rect(a, 0, 1).y, 24);
     }
 
     #[test]
     fn rows_wrap_the_overflow_and_cap_at_the_screenful() {
-        // Two columns: three items need two rows, both fitting in 80
-        // screen rows.
         let l = layout(area(150, 80), 3).unwrap();
         assert_eq!((l.rows, l.visible), (2, 2));
-        // A single row of items shows just that row.
         let l = layout(area(150, 80), 2).unwrap();
         assert_eq!((l.rows, l.visible), (1, 1));
-        // Ten items need five rows; only three fit.
         let l = layout(area(150, 80), 10).unwrap();
         assert_eq!((l.rows, l.visible), (5, 3));
     }
@@ -516,7 +459,6 @@ mod tests {
         assert_eq!(s.highlight, 5, "no tile to the right in a partial row");
         navigate(&mut s, a, 6, Dir::Up);
         assert_eq!(s.highlight, 1);
-        // Item 2 has no tile directly below it (the second row holds two).
         s.highlight = 2;
         navigate(&mut s, a, 6, Dir::Down);
         assert_eq!(s.highlight, 2);
@@ -524,11 +466,10 @@ mod tests {
 
     #[test]
     fn scrolling_follows_the_highlight() {
-        // 4 columns × 2 visible rows, 20 items: 5 rows.
         let l = layout(area(240, 70), 20).unwrap();
         assert_eq!((l.cols, l.rows, l.visible), (4, 5, 2));
         let mut s = GridState::default();
-        s.highlight = 19; // last row
+        s.highlight = 19;
         ensure_visible(&mut s, &l);
         assert_eq!(s.scroll, 3, "view carried down to the highlight");
         s.highlight = 0;
@@ -538,8 +479,6 @@ mod tests {
 
     #[test]
     fn border_cells_cover_the_perimeter_once() {
-        // Every border cell drawn exactly once, corners included, for
-        // both line weights.
         for double in [false, true] {
             let rect = Rect::new(2, 1, 6, 4);
             let mut buf = Buffer::empty(Rect::new(0, 0, 12, 8));
@@ -560,7 +499,6 @@ mod tests {
             assert_eq!(buf.cell(Position::new(7, 1)).unwrap().symbol(), tr);
             assert_eq!(buf.cell(Position::new(2, 4)).unwrap().symbol(), bl);
             assert_eq!(buf.cell(Position::new(7, 4)).unwrap().symbol(), br);
-            // Edges take the status color; the interior is untouched.
             assert_eq!(
                 buf.cell(Position::new(4, 1)).unwrap().style().fg,
                 Some(Color::Red)
