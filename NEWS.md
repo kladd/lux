@@ -1,5 +1,12 @@
 # News
 
+## 2026-09-01
+
+- Codex tabs no longer report blocked from prompts left in scrollback.
+- Claude MCP dialogs now read as blocked.
+- Text typed into Claude or Codex input boxes no longer affects a tab's agent
+  status.
+
 ## 2026-08-27
 
 - `prefix+y` yanks a tab and `prefix+P` pastes it into any session's

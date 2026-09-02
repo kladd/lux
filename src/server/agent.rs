@@ -1,9 +1,11 @@
 //! Agent detection: hardcoded, priority-ordered rules per agent, gated
 //! by nested `all`/`any`/`not` combinators over `contains`/`regex`
-//! matchers, evaluated against a tab's visible screen text and OSC
+//! matchers, evaluated against a tab's visible screen text — less
+//! whatever the user has typed into the agent's input area — and OSC
 //! title/progress signals. The configurable TOML delivery mechanism is
 //! deliberately absent.
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -34,11 +36,13 @@ pub enum AgentKind {
 }
 
 /// The evidence a rule matches against: the tab's
-/// current screen text, the last non-empty screen line above the
-/// input box, or the OSC title / OSC 9;4 progress state the engine
-/// captured from the PTY stream.
+/// current screen text, the screen from the input prompt line down,
+/// the last non-empty screen line above the input box, or the OSC
+/// title / OSC 9;4 progress state the engine captured from the PTY
+/// stream.
 enum Source {
     Screen,
+    FromPromptLine,
     LastLineAbovePrompt,
     OscTitle,
     OscProgress,
@@ -163,6 +167,26 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
                 ..Default::default()
             },
         },
+        // An MCP server's elicitation dialog: its question is freeform,
+        // so match the header, the Accept/Decline controls, and the
+        // cancel hint that frame it.
+        Rule {
+            state: AgentState::Blocked,
+            priority: 880,
+            source: Source::Screen,
+            gate: Gate {
+                contains: vec!["esc to cancel"],
+                regex: vec![
+                    Regex::new(r#"(?im)^\s*MCP server ["“].+["”] requests your input\s*$"#)
+                        .expect("valid rule regex"),
+                ],
+                any: vec![
+                    regex(&[r"(?m)^\s*❯?\s*Accept\b"]),
+                    regex(&[r"(?m)^\s*❯?\s*Decline\b"]),
+                ],
+                ..Default::default()
+            },
+        },
         // The CLI animates a spinner into the window title while it
         // runs: Braille frames on older versions, half-circle frames
         // from 2.1.228 on.
@@ -241,10 +265,12 @@ static CODEX_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             source: Source::OscTitle,
             gate: regex(&["^[\u{2800}-\u{28FF}]"]),
         },
+        // Scoped from the input prompt line down: a finished command's
+        // own output above it can quote a prompt.
         Rule {
             state: AgentState::Blocked,
             priority: 900,
-            source: Source::Screen,
+            source: Source::FromPromptLine,
             gate: Gate {
                 any: vec![
                     contains(&["press enter to confirm"]),
@@ -320,13 +346,70 @@ static KIRO_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
     ]
 });
 
-/// The last non-empty screen line above the input box's top border.
-/// The box's bottom border is the first horizontal rule up from the
-/// screen bottom and its top border the second; with fewer than two
-/// rules on screen there is no box, and the whole screen is searched.
+/// The screen with the input area's contents cut out, so typed text
+/// never counts as evidence: Claude Code's bordered input box loses
+/// its body, and Codex's composer keeps only its `›` glyph, dropping
+/// the typed lines between it and the footer below. Kiro's input
+/// chrome is not identified, so its screen passes through.
+fn without_input_area(kind: AgentKind, screen: &str) -> Cow<'_, str> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let kept = match kind {
+        AgentKind::Claude => {
+            let Some((top, bottom)) = prompt_box(&lines) else {
+                return Cow::Borrowed(screen);
+            };
+            let mut kept = lines[..=top].to_vec();
+            kept.extend_from_slice(&lines[bottom..]);
+            kept
+        }
+        AgentKind::Codex => {
+            let Some(prompt) = lines.iter().rposition(|line| is_prompt_line(line)) else {
+                return Cow::Borrowed(screen);
+            };
+            let footer = lines
+                .iter()
+                .rposition(|line| !line.trim().is_empty())
+                .filter(|&index| index > prompt)
+                .unwrap_or(prompt + 1);
+            let mut kept = lines[..prompt].to_vec();
+            kept.push("›");
+            kept.extend_from_slice(&lines[footer..]);
+            kept
+        }
+        AgentKind::Kiro => return Cow::Borrowed(screen),
+    };
+    let mut out = String::with_capacity(screen.len());
+    for line in kept {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Cow::Owned(out)
+}
+
+/// Codex's input prompt line: the `›` glyph at the left edge.
+fn is_prompt_line(line: &str) -> bool {
+    line == "›" || line.starts_with("› ")
+}
+
+/// The screen from the input prompt line to the bottom, or the whole
+/// screen when no prompt line is showing.
+fn from_prompt_line(screen: &str) -> &str {
+    let mut start = 0;
+    let mut offset = 0;
+    for line in screen.split_inclusive('\n') {
+        if is_prompt_line(line.trim_end_matches('\n')) {
+            start = offset;
+        }
+        offset += line.len();
+    }
+    &screen[start..]
+}
+
+/// The last non-empty screen line above the input box's top border,
+/// or anywhere on screen when there is no box.
 fn last_line_above_prompt(screen: &str) -> &str {
     let lines: Vec<&str> = screen.lines().collect();
-    let top = prompt_box_top(&lines).unwrap_or(lines.len());
+    let top = prompt_box(&lines).map_or(lines.len(), |(top, _)| top);
     lines[..top]
         .iter()
         .rev()
@@ -335,15 +418,17 @@ fn last_line_above_prompt(screen: &str) -> &str {
         .unwrap_or("")
 }
 
-/// Index of the input box's top border: the second horizontal rule
-/// scanning up from the screen bottom.
-fn prompt_box_top(lines: &[&str]) -> Option<usize> {
-    let mut rules = 0;
+/// Indices of the input box's top and bottom borders: the bottom border
+/// is the first horizontal rule scanning up from the screen bottom and
+/// the top border the second. With fewer than two rules on screen
+/// there is no box.
+fn prompt_box(lines: &[&str]) -> Option<(usize, usize)> {
+    let mut bottom = None;
     for (index, line) in lines.iter().enumerate().rev() {
         if is_horizontal_rule(line) {
-            rules += 1;
-            if rules == 2 {
-                return Some(index);
+            match bottom {
+                None => bottom = Some(index),
+                Some(bottom) => return Some((index, bottom)),
             }
         }
     }
@@ -367,11 +452,13 @@ pub fn evaluate(kind: AgentKind, snapshot: &Snapshot) -> AgentState {
         AgentKind::Codex => &CODEX_RULES,
         AgentKind::Kiro => &KIRO_RULES,
     };
+    let screen = without_input_area(kind, &snapshot.screen);
     let mut best: Option<&Rule> = None;
     for rule in rules.iter() {
         let text = match rule.source {
-            Source::Screen => snapshot.screen.as_str(),
-            Source::LastLineAbovePrompt => last_line_above_prompt(&snapshot.screen),
+            Source::Screen => screen.as_ref(),
+            Source::FromPromptLine => from_prompt_line(&screen),
+            Source::LastLineAbovePrompt => last_line_above_prompt(&screen),
             Source::OscTitle => snapshot.title.as_str(),
             Source::OscProgress => snapshot.progress.as_str(),
         };
@@ -701,6 +788,75 @@ mod tests {
     }
 
     #[test]
+    fn typed_text_in_input_box_is_not_evidence() {
+        // Whatever sits between the box's borders is cut out before the
+        // rules run; the spinner line above the box still counts.
+        let s = snap(
+            "✻ Thinking…\n\n────────────\n❯ do you want to proceed? [y/n]\n────────────\n\
+             \x20 ~/src/lux ⎇ main\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
+        let s = snap(
+            "● Done.\n\n────────────\n❯ esc to interrupt\n  ❯ 1. Yes\n────────────\n\
+             \x20 ~/src/lux ⎇ main\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        // A wrapped or multi-line entry fills several body lines, all
+        // of them cut out.
+        let s = snap(
+            "● Done. The command printed lux-probe.\n\n✻ Crunched for 3s · done 7:22 PM\n\n\
+             ────────────\n❯ Use the AskUserQuestion tool to ask me whether I prefer red or blue.\n\
+             \x20 first typed line do you want to proceed? [y/n]\n────────────\n\
+             \x20 Haiku 4.5 | Context: 18% used\n  ⏸ manual mode on\n",
+            "✳ Claude Code",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
+    fn dialog_below_last_rule_is_blocked() {
+        // A dialog replaces the box: one rule above it and none below,
+        // so nothing is cut out.
+        let s = snap(
+            "────────────\n Bash command\n\n   mkdir -p /tmp/probe\n   Create directory /tmp/probe\n\n\
+             \x20Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and always allow access to /tmp\n\
+             \x20  3. No\n\n Esc to cancel · Tab to amend\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
+    }
+
+    #[test]
+    fn mcp_elicitation_dialog_is_blocked() {
+        // The server's question is freeform; the header, the
+        // Accept/Decline controls, and the cancel hint frame it. Live
+        // captures put curly quotes around the server name.
+        for screen in [
+            "MCP server “my-server” requests your input\n\n\
+             Grant temporary access to the demo gateway for 15 minutes?\n\n\
+             ❯ Accept    Decline\n\nEsc to cancel · ↑/↓ to navigate\n",
+            "MCP server \"my-server\" requests your input\n\nserver-supplied message\n\n\
+             ❯ Accept    Decline\n\nEsc to cancel · ↑/↓ to navigate\n",
+        ] {
+            let s = snap(screen, "✳ Claude Code", "none");
+            assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
+        }
+        // The header alone, without the controls, is ordinary output.
+        let s = snap(
+            "MCP server “my-server” requests your input\n\nEsc to cancel\n",
+            "✳ Claude Code",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+    }
+
+    #[test]
     fn kiro_approval_prompts_are_blocked() {
         let s = snap(
             "Shell command requires approval\n❯ 1. Yes, single permission\n  \
@@ -781,6 +937,43 @@ mod tests {
         ] {
             let s = snap(prompt, "codex", "none");
             assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Blocked);
+        }
+    }
+
+    #[test]
+    fn codex_confirmation_text_above_prompt_is_idle() {
+        // A finished response quoting a prompt sits above the composer.
+        let s = snap(
+            "• The transcript now shows [y/N] / esc, matching the real prompt.\n\n\
+             ─ Worked for 4m 59s ─\n\n› Ask Codex to do anything\n",
+            "codex",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Idle);
+        let s = snap("Continue? [y/n]\n›\n", "codex", "none");
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Idle);
+        // From the prompt line down it is live.
+        let s = snap(
+            "• Working (4s • esc to interrupt)\n› 1. Yes, proceed\n  2. No\n\
+             Press enter to confirm or esc to cancel\n",
+            "codex",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Blocked);
+    }
+
+    #[test]
+    fn codex_typed_text_in_composer_is_not_evidence() {
+        // Single-line, wrapped, and multi-paragraph input, with and
+        // without the footer below the composer.
+        for screen in [
+            "› do you want to continue? [y/n]\n",
+            "› Explain why this prompt wraps before quoting the confirmation text\n\
+             \x20 [y/N] / esc and whether the docs should include it\n\n  gpt-5 default · /work\n",
+            "› first paragraph\n\n  allow command? second paragraph\n\n  ? for shortcuts\n",
+        ] {
+            let s = snap(screen, "codex", "none");
+            assert_eq!(evaluate(AgentKind::Codex, &s), AgentState::Idle);
         }
     }
 
