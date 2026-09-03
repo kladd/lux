@@ -1,5 +1,13 @@
 # News
 
+## 2026-09-02
+
+- Middle-clicking a tab indicator closes that tab.
+- Switcher entries shimmer or breathe in the color of the session's most
+  pressing agent tab: blocked, then done, then working.
+- `osc-titles` (`none`, `agents`, or `all`; default `agents`) controls which
+  tabs take their name from the program's OSC title.
+
 ## 2026-09-01
 
 - Codex tabs no longer report blocked from prompts left in scrollback.

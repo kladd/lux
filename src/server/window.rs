@@ -15,7 +15,8 @@ use wezterm_term::{
 };
 
 use crate::server::ServerEvent;
-use crate::server::agent::{self, AgentState, Tracker};
+use crate::server::agent::{self, AgentKind, AgentState, Tracker};
+use crate::server::config::OscTitles;
 use crate::server::layout::WindowId;
 
 pub type TabId = usize;
@@ -202,6 +203,18 @@ impl Foreground {
             || ["kiro", "kiro-cli"].contains(&self.arg0.as_str())
     }
 
+    fn agent_kind(&self) -> Option<AgentKind> {
+        if self.is_claude() {
+            Some(AgentKind::Claude)
+        } else if self.is_codex() {
+            Some(AgentKind::Codex)
+        } else if self.is_kiro() {
+            Some(AgentKind::Kiro)
+        } else {
+            None
+        }
+    }
+
     fn display_name(&self) -> &str {
         if self.arg0.is_empty() {
             &self.comm
@@ -353,12 +366,31 @@ impl Tab {
         self.manual_name = true;
     }
 
-    pub fn clear_name(&mut self) {
+    pub fn clear_name(&mut self, osc_titles: OscTitles) {
         self.manual_name = false;
         // Don't wait for the next PTY output to trigger refresh_identity.
-        if let Some(name) = self.claude_session_name().or_else(|| self.osc_title()) {
-            self.name = name;
+        if let Some(fg) = self.foreground() {
+            let name = self.derived_name(&fg, osc_titles);
+            if !name.is_empty() {
+                self.name = name;
+            }
         }
+    }
+
+    fn derived_name(&self, fg: &Foreground, osc_titles: OscTitles) -> String {
+        let kind = fg.agent_kind();
+        // Claude Code churns the OSC title as a status channel, so the
+        // session name outranks it.
+        let session = (kind == Some(AgentKind::Claude))
+            .then(|| self.claude_session_name())
+            .flatten();
+        automatic_name(
+            kind,
+            session,
+            self.osc_title(),
+            fg.display_name(),
+            osc_titles,
+        )
     }
 
     fn osc_title(&self) -> Option<String> {
@@ -377,25 +409,16 @@ impl Tab {
 
     /// Re-derive the display name and re-run agent detection after new PTY
     /// output. The bool is whether the display changed.
-    pub fn refresh_identity(&mut self) -> (bool, Option<Notice>) {
+    pub fn refresh_identity(&mut self, osc_titles: OscTitles) -> (bool, Option<Notice>) {
         let fg = self.foreground();
         let renamed = if self.manual_name {
             false
         } else {
-            let new_name = match fg.as_ref() {
-                // Claude Code churns the OSC title as a status channel, so
-                // the session name outranks it.
-                Some(fg) if fg.is_claude() => self
-                    .claude_session_name()
-                    .or_else(|| self.osc_title())
-                    .unwrap_or_else(|| fg.display_name().to_string()),
-                Some(fg) => self
-                    .osc_title()
-                    .unwrap_or_else(|| fg.display_name().to_string()),
-                // Unreadable foreground (mid-exec): keep the current name
-                // rather than flicker.
-                None => String::new(),
-            };
+            // Unreadable foreground (mid-exec): keep the current name rather
+            // than flicker.
+            let new_name = fg
+                .as_ref()
+                .map_or_else(String::new, |fg| self.derived_name(fg, osc_titles));
             if !new_name.is_empty() && new_name != self.name {
                 self.name = new_name;
                 true
@@ -403,12 +426,7 @@ impl Tab {
                 false
             }
         };
-        let kind = match fg.as_ref() {
-            Some(fg) if fg.is_claude() => Some(agent::AgentKind::Claude),
-            Some(fg) if fg.is_codex() => Some(agent::AgentKind::Codex),
-            Some(fg) if fg.is_kiro() => Some(agent::AgentKind::Kiro),
-            _ => None,
-        };
+        let kind = fg.as_ref().and_then(Foreground::agent_kind);
         let Some(kind) = kind else {
             // Only a definite non-claude sighting clears session identity.
             // An unreadable foreground (mid-exec) is transient.
@@ -566,6 +584,23 @@ impl Tab {
     }
 }
 
+/// Session name, then the OSC title where the scope allows it, then the
+/// command name.
+fn automatic_name(
+    kind: Option<AgentKind>,
+    session: Option<String>,
+    title: Option<String>,
+    command: &str,
+    osc_titles: OscTitles,
+) -> String {
+    let title = match osc_titles {
+        OscTitles::All => title,
+        OscTitles::Agents if kind.is_some() => title,
+        _ => None,
+    };
+    session.or(title).unwrap_or_else(|| command.to_string())
+}
+
 /// A rect can shrink to zero, but the PTY and engine need at least 1x1.
 fn pty_size(rect: Rect) -> PtySize {
     PtySize {
@@ -609,6 +644,49 @@ mod tests {
         assert!(fg("claude", "node").is_claude());
         assert!(fg("node", "claude").is_claude());
         assert!(!fg("node", "node").is_claude());
+    }
+
+    #[test]
+    fn osc_title_scope_gates_which_tabs_use_it() {
+        let title = || Some("kyle@host: ~/src".to_string());
+        let name = |kind, scope| automatic_name(kind, None, title(), "bash", scope);
+        assert_eq!(name(None, OscTitles::All), "kyle@host: ~/src");
+        assert_eq!(name(None, OscTitles::Agents), "bash");
+        assert_eq!(name(None, OscTitles::None), "bash");
+        assert_eq!(
+            name(Some(AgentKind::Codex), OscTitles::Agents),
+            "kyle@host: ~/src"
+        );
+        assert_eq!(name(Some(AgentKind::Codex), OscTitles::None), "bash");
+    }
+
+    #[test]
+    fn session_name_outranks_title_and_title_outranks_command() {
+        let session = Some("refactor".to_string());
+        let title = Some("✻ Thinking".to_string());
+        let claude = Some(AgentKind::Claude);
+        assert_eq!(
+            automatic_name(
+                claude,
+                session.clone(),
+                title.clone(),
+                "claude",
+                OscTitles::Agents
+            ),
+            "refactor"
+        );
+        assert_eq!(
+            automatic_name(claude, session, None, "claude", OscTitles::None),
+            "refactor"
+        );
+        assert_eq!(
+            automatic_name(claude, None, title, "claude", OscTitles::Agents),
+            "✻ Thinking"
+        );
+        assert_eq!(
+            automatic_name(claude, None, None, "claude", OscTitles::All),
+            "claude"
+        );
     }
 
     #[test]

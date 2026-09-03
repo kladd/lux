@@ -28,6 +28,26 @@ pub enum AgentKind {
     Kiro,
 }
 
+/// The states that call for a motion cue, least pressing first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Urgency {
+    Working,
+    Done,
+    Blocked,
+}
+
+impl Urgency {
+    /// The state's status text color and the animation a single-line
+    /// entry carries for it.
+    pub fn visual(self) -> (Color, Anim) {
+        match self {
+            Urgency::Working => (Color::Yellow, Anim::Shimmer),
+            Urgency::Done => (Color::Green, Anim::Shimmer),
+            Urgency::Blocked => (Color::Red, Anim::Breathe),
+        }
+    }
+}
+
 enum Source {
     Screen,
     FromPromptLine,
@@ -516,6 +536,15 @@ impl Tracker {
         !(self.displayed == AgentState::Idle && self.seen)
     }
 
+    pub fn urgency(&self) -> Option<Urgency> {
+        match (self.displayed, self.seen) {
+            (AgentState::Working, _) => Some(Urgency::Working),
+            (AgentState::Blocked, _) => Some(Urgency::Blocked),
+            (AgentState::Idle, false) => Some(Urgency::Done),
+            (AgentState::Idle, true) => None,
+        }
+    }
+
     pub fn visual(&self, now: Instant) -> Visual {
         let (state, color, anim) = match (self.displayed, self.seen) {
             (AgentState::Working, _) => ("working", Color::Yellow, Anim::Shimmer),
@@ -561,6 +590,34 @@ mod tests {
             title: title.into(),
             progress: progress.into(),
         }
+    }
+
+    #[test]
+    fn urgency_ranks_blocked_over_done_over_working() {
+        assert!(Urgency::Blocked > Urgency::Done);
+        assert!(Urgency::Done > Urgency::Working);
+        assert_eq!(
+            [Urgency::Working, Urgency::Blocked, Urgency::Done]
+                .into_iter()
+                .max(),
+            Some(Urgency::Blocked)
+        );
+    }
+
+    #[test]
+    fn urgency_follows_displayed_state_and_seen() {
+        let now = Instant::now();
+        let mut tracker = Tracker::new(AgentKind::Claude);
+        assert_eq!(tracker.urgency(), None);
+        tracker.observe(AgentState::Working, now);
+        assert_eq!(tracker.urgency(), Some(Urgency::Working));
+        tracker.observe(AgentState::Blocked, now);
+        assert_eq!(tracker.urgency(), Some(Urgency::Blocked));
+        tracker.observe(AgentState::Idle, now);
+        tracker.tick(now + IDLE_DEBOUNCE);
+        assert_eq!(tracker.urgency(), Some(Urgency::Done));
+        tracker.mark_seen();
+        assert_eq!(tracker.urgency(), None);
     }
 
     #[test]

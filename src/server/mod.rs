@@ -37,7 +37,9 @@ use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::protocol::{self, Request};
+use anim::Anim;
 use auto::AutoState;
+use config::OscTitles;
 use grid::GridState;
 use input::{DecodedInput, InputDecoder};
 use keys::{KeyMatch, KeyTable};
@@ -157,6 +159,7 @@ pub fn run() -> i32 {
         notify: config.notify,
         auto_enabled: config.automode,
         copy_on_select: config.copy_on_select,
+        osc_titles: config.osc_titles,
         next_session_id: 0,
         save_deadline: None,
         last_saved: None,
@@ -272,6 +275,7 @@ struct Server {
     notify: bool,
     auto_enabled: bool,
     copy_on_select: bool,
+    osc_titles: OscTitles,
     next_session_id: SessionId,
     save_deadline: Option<std::time::Instant>,
     last_saved: Option<String>,
@@ -393,6 +397,7 @@ impl Server {
                 area,
                 self.keys.clone(),
                 self.copy_on_select,
+                self.osc_titles,
                 self.tx.clone(),
             ) else {
                 continue;
@@ -612,6 +617,7 @@ impl Server {
             area,
             self.keys.clone(),
             self.copy_on_select,
+            self.osc_titles,
             self.tx.clone(),
         )
         .map_err(|err| format!("cannot start session: {err:#}"))?;
@@ -1613,45 +1619,51 @@ fn render_switcher(
     highlight: usize,
 ) {
     let pinned = sessions.values().any(Session::has_agent_tab) as usize;
-    let mut names: Vec<String> = Vec::with_capacity(pinned + sessions.len());
+    let mut entries: Vec<(String, Option<agent::Urgency>)> =
+        Vec::with_capacity(pinned + sessions.len());
     if pinned > 0 {
-        names.push(grid::ENTRY_NAME.to_string());
+        entries.push((grid::ENTRY_NAME.to_string(), None));
     }
-    names.extend(
-        sessions
-            .values()
-            .map(|s| format!("{} ({} windows)", s.name, s.window_count())),
-    );
-    let highlight = highlight.min(names.len().saturating_sub(1));
+    entries.extend(sessions.values().map(|s| {
+        let name = format!("{} ({} windows)", s.name, s.window_count());
+        (name, s.urgency())
+    }));
+    let highlight = highlight.min(entries.len().saturating_sub(1));
     let highlighted_sid = highlight
         .checked_sub(pinned)
         .and_then(|i| sessions.keys().nth(i).copied());
+    let elapsed = anim::elapsed();
     let _ = client.terminal.draw(|frame| {
         let area = frame.area();
         let buf = frame.buffer_mut();
         clear_region(buf, area);
         let list_w = SWITCHER_LIST_WIDTH.min(area.width);
-        for (i, name) in names.iter().enumerate() {
+        for (i, (name, urgency)) in entries.iter().enumerate() {
             let y = area.y + 1 + i as u16;
             if y >= area.bottom() {
                 break;
             }
-            let style = if i == highlight {
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::REVERSED)
+            let (base, modifier) = if i == highlight {
+                (Color::Green, Modifier::REVERSED)
             } else {
-                Style::default()
+                (Color::Reset, Modifier::empty())
             };
+            let (color, anim) = urgency.map_or((base, Anim::None), agent::Urgency::visual);
             let text = format!(" {name} ");
+            let len = text.chars().count();
             for (j, ch) in text.chars().enumerate() {
                 let x = area.x + j as u16;
                 if x >= area.x + list_w {
                     break;
                 }
+                let fg = match anim {
+                    Anim::None => color,
+                    Anim::Shimmer => anim::shimmer(color, j, len, elapsed),
+                    Anim::Breathe => anim::breathe(color, elapsed),
+                };
                 if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
                     dst.set_char(ch);
-                    dst.set_style(style);
+                    dst.set_style(Style::default().fg(fg).add_modifier(modifier));
                 }
             }
         }

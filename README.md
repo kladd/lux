@@ -77,6 +77,9 @@ All window commands start with the prefix key (default `Ctrl-b`):
 Arrow keys work as alternates for `h`/`j`/`k`/`l` (and Shift-arrows for
 `H`/`J`/`K`/`L`).
 
+Clicking a tab indicator selects that tab; middle-clicking it closes the
+tab, like prefix+`w`.
+
 In terminals that support pointer shapes, clickable chrome — tab
 indicators, window controls, minimized window titles, the status bar's
 menu icon and agent indicator, and switcher entries — shows a hand
@@ -151,7 +154,13 @@ restore = false  # skip restoring persisted sessions at startup
 notify = false   # no desktop notifications for Claude Code tabs
 automode = true  # CLAUDECOM opens auto mode instead of the grid
 copy-on-select = false   # selections yank only on right-click
+osc-titles = "all"       # which tabs are named by the program's OSC title
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`
 for Ctrl.
+
+`osc-titles` is `none`, `agents` (the default), or `all`. A tab not renamed
+by hand is named after its foreground process; where the option allows it,
+a window title the program sets with OSC 0/2 replaces that name. Agent tabs
+use the title by default; a Claude Code session name outranks it.

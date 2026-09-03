@@ -6,6 +6,15 @@ use ratatui::crossterm::event::KeyCode as CtKeyCode;
 
 use crate::server::keys::{KeyMatch, KeyTable};
 
+/// Which tabs may take their name from the program's OSC window title.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OscTitles {
+    None,
+    #[default]
+    Agents,
+    All,
+}
+
 pub struct Config {
     pub keys: KeyTable,
     /// Restore persisted sessions at startup. Saving happens either way.
@@ -16,6 +25,7 @@ pub struct Config {
     pub automode: bool,
     /// Yank a drag selection to the system clipboard on release.
     pub copy_on_select: bool,
+    pub osc_titles: OscTitles,
 }
 
 impl Default for Config {
@@ -26,6 +36,7 @@ impl Default for Config {
             notify: true,
             automode: false,
             copy_on_select: true,
+            osc_titles: OscTitles::default(),
         }
     }
 }
@@ -90,6 +101,14 @@ fn from_toml(text: &str, origin: &str) -> Config {
         match value.as_bool() {
             Some(copy) => config.copy_on_select = copy,
             None => eprintln!("lux: {origin}: invalid copy-on-select value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("osc-titles") {
+        match value.as_str() {
+            Some("none") => config.osc_titles = OscTitles::None,
+            Some("agents") => config.osc_titles = OscTitles::Agents,
+            Some("all") => config.osc_titles = OscTitles::All,
+            _ => eprintln!("lux: {origin}: invalid osc-titles value {value}"),
         }
     }
     config
@@ -167,6 +186,31 @@ mod tests {
         assert!(!from_toml("copy-on-select = false", "test").copy_on_select);
         assert!(from_toml("copy-on-select = true", "test").copy_on_select);
         assert!(from_toml("copy-on-select = \"no\"", "test").copy_on_select);
+    }
+
+    #[test]
+    fn osc_titles_option_parses_and_defaults_to_agents() {
+        assert_eq!(from_toml("", "test").osc_titles, OscTitles::Agents);
+        assert_eq!(
+            from_toml("osc-titles = \"none\"", "test").osc_titles,
+            OscTitles::None
+        );
+        assert_eq!(
+            from_toml("osc-titles = \"agents\"", "test").osc_titles,
+            OscTitles::Agents
+        );
+        assert_eq!(
+            from_toml("osc-titles = \"all\"", "test").osc_titles,
+            OscTitles::All
+        );
+        assert_eq!(
+            from_toml("osc-titles = \"shells\"", "test").osc_titles,
+            OscTitles::Agents
+        );
+        assert_eq!(
+            from_toml("osc-titles = true", "test").osc_titles,
+            OscTitles::Agents
+        );
     }
 
     #[test]

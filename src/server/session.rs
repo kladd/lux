@@ -24,6 +24,7 @@ use tui_textarea::TextArea;
 
 use crate::server::agent;
 use crate::server::anim::{self, Anim};
+use crate::server::config::OscTitles;
 use crate::server::ex::{self, ExCommand};
 use crate::server::input;
 use crate::server::keys::{Command, KeyMatch, KeyTable, KeyTrie};
@@ -293,6 +294,7 @@ pub struct Session {
     prompt: Option<Prompt>,
     keys: Arc<KeyTable>,
     copy_on_select: bool,
+    osc_titles: OscTitles,
     /// Shown on the bottom row until the next key press.
     message: Option<String>,
     selection: Option<Selection>,
@@ -316,6 +318,7 @@ impl Session {
         area: Rect,
         keys: Arc<KeyTable>,
         copy_on_select: bool,
+        osc_titles: OscTitles,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
         let first = Window::new(0, tree_area(area), tx.clone())?;
@@ -336,6 +339,7 @@ impl Session {
             prompt: None,
             keys,
             copy_on_select,
+            osc_titles,
             message: None,
             selection: None,
             border_drag: None,
@@ -357,6 +361,7 @@ impl Session {
         area: Rect,
         keys: Arc<KeyTable>,
         copy_on_select: bool,
+        osc_titles: OscTitles,
         tx: Sender<ServerEvent>,
     ) -> Option<Self> {
         let mut tree = Some(persist::restore_node(&snap.tree));
@@ -405,6 +410,7 @@ impl Session {
             prompt: None,
             keys,
             copy_on_select,
+            osc_titles,
             message: None,
             selection: None,
             border_drag: None,
@@ -485,9 +491,10 @@ impl Session {
 
     /// Feed PTY output to the tab and re-run name and agent detection.
     pub fn pty_output(&mut self, id: TabId, bytes: &[u8]) -> Option<Notice> {
+        let osc_titles = self.osc_titles;
         let tab = self.find_tab_mut(id)?;
         tab.engine.advance_bytes(bytes);
-        let (changed, notice) = tab.refresh_identity();
+        let (changed, notice) = tab.refresh_identity(osc_titles);
         if changed {
             self.force_redraw = true;
         }
@@ -573,6 +580,14 @@ impl Session {
             }
         }
         out
+    }
+
+    /// The most pressing agent state across on-screen tabs.
+    pub fn urgency(&self) -> Option<agent::Urgency> {
+        self.agent_tabs()
+            .into_iter()
+            .filter_map(|(id, i)| self.tab_at(id, i)?.agent.as_ref()?.urgency())
+            .max()
     }
 
     /// On-screen windows in layout order, then minimized ones.
@@ -855,6 +870,14 @@ impl Session {
                     && let Some(index) = self.tab_badge_at(id, pos)
                 {
                     self.select_tab(index);
+                    return None;
+                }
+                if button == CtMouseButton::Middle
+                    && let Some(index) = self.tab_badge_at(id, pos)
+                {
+                    if let Some(tab) = self.tab_at_mut(id, index) {
+                        tab.kill();
+                    }
                     return None;
                 }
                 let win = self.windows.get_mut(&id).expect("window exists");
@@ -1177,13 +1200,14 @@ impl Session {
                         None => {}
                     },
                     PromptKind::Rename => {
+                        let osc_titles = self.osc_titles;
                         let win = self
                             .windows
                             .get_mut(&self.focus)
                             .expect("focused window exists");
                         let tab = win.active_tab_mut();
                         if text.is_empty() {
-                            tab.clear_name();
+                            tab.clear_name(osc_titles);
                         } else {
                             tab.set_name(text);
                         }
