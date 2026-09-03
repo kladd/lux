@@ -157,7 +157,7 @@ automode = true  # CLAUDECOM opens auto mode instead of the grid
 copy-on-select = false   # selections yank only on right-click
 osc-titles = "all"       # which tabs are named by the program's OSC title
 palette = "default"      # the interface color set
-dim-unfocused = true     # darken every window but the focused one
+dim-unfocused = false    # leave unfocused windows at full brightness
 shadows = true           # popovers cast a shadow on the content beneath
 ```
 
@@ -173,7 +173,8 @@ use the title by default; a Claude Code session name outranks it.
 tab bars, the status line, selections, and popovers. Only `default` exists
 so far. Terminal content always keeps your terminal's own colors.
 
-`dim-unfocused` and `shadows` are off by default. Both darken cells. Lux
+`dim-unfocused` darkens every window but the focused one and is on by
+default; `shadows` is off by default. Both darken cells. Lux
 asks your terminal for its default and ANSI colors when you attach, so a
 dimmed cell keeps its hue; a terminal that doesn't answer is darkened from
 the palette's stand-ins (light grey on black) instead.

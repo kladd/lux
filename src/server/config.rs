@@ -44,7 +44,7 @@ impl Default for Config {
             copy_on_select: true,
             osc_titles: OscTitles::default(),
             palette: Palette::default(),
-            dim_unfocused: false,
+            dim_unfocused: true,
             shadows: false,
         }
     }
@@ -255,11 +255,11 @@ mod tests {
     }
 
     #[test]
-    fn dim_unfocused_option_parses_and_defaults_off() {
-        assert!(!from_toml("", "test").dim_unfocused);
+    fn dim_unfocused_option_parses_and_defaults_on() {
+        assert!(from_toml("", "test").dim_unfocused);
         assert!(from_toml("dim-unfocused = true", "test").dim_unfocused);
         assert!(!from_toml("dim-unfocused = false", "test").dim_unfocused);
-        assert!(!from_toml("dim-unfocused = \"yes\"", "test").dim_unfocused);
+        assert!(from_toml("dim-unfocused = \"yes\"", "test").dim_unfocused);
     }
 
     #[test]
