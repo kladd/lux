@@ -120,6 +120,7 @@ pub fn render(
     sessions: &mut BTreeMap<SessionId, Session>,
     state: &FinderState,
     config: &Config,
+    colors: &palette::TermColors,
 ) {
     let window = float_rect(area);
     if window.width < 4 || window.height < 4 {
@@ -138,7 +139,7 @@ pub fn render(
         palette,
     );
     if config.shadows {
-        palette::shadow(buf, window, area, palette);
+        palette::shadow(buf, window, area, palette, colors);
     }
 }
 

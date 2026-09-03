@@ -100,6 +100,8 @@ struct Client {
     yank: Option<TabId>,
     /// The OSC 22 pointer shape last written, so hover only writes changes.
     pointer: &'static str,
+    /// What the terminal has answered to the color queries sent at attach.
+    colors: palette::TermColors,
 }
 
 pub fn run() -> i32 {
@@ -554,7 +556,7 @@ impl Server {
             self.detach(old);
         }
 
-        let Ok(raw_out) = stdout_file.try_clone() else {
+        let Ok(mut raw_out) = stdout_file.try_clone() else {
             return;
         };
         let mut terminal = match Terminal::new(FdBackend::new(stdout_file, size)) {
@@ -562,6 +564,7 @@ impl Server {
             Err(_) => return,
         };
         let _ = terminal.clear();
+        query_colors(&mut raw_out);
 
         let stdin_stop = Arc::new(AtomicBool::new(false));
         spawn_stdin_reader(conn, stdin, stdin_stop.clone(), self.tx.clone());
@@ -585,6 +588,7 @@ impl Server {
                 finder: None,
                 yank: None,
                 pointer: "default",
+                colors: palette::TermColors::default(),
             },
         );
         self.note_attached(sid);
@@ -683,9 +687,15 @@ impl Server {
 
     fn route_input(&mut self, conn: ConnId, events: Vec<DecodedInput>) {
         for event in events {
-            let Some(client) = self.clients.get(&conn) else {
+            let Some(client) = self.clients.get_mut(&conn) else {
                 return;
             };
+            // The terminal's color answers apply whatever mode the client
+            // is in.
+            if let DecodedInput::Color(slot, rgb) = event {
+                client.colors.set(slot, rgb);
+                continue;
+            }
             if client.finder.is_some() {
                 self.finder_input(conn, &event);
                 continue;
@@ -714,6 +724,7 @@ impl Server {
                     session.paste_text(&text);
                     None
                 }
+                DecodedInput::Color(..) => None,
             };
             if let Some(effect) = effect {
                 self.apply_effect(conn, sid, effect);
@@ -810,7 +821,7 @@ impl Server {
                 }
                 return;
             }
-            DecodedInput::Paste(_) => return,
+            DecodedInput::Paste(_) | DecodedInput::Color(..) => return,
         };
         let pinned = self.pinned_entries();
         let count = pinned + self.sessions.len();
@@ -947,6 +958,7 @@ impl Server {
                 }
                 return;
             }
+            DecodedInput::Color(..) => return,
         };
         if key.kind == KeyEventKind::Release {
             return;
@@ -1447,7 +1459,7 @@ impl Server {
                 session.key_to_tab(item.window, item.tab, *key);
             }
             DecodedInput::Paste(text) => session.paste_to_tab(item.window, item.tab, text),
-            DecodedInput::Mouse(_) => {}
+            DecodedInput::Mouse(_) | DecodedInput::Color(..) => {}
         }
         None
     }
@@ -1526,6 +1538,12 @@ impl Server {
                 .collect();
             session.set_yanked(held);
         }
+        // A session darkens against what its client's terminal answered.
+        for client in self.clients.values() {
+            if let Some(session) = self.sessions.get_mut(&client.attached) {
+                session.set_terminal_colors(client.colors);
+            }
+        }
         let Server {
             sessions,
             clients,
@@ -1556,7 +1574,10 @@ fn render_finder(
     config: &Config,
 ) {
     let Client {
-        finder, terminal, ..
+        finder,
+        terminal,
+        colors,
+        ..
     } = client;
     let Some(state) = finder.as_ref() else {
         return;
@@ -1575,7 +1596,7 @@ fn render_finder(
                 }
             }
         }
-        find::render(buf, area, sessions, state, config);
+        find::render(buf, area, sessions, state, config, colors);
     });
 }
 
@@ -1629,6 +1650,7 @@ fn render_switcher(
         .checked_sub(pinned)
         .and_then(|i| sessions.keys().nth(i).copied());
     let elapsed = anim::elapsed();
+    let colors = client.colors;
     let _ = client.terminal.draw(|frame| {
         let area = frame.area();
         let buf = frame.buffer_mut();
@@ -1698,7 +1720,7 @@ fn render_switcher(
                 width: (list_w + 1).min(area.width),
                 ..area
             };
-            palette::shadow(buf, panel, area, palette);
+            palette::shadow(buf, panel, area, palette, &colors);
         }
     });
 }
@@ -1768,6 +1790,17 @@ fn plain_char(key: &KeyEvent, ch: char) -> bool {
             ctrl: false,
             shift: false,
         }
+}
+
+/// Asks the terminal for its default and ANSI colors. The answers arrive
+/// as input.
+fn query_colors(out: &mut File) {
+    let mut seq = String::from("\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
+    for i in 0..16 {
+        seq.push_str(&format!("\x1b]4;{i};?\x1b\\"));
+    }
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 fn osc52_copy(out: &mut File, text: &str) {

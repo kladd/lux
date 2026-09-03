@@ -307,6 +307,9 @@ pub struct Session {
     indicator: Option<Indicator>,
     /// Tabs held as pending yanks, set by the server each render pass.
     yanked: Vec<TabId>,
+    /// What the attached client's terminal answered about its colors, set
+    /// by the server each render pass.
+    term_colors: palette::TermColors,
     view: View,
     area: Rect,
     /// The clock text as of the last computed view.
@@ -345,6 +348,7 @@ impl Session {
             border_drag: None,
             indicator: None,
             yanked: Vec::new(),
+            term_colors: palette::TermColors::default(),
             view: View::default(),
             area,
             clock: String::new(),
@@ -412,6 +416,7 @@ impl Session {
             border_drag: None,
             indicator: None,
             yanked: Vec::new(),
+            term_colors: palette::TermColors::default(),
             view: View::default(),
             area,
             clock: String::new(),
@@ -630,6 +635,13 @@ impl Session {
     pub fn focused_active(&self) -> (WindowId, usize) {
         let active = self.windows.get(&self.focus).map_or(0, |w| w.active);
         (self.focus, active)
+    }
+
+    pub fn set_terminal_colors(&mut self, colors: palette::TermColors) {
+        if self.term_colors != colors {
+            self.term_colors = colors;
+            self.force_redraw = true;
+        }
     }
 
     pub fn set_indicator(&mut self, indicator: Option<Indicator>) {
@@ -1984,6 +1996,7 @@ impl Session {
     /// Draws from `self.view` and engine state only, with no geometry math.
     fn render_to_buffer(&self, buf: &mut Buffer) {
         let palette = &self.config.palette;
+        let colors = &self.term_colors;
         for win in self.windows.values() {
             if self.maximized.is_some_and(|id| id != win.id) || self.minimized.contains(&win.id) {
                 continue;
@@ -1991,7 +2004,7 @@ impl Session {
             let tab = win.active_tab();
             render_tab(tab, buf);
             if self.config.dim_unfocused && win.id != self.focus {
-                palette::shade(buf, win.content_rect(), palette, palette::DIM);
+                palette::shade(buf, win.content_rect(), palette, colors, palette::DIM);
             }
             if let Some(metrics) = tab.scroll_metrics() {
                 render_scrollbar(win.content_rect(), metrics, palette, buf);
@@ -2001,7 +2014,7 @@ impl Session {
             let dim = self.config.dim_unfocused;
             render_tab_bar(chrome, self.focus, dim, palette, buf, self.view.elapsed);
             if dim && chrome.window != self.focus {
-                palette::shade(buf, chrome.tab_bar, palette, palette::DIM);
+                palette::shade(buf, chrome.tab_bar, palette, colors, palette::DIM);
             }
         }
         if let Some(sel) = &self.selection
@@ -2025,13 +2038,13 @@ impl Session {
                 prompt.textarea.render(chrome.input, buf);
             }
             if self.config.shadows {
-                palette::shadow(buf, chrome.input, self.area, palette);
+                palette::shadow(buf, chrome.input, self.area, palette, colors);
             }
         }
         if let Some(hints) = &self.view.hints {
             render_hints(hints, palette, buf);
             if self.config.shadows {
-                palette::shadow(buf, hints.rect, self.area, palette);
+                palette::shadow(buf, hints.rect, self.area, palette, colors);
             }
         }
     }

@@ -173,6 +173,7 @@ use the title by default; a Claude Code session name outranks it.
 tab bars, the status line, selections, and popovers. Only `default` exists
 so far. Terminal content always keeps your terminal's own colors.
 
-`dim-unfocused` and `shadows` are off by default. Both darken cells, and a
-cell in the terminal's default colors is darkened from the palette's
-stand-ins (light grey on black), so they look best on a dark terminal.
+`dim-unfocused` and `shadows` are off by default. Both darken cells. Lux
+asks your terminal for its default and ANSI colors when you attach, so a
+dimmed cell keeps its hue; a terminal that doesn't answer is darkened from
+the palette's stand-ins (light grey on black) instead.
