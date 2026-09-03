@@ -1998,7 +1998,11 @@ impl Session {
             }
         }
         for chrome in &self.view.chrome {
-            render_tab_bar(chrome, self.focus, palette, buf, self.view.elapsed);
+            let dim = self.config.dim_unfocused;
+            render_tab_bar(chrome, self.focus, dim, palette, buf, self.view.elapsed);
+            if dim && chrome.window != self.focus {
+                palette::shade(buf, chrome.tab_bar, palette, palette::DIM);
+            }
         }
         if let Some(sel) = &self.selection
             && self.maximized.is_none_or(|id| id == sel.window)
@@ -2130,6 +2134,7 @@ fn truncate_name(name: &str, width: usize) -> String {
 fn render_tab_bar(
     chrome: &Chrome,
     focus: WindowId,
+    dim_unfocused: bool,
     palette: &Palette,
     buf: &mut Buffer,
     elapsed: Duration,
@@ -2139,6 +2144,10 @@ fn render_tab_bar(
         return;
     }
     let focused = chrome.window == focus;
+    // With dimming on, the shade marks focus, so an unfocused rule keeps
+    // its animation.
+    let animated = focused || dim_unfocused;
+    let plain = if focused { palette.text } else { palette.dim };
     let badges_end = chrome.controls.map_or(bar.right(), |c| c.x);
     let mut x = bar.x;
     let mut put = |x: &mut u16, ch: char, style: Style| -> bool {
@@ -2155,18 +2164,18 @@ fn render_tab_bar(
     // The animation and the fill index by bar position so they span the
     // whole width.
     let rule_at = |x: u16| -> (char, Style) {
-        if !focused {
-            return ('─', Style::default().fg(palette.dim));
+        if !animated {
+            return ('─', Style::default().fg(plain));
         }
         let i = (x - bar.x) as usize;
         let (ch, color) = match chrome.rule {
-            Rule::Plain => ('─', palette.text),
+            Rule::Plain => ('─', plain),
             Rule::Progress { percent, color } => {
                 let filled = (bar.width as usize * percent as usize + 50) / 100;
                 if i < filled {
                     ('━', color)
                 } else {
-                    ('─', palette.text)
+                    ('─', plain)
                 }
             }
             Rule::Shimmer { phase, color } => {

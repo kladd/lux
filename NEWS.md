@@ -15,8 +15,9 @@
 - `prefix+Y` copies the last completed command's output to the clipboard.
 - Scroll mode shows a scrollbar along the content's right edge.
 - Strikethrough, blink, hidden text, and colored underlines now render.
-- `dim-unfocused` darkens every window but the focused one and `shadows`
-  gives popovers a drop shadow; both default off.
+- `dim-unfocused` darkens every window but the focused one, tab bar and
+  its rule animations included, and `shadows` gives popovers a drop
+  shadow; both default off.
 - `palette` selects the interface color set; `default` is the only one so
   far, and selections now highlight with its background color instead of
   reverse video.
