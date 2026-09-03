@@ -31,6 +31,7 @@ pub enum Command {
     CloseWindow,
     YankTab,
     PasteTab,
+    YankOutput,
     SendPrefix,
     CycleAgent,
 }
@@ -76,6 +77,7 @@ impl Command {
             Command::CloseWindow => "close window",
             Command::YankTab => "yank tab",
             Command::PasteTab => "paste yanked tab",
+            Command::YankOutput => "yank last command output",
             Command::SendPrefix => "send prefix key",
             Command::CycleAgent => "next agent needing attention",
         }
@@ -262,6 +264,7 @@ impl Default for KeyTable {
             cmd('x', Command::CloseWindow),
             cmd('y', Command::YankTab),
             cmd('P', Command::PasteTab),
+            cmd('Y', Command::YankOutput),
             (
                 plain('m'),
                 KeyTrie::Node(KeyTrieNode {

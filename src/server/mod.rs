@@ -11,6 +11,7 @@ pub mod grid;
 pub mod input;
 pub mod keys;
 pub mod layout;
+pub mod palette;
 pub mod persist;
 pub mod session;
 pub mod term;
@@ -34,15 +35,15 @@ use ratatui::crossterm::event::{
     MouseButton as CtMouseButton, MouseEventKind as CtMouseKind,
 };
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 
 use crate::protocol::{self, Request};
 use anim::Anim;
 use auto::AutoState;
-use config::OscTitles;
+use config::Config;
 use grid::GridState;
 use input::{DecodedInput, InputDecoder};
-use keys::{KeyMatch, KeyTable};
+use keys::KeyMatch;
 use layout::Dir;
 use session::{Effect, Session};
 use term::FdBackend;
@@ -122,8 +123,7 @@ pub fn run() -> i32 {
         }
     };
 
-    let config = config::load();
-    let keys = Arc::new(config.keys);
+    let config = Arc::new(config::load());
     let (tx, rx) = mpsc::channel::<ServerEvent>();
 
     let accept_tx = tx.clone();
@@ -154,12 +154,8 @@ pub fn run() -> i32 {
         sessions: BTreeMap::new(),
         clients: HashMap::new(),
         attach_order: Vec::new(),
-        keys,
+        config: config.clone(),
         clipboard: arboard::Clipboard::new().ok(),
-        notify: config.notify,
-        auto_enabled: config.automode,
-        copy_on_select: config.copy_on_select,
-        osc_titles: config.osc_titles,
         next_session_id: 0,
         save_deadline: None,
         last_saved: None,
@@ -270,12 +266,8 @@ struct Server {
     clients: HashMap<ConnId, Client>,
     /// Most recent last. Ended sessions are skipped on lookup, not pruned.
     attach_order: Vec<SessionId>,
-    keys: Arc<KeyTable>,
+    config: Arc<Config>,
     clipboard: Option<arboard::Clipboard>,
-    notify: bool,
-    auto_enabled: bool,
-    copy_on_select: bool,
-    osc_titles: OscTitles,
     next_session_id: SessionId,
     save_deadline: Option<std::time::Instant>,
     last_saved: Option<String>,
@@ -324,7 +316,7 @@ impl Server {
     /// Writes an OSC 9 notification to every attached client, so whichever
     /// terminal the user is watching shows it.
     fn raise_notification(&mut self, session: &str, notice: &window::Notice) {
-        if !self.notify {
+        if !self.config.notify {
             return;
         }
         let what = if notice.blocked {
@@ -392,14 +384,8 @@ impl Server {
             if self.session_by_name(&snap.name).is_some() {
                 continue;
             }
-            let Some(session) = Session::restore(
-                snap,
-                area,
-                self.keys.clone(),
-                self.copy_on_select,
-                self.osc_titles,
-                self.tx.clone(),
-            ) else {
+            let Some(session) = Session::restore(snap, area, self.config.clone(), self.tx.clone())
+            else {
                 continue;
             };
             let sid = self.next_session_id;
@@ -612,15 +598,8 @@ impl Server {
                 .find(|candidate| self.session_by_name(candidate).is_none())
                 .expect("some integer name is free"),
         };
-        let session = Session::new(
-            name,
-            area,
-            self.keys.clone(),
-            self.copy_on_select,
-            self.osc_titles,
-            self.tx.clone(),
-        )
-        .map_err(|err| format!("cannot start session: {err:#}"))?;
+        let session = Session::new(name, area, self.config.clone(), self.tx.clone())
+            .map_err(|err| format!("cannot start session: {err:#}"))?;
         let sid = self.next_session_id;
         self.next_session_id += 1;
         self.sessions.insert(sid, session);
@@ -747,7 +726,7 @@ impl Server {
             Effect::Detach => self.detach(conn),
             Effect::OpenSwitcher => self.open_switcher(conn),
             Effect::OpenGrid => {
-                if self.auto_enabled {
+                if self.config.automode {
                     self.begin_auto(conn);
                 } else if let Some(client) = self.clients.get_mut(&conn) {
                     client.grid = Some(GridState::default());
@@ -909,7 +888,7 @@ impl Server {
         };
         client.switcher = None;
         if highlight < pinned {
-            if self.auto_enabled {
+            if self.config.automode {
                 self.begin_auto(conn);
             } else {
                 client.grid = Some(GridState::default());
@@ -1211,7 +1190,7 @@ impl Server {
             }
             return;
         }
-        if self.keys.is_prefix(*key) {
+        if self.config.keys.is_prefix(*key) {
             state.pending_prefix = true;
             self.store_auto_state(conn, state);
             return;
@@ -1378,7 +1357,7 @@ impl Server {
             }
             return;
         }
-        if self.keys.is_prefix(*key) {
+        if self.config.keys.is_prefix(*key) {
             state.pending_prefix = true;
             self.store_grid_state(conn, state);
             return;
@@ -1461,7 +1440,7 @@ impl Server {
                     }
                     return None;
                 }
-                if self.keys.is_prefix(*key) {
+                if self.config.keys.is_prefix(*key) {
                     state.pending_prefix = true;
                     return None;
                 }
@@ -1548,17 +1527,20 @@ impl Server {
             session.set_yanked(held);
         }
         let Server {
-            sessions, clients, ..
+            sessions,
+            clients,
+            config,
+            ..
         } = self;
         for client in clients.values_mut() {
             if client.finder.is_some() {
-                render_finder(client, sessions);
+                render_finder(client, sessions, config);
             } else if client.grid.is_some() {
-                render_grid(client, sessions);
+                render_grid(client, sessions, &config.palette);
             } else if let Some(highlight) = client.switcher {
-                render_switcher(client, sessions, highlight);
+                render_switcher(client, sessions, highlight, config);
             } else if client.auto.is_some_and(|a| a.presented.is_none()) {
-                render_auto_blank(client, sessions);
+                render_auto_blank(client, sessions, &config.palette);
             } else if let Some(session) = sessions.get_mut(&client.attached)
                 && session.needs_redraw()
             {
@@ -1568,7 +1550,11 @@ impl Server {
     }
 }
 
-fn render_finder(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>) {
+fn render_finder(
+    client: &mut Client,
+    sessions: &mut BTreeMap<SessionId, Session>,
+    config: &Config,
+) {
     let Client {
         finder, terminal, ..
     } = client;
@@ -1589,25 +1575,33 @@ fn render_finder(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session
                 }
             }
         }
-        find::render(buf, area, sessions, state);
+        find::render(buf, area, sessions, state, config);
     });
 }
 
-fn render_auto_blank(client: &mut Client, sessions: &BTreeMap<SessionId, Session>) {
+fn render_auto_blank(
+    client: &mut Client,
+    sessions: &BTreeMap<SessionId, Session>,
+    palette: &palette::Palette,
+) {
     let _ = client.terminal.draw(|frame| {
         let area = frame.area();
-        auto::render_blank(frame.buffer_mut(), area, sessions);
+        auto::render_blank(frame.buffer_mut(), area, sessions, palette);
     });
 }
 
-fn render_grid(client: &mut Client, sessions: &mut BTreeMap<SessionId, Session>) {
+fn render_grid(
+    client: &mut Client,
+    sessions: &mut BTreeMap<SessionId, Session>,
+    palette: &palette::Palette,
+) {
     let Client { grid, terminal, .. } = client;
     let Some(state) = grid.as_mut() else {
         return;
     };
     let _ = terminal.draw(|frame| {
         let area = frame.area();
-        grid::render(frame.buffer_mut(), area, sessions, state);
+        grid::render(frame.buffer_mut(), area, sessions, state, palette);
     });
 }
 
@@ -1617,7 +1611,9 @@ fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
     highlight: usize,
+    config: &Config,
 ) {
+    let palette = &config.palette;
     let pinned = sessions.values().any(Session::has_agent_tab) as usize;
     let mut entries: Vec<(String, Option<agent::Urgency>)> =
         Vec::with_capacity(pinned + sessions.len());
@@ -1644,11 +1640,14 @@ fn render_switcher(
                 break;
             }
             let (base, modifier) = if i == highlight {
-                (Color::Green, Modifier::REVERSED)
+                (palette.accent, Modifier::REVERSED)
             } else {
-                (Color::Reset, Modifier::empty())
+                (palette.text, Modifier::empty())
             };
-            let (color, anim) = urgency.map_or((base, Anim::None), agent::Urgency::visual);
+            let (color, anim) = urgency.map_or((base, Anim::None), |urgency| {
+                let (status, anim) = urgency.visual();
+                (palette.status(status), anim)
+            });
             let text = format!(" {name} ");
             let len = text.chars().count();
             for (j, ch) in text.chars().enumerate() {
@@ -1672,13 +1671,13 @@ fn render_switcher(
             && let Some(dst) = buf.cell_mut(Position::new(area.x, area.bottom() - 1))
         {
             dst.set_char('○');
-            dst.set_style(Style::default().fg(Color::Green));
+            dst.set_style(Style::default().fg(palette.accent));
         }
         if area.width > list_w {
             for y in area.top()..area.bottom() {
                 if let Some(dst) = buf.cell_mut(Position::new(area.x + list_w, y)) {
                     dst.set_symbol("│");
-                    dst.set_style(Style::default().fg(Color::DarkGray));
+                    dst.set_style(Style::default().fg(palette.dim));
                 }
             }
             let preview = Rect {
@@ -1687,10 +1686,19 @@ fn render_switcher(
                 ..area
             };
             if pinned > 0 && highlight == 0 {
-                grid::render_preview(buf, preview, sessions);
+                grid::render_preview(buf, preview, sessions, palette);
             } else if let Some(session) = highlighted_sid.and_then(|sid| sessions.get_mut(&sid)) {
                 session.render_preview(buf, preview);
             }
+        }
+        // The list and its divider are the panel; the shadow falls on the
+        // preview.
+        if config.shadows {
+            let panel = Rect {
+                width: (list_w + 1).min(area.width),
+                ..area
+            };
+            palette::shadow(buf, panel, area, palette);
         }
     });
 }

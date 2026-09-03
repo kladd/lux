@@ -6,7 +6,20 @@
 - Switcher entries shimmer or breathe in the color of the session's most
   pressing agent tab: blocked, then done, then working.
 - `osc-titles` (`none`, `agents`, or `all`; default `agents`) controls which
-  tabs take their name from the program's OSC title.
+  tabs take their name from the program's preferred title.
+- A tab that produces output while off screen gets a dot on its indicator;
+  a bell turns it green, and selecting the tab clears it.
+- The focused tab bar's rule fills like a progress bar when the active tab
+  reports progress, and the working shimmer moves at the tab's output rate,
+  standing still when output stops.
+- `prefix+Y` copies the last completed command's output to the clipboard.
+- Scroll mode shows a scrollbar along the content's right edge.
+- Strikethrough, blink, hidden text, and colored underlines now render.
+- `dim-unfocused` darkens every window but the focused one and `shadows`
+  gives popovers a drop shadow; both default off.
+- `palette` selects the interface color set; `default` is the only one so
+  far, and selections now highlight with its background color instead of
+  reverse video.
 
 ## 2026-09-01
 

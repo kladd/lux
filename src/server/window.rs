@@ -1,17 +1,21 @@
 //! Windows and the tabs they own: each tab is one PTY plus a terminal engine.
 
+use std::collections::VecDeque;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use ratatui::layout::Rect;
+use termwiz::cell::SemanticType;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
-    Alert, AlertHandler, Clipboard, ClipboardSelection, Terminal as Engine, TerminalConfiguration,
-    TerminalSize,
+    Alert, AlertHandler, Clipboard, ClipboardSelection, Progress, Terminal as Engine,
+    TerminalConfiguration, TerminalSize,
 };
 
 use crate::server::ServerEvent;
@@ -51,12 +55,13 @@ impl Clipboard for ClipboardRelay {
     }
 }
 
-/// Captures a program's OSC 9 notification text and OSC 0/2 window title
-/// for the tab to read later. OSC 9;4 progress and OSC 1 icon titles never
-/// land here.
+/// Captures a program's OSC 9 notification text, OSC 0/2 window title, and
+/// bell for the tab to read later. OSC 9;4 progress and OSC 1 icon titles
+/// never land here.
 struct NotificationRelay {
     text: Arc<Mutex<Option<String>>>,
     title: Arc<Mutex<Option<String>>>,
+    bell: Arc<AtomicBool>,
 }
 
 impl AlertHandler for NotificationRelay {
@@ -68,8 +73,76 @@ impl AlertHandler for NotificationRelay {
             Alert::WindowTitleChanged(title) => {
                 *self.title.lock().unwrap() = Some(title);
             }
+            Alert::Bell => self.bell.store(true, Ordering::Relaxed),
             _ => {}
         }
+    }
+}
+
+/// What a tab did while it was not its window's active tab.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Activity {
+    Output,
+    Bell,
+}
+
+/// The most recently completed command's output, as far as the shell's
+/// command boundaries tell.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LastOutput {
+    Text(String),
+    NoneCompleted,
+    NoBoundaries,
+}
+
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+/// Bytes per second at which the working shimmer reaches full speed.
+const FULL_SPEED_RATE: f32 = 8192.0;
+/// Sweeps per second at full speed.
+const MAX_SWEEPS: f32 = 1.0;
+
+/// Recent output volume, which paces the working shimmer.
+struct OutputRate {
+    samples: VecDeque<(Instant, usize)>,
+    /// Sweeps completed, kept fractional.
+    phase: f32,
+    advanced: Instant,
+}
+
+impl OutputRate {
+    fn new(now: Instant) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            phase: 0.0,
+            advanced: now,
+        }
+    }
+
+    fn record(&mut self, now: Instant, len: usize) {
+        self.prune(now);
+        self.samples.push_back((now, len));
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|&(at, _)| now.duration_since(at) > RATE_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Moves the sweep on by the time elapsed at the current output rate.
+    fn advance(&mut self, now: Instant) -> f32 {
+        self.prune(now);
+        let bytes: usize = self.samples.iter().map(|&(_, len)| len).sum();
+        let rate = bytes as f32 / RATE_WINDOW.as_secs_f32();
+        let speed = (rate / FULL_SPEED_RATE).min(1.0) * MAX_SWEEPS;
+        let dt = now.duration_since(self.advanced).as_secs_f32();
+        self.phase = (self.phase + speed * dt).rem_euclid(1.0);
+        self.advanced = now;
+        self.phase
     }
 }
 
@@ -246,6 +319,10 @@ pub struct Tab {
     notify_text: Arc<Mutex<Option<String>>>,
     /// Latest OSC 0/2 window title: `None` until set, empty once cleared.
     osc_title: Arc<Mutex<Option<String>>>,
+    bell: Arc<AtomicBool>,
+    /// Set while the tab is off screen, cleared once it is looked at.
+    pub activity: Option<Activity>,
+    output: OutputRate,
     master: Box<dyn MasterPty>,
     child: Box<dyn Child + Send + Sync>,
 }
@@ -328,9 +405,11 @@ impl Tab {
         engine.set_clipboard(&clipboard);
         let notify_text = Arc::new(Mutex::new(None));
         let osc_title = Arc::new(Mutex::new(None));
+        let bell = Arc::new(AtomicBool::new(false));
         engine.set_notification_handler(Box::new(NotificationRelay {
             text: notify_text.clone(),
             title: osc_title.clone(),
+            bell: bell.clone(),
         }));
 
         let name = std::path::Path::new(argv[0])
@@ -351,9 +430,46 @@ impl Tab {
             running_claude: false,
             notify_text,
             osc_title,
+            bell,
+            activity: None,
+            output: OutputRate::new(Instant::now()),
             master: pair.master,
             child,
         })
+    }
+
+    pub fn note_output(&mut self, len: usize, now: Instant) {
+        self.output.record(now, len);
+    }
+
+    /// The working shimmer's phase, moved on by recent output.
+    pub fn advance_shimmer(&mut self, now: Instant) -> f32 {
+        self.output.advance(now)
+    }
+
+    pub fn take_bell(&mut self) -> bool {
+        self.bell.swap(false, Ordering::Relaxed)
+    }
+
+    /// The percentage the program last reported through OSC 9;4.
+    pub fn progress(&self) -> Option<u8> {
+        match self.engine.get_progress() {
+            Progress::Percentage(p) | Progress::Error(p) => Some(p.min(100)),
+            Progress::None | Progress::Indeterminate => None,
+        }
+    }
+
+    pub fn last_command_output(&mut self) -> LastOutput {
+        last_command_output(&mut self.engine)
+    }
+
+    /// In scroll mode: the top row's index into history, the view's
+    /// height, and history's row count.
+    pub fn scroll_metrics(&self) -> Option<(usize, usize, usize)> {
+        let top = self.scroll_top?;
+        let screen = self.engine.screen();
+        let phys = screen.stable_range(&(top..top + 1)).start;
+        Some((phys, screen.physical_rows, screen.scrollback_rows()))
     }
 
     /// Removal follows once the PTY closes, like any other exit.
@@ -601,6 +717,54 @@ fn automatic_name(
     session.or(title).unwrap_or_else(|| command.to_string())
 }
 
+/// The last output zone that a prompt or input zone follows. Without
+/// shell integration every cell is output, so there are no boundaries.
+fn last_command_output(engine: &mut Engine) -> LastOutput {
+    let zones = engine.get_semantic_zones().unwrap_or_default();
+    if zones
+        .iter()
+        .all(|zone| zone.semantic_type == SemanticType::Output)
+    {
+        return LastOutput::NoBoundaries;
+    }
+    let completed = zones.windows(2).rev().find_map(|pair| {
+        (pair[0].semantic_type == SemanticType::Output
+            && pair[1].semantic_type != SemanticType::Output)
+            .then_some(pair[0])
+    });
+    let Some(zone) = completed else {
+        return LastOutput::NoneCompleted;
+    };
+    let screen = engine.screen();
+    let lines = screen.lines_in_phys_range(screen.stable_range(&(zone.start_y..zone.end_y + 1)));
+    let last = lines.len().saturating_sub(1);
+    let mut rows: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let from = if i == 0 { zone.start_x } else { 0 };
+            // `end_x` is the last cell's index, not one past it.
+            let to = if i == last {
+                zone.end_x + 1
+            } else {
+                usize::MAX
+            };
+            line.visible_cells()
+                .filter(|cell| (from..to).contains(&cell.cell_index()))
+                .fold(String::new(), |mut text, cell| {
+                    text.push_str(cell.str());
+                    text
+                })
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    LastOutput::Text(rows.join("\n"))
+}
+
 /// A rect can shrink to zero, but the PTY and engine need at least 1x1.
 fn pty_size(rect: Rect) -> PtySize {
     PtySize {
@@ -756,6 +920,7 @@ mod tests {
         engine.set_notification_handler(Box::new(NotificationRelay {
             text: text.clone(),
             title: title.clone(),
+            bell: Arc::new(AtomicBool::new(false)),
         }));
 
         // OSC 9;4 is progress, not notification text.
@@ -795,6 +960,7 @@ mod tests {
         engine.set_notification_handler(Box::new(NotificationRelay {
             text: text.clone(),
             title: title.clone(),
+            bell: Arc::new(AtomicBool::new(false)),
         }));
 
         // OSC 2 sets the window title, OSC 0 sets icon and window title.
@@ -810,5 +976,84 @@ mod tests {
         // Empty means cleared, not unset.
         engine.advance_bytes(b"\x1b]2;\x07");
         assert_eq!(title.lock().unwrap().as_deref(), Some(""));
+    }
+
+    fn bare_engine() -> Engine {
+        struct NullWriter;
+        impl std::io::Write for NullWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        Engine::new(
+            term_size(Rect::new(0, 0, 40, 6)),
+            Arc::new(LuxConfig),
+            "lux",
+            env!("CARGO_PKG_VERSION"),
+            Box::new(NullWriter),
+        )
+    }
+
+    #[test]
+    fn the_bell_is_flagged_by_the_relay() {
+        let mut engine = bare_engine();
+        let bell = Arc::new(AtomicBool::new(false));
+        engine.set_notification_handler(Box::new(NotificationRelay {
+            text: Arc::new(Mutex::new(None)),
+            title: Arc::new(Mutex::new(None)),
+            bell: bell.clone(),
+        }));
+        engine.advance_bytes(b"hello");
+        assert!(!bell.load(Ordering::Relaxed));
+        engine.advance_bytes(b"\x07");
+        assert!(bell.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn shimmer_speed_follows_output_and_stops_without_it() {
+        let start = Instant::now();
+        let mut rate = OutputRate::new(start);
+        assert_eq!(rate.advance(start + Duration::from_millis(500)), 0.0);
+        // Full speed: 8 KiB within the window moves a whole sweep per second.
+        rate.record(start + Duration::from_millis(500), 8192);
+        let phase = rate.advance(start + Duration::from_millis(1000));
+        assert!((phase - 0.5).abs() < 0.01, "phase {phase}");
+        // Half the rate moves half as far.
+        let mut rate = OutputRate::new(start);
+        rate.record(start, 4096);
+        let phase = rate.advance(start + Duration::from_millis(1000));
+        assert!((phase - 0.5).abs() < 0.01, "phase {phase}");
+        // Once the sample ages out the sweep stands still.
+        let held = rate.advance(start + Duration::from_millis(3000));
+        assert_eq!(held, phase);
+    }
+
+    #[test]
+    fn last_output_comes_from_the_shells_command_boundaries() {
+        let mut engine = bare_engine();
+        engine.advance_bytes(b"plain output\r\nmore\r\n");
+        assert_eq!(last_command_output(&mut engine), LastOutput::NoBoundaries);
+
+        let mut engine = bare_engine();
+        engine.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(last_command_output(&mut engine), LastOutput::NoneCompleted);
+
+        engine.advance_bytes(b"ls\r\n\x1b]133;C\x07a.txt\r\nb.txt  \r\n\x1b]133;D;0\x07");
+        engine.advance_bytes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(
+            last_command_output(&mut engine),
+            LastOutput::Text("a.txt\nb.txt".into())
+        );
+
+        // A command still running leaves the previous one as the last
+        // completed.
+        engine.advance_bytes(b"sleep\r\n\x1b]133;C\x07partial");
+        assert_eq!(
+            last_command_output(&mut engine),
+            LastOutput::Text("a.txt\nb.txt".into())
+        );
     }
 }

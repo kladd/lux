@@ -28,8 +28,14 @@ const PADDING: usize = 10;
 
 /// The color of character `i` of `len` as a highlight band sweeps past.
 pub fn shimmer(base: Color, i: usize, len: usize, elapsed: Duration) -> Color {
+    shimmer_at(base, i, len, (elapsed.as_secs_f32() % PERIOD) / PERIOD)
+}
+
+/// The same band `phase` of the way through its sweep, for callers that
+/// pace the sweep themselves.
+pub fn shimmer_at(base: Color, i: usize, len: usize, phase: f32) -> Color {
     let period_cells = (len + 2 * PADDING) as f32;
-    let pos = (elapsed.as_secs_f32() % PERIOD) / PERIOD * period_cells;
+    let pos = phase.rem_euclid(1.0) * period_cells;
     let dist = ((i + PADDING) as f32 - pos).abs();
     if dist > BAND_HALF_WIDTH {
         return base;
@@ -53,16 +59,9 @@ fn blend(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
     Color::Rgb(ch(from.0, to.0), ch(from.1, to.1), ch(from.2, to.2))
 }
 
-/// Concrete channels for the named colors, since blending needs them.
+/// Blending needs channels, and the terminal default has none.
 fn rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Yellow => (205, 205, 0),
-        Color::Red => (205, 0, 0),
-        Color::Green => (0, 205, 0),
-        Color::DarkGray => (128, 128, 128),
-        _ => (170, 170, 170),
-    }
+    crate::server::palette::rgb(color).unwrap_or((170, 170, 170))
 }
 
 #[cfg(test)]

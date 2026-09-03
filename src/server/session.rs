@@ -15,8 +15,8 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::Widget;
-use termwiz::cell::{CellAttributes, Intensity, Underline};
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
+use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers as KeyModifiers};
 use termwiz::surface::CursorVisibility;
@@ -24,14 +24,15 @@ use tui_textarea::TextArea;
 
 use crate::server::agent;
 use crate::server::anim::{self, Anim};
-use crate::server::config::OscTitles;
+use crate::server::config::Config;
 use crate::server::ex::{self, ExCommand};
 use crate::server::input;
-use crate::server::keys::{Command, KeyMatch, KeyTable, KeyTrie};
+use crate::server::keys::{Command, KeyMatch, KeyTrie};
 use crate::server::layout::{self, Dir, Node, Separator, Side, SplitKind, WindowId};
+use crate::server::palette::{self, Palette};
 use crate::server::persist;
 use crate::server::term::FdBackend;
-use crate::server::window::{Notice, Tab, TabId, Window};
+use crate::server::window::{Activity, LastOutput, Notice, Tab, TabId, Window};
 use crate::server::{ServerEvent, SessionId};
 
 /// Minimum window size.
@@ -163,9 +164,19 @@ struct TabBadge {
     active: bool,
     name: String,
     yanked: bool,
+    activity: Option<Activity>,
     agent: Option<agent::Visual>,
     /// Columns in the bar, for hit-tests. Must match render_tab_bar's layout.
     span: std::ops::Range<u16>,
+}
+
+/// What the tab bar's horizontal rule shows while the window is focused.
+#[derive(Clone, Copy)]
+enum Rule {
+    Plain,
+    Progress { percent: u8, color: Color },
+    Shimmer { phase: f32, color: Color },
+    Breathe { color: Color },
 }
 
 /// One window's per-frame chrome geometry.
@@ -174,9 +185,7 @@ struct Chrome {
     tab_bar: Rect,
     tabs: Vec<TabBadge>,
     scroll: bool,
-    /// The active tab's status animation, drawn on the rule while focused.
-    rule_anim: Anim,
-    rule_color: Color,
+    rule: Rule,
     /// None when the bar is too narrow to hold it.
     controls: Option<Rect>,
     maximized: bool,
@@ -188,9 +197,6 @@ struct MinimizedTitle {
     name: String,
     span: std::ops::Range<u16>,
 }
-
-/// Grey 235 (#262626), a neutral shade with no hue.
-pub(crate) const CHROME_BG: Color = Color::Indexed(235);
 
 static HOSTNAME: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     rustix::system::uname()
@@ -292,9 +298,7 @@ pub struct Session {
     minimized: Vec<WindowId>,
     hover: Option<(WindowId, Control)>,
     prompt: Option<Prompt>,
-    keys: Arc<KeyTable>,
-    copy_on_select: bool,
-    osc_titles: OscTitles,
+    config: Arc<Config>,
     /// Shown on the bottom row until the next key press.
     message: Option<String>,
     selection: Option<Selection>,
@@ -316,9 +320,7 @@ impl Session {
     pub fn new(
         name: String,
         area: Rect,
-        keys: Arc<KeyTable>,
-        copy_on_select: bool,
-        osc_titles: OscTitles,
+        config: Arc<Config>,
         tx: Sender<ServerEvent>,
     ) -> anyhow::Result<Self> {
         let first = Window::new(0, tree_area(area), tx.clone())?;
@@ -337,9 +339,7 @@ impl Session {
             minimized: Vec::new(),
             hover: None,
             prompt: None,
-            keys,
-            copy_on_select,
-            osc_titles,
+            config,
             message: None,
             selection: None,
             border_drag: None,
@@ -359,9 +359,7 @@ impl Session {
     pub fn restore(
         snap: &persist::SessionSnapshot,
         area: Rect,
-        keys: Arc<KeyTable>,
-        copy_on_select: bool,
-        osc_titles: OscTitles,
+        config: Arc<Config>,
         tx: Sender<ServerEvent>,
     ) -> Option<Self> {
         let mut tree = Some(persist::restore_node(&snap.tree));
@@ -408,9 +406,7 @@ impl Session {
             minimized: Vec::new(),
             hover: None,
             prompt: None,
-            keys,
-            copy_on_select,
-            osc_titles,
+            config,
             message: None,
             selection: None,
             border_drag: None,
@@ -491,10 +487,28 @@ impl Session {
 
     /// Feed PTY output to the tab and re-run name and agent detection.
     pub fn pty_output(&mut self, id: TabId, bytes: &[u8]) -> Option<Notice> {
-        let osc_titles = self.osc_titles;
-        let tab = self.find_tab_mut(id)?;
+        let osc_titles = self.config.osc_titles;
+        let win = self
+            .windows
+            .values_mut()
+            .find(|w| w.tabs.iter().any(|t| t.id == id))?;
+        let background = win.active_tab().id != id;
+        let tab = win.find_tab_mut(id)?;
         tab.engine.advance_bytes(bytes);
-        let (changed, notice) = tab.refresh_identity(osc_titles);
+        tab.note_output(bytes.len(), Instant::now());
+        let (mut changed, notice) = tab.refresh_identity(osc_titles);
+        let rang = tab.take_bell();
+        if background && tab.agent.is_none() {
+            let mark = match (rang, tab.activity) {
+                (true, _) => Some(Activity::Bell),
+                (false, None) => Some(Activity::Output),
+                (false, Some(_)) => None,
+            };
+            if mark.is_some() && mark != tab.activity {
+                tab.activity = mark;
+                changed = true;
+            }
+        }
         if changed {
             self.force_redraw = true;
         }
@@ -720,6 +734,7 @@ impl Session {
                 return path.is_empty().then_some(Effect::ClearYank);
             }
             let node = self
+                .config
                 .keys
                 .node_at(&path)
                 .expect("pending chord path resolves to a node");
@@ -749,10 +764,10 @@ impl Session {
             }
             return None;
         }
-        if self.send_prefix_repeat.take().is_some() && self.keys.is_prefix(key) {
+        if self.send_prefix_repeat.take().is_some() && self.config.keys.is_prefix(key) {
             return self.execute(Command::SendPrefix);
         }
-        if self.keys.is_prefix(key) {
+        if self.config.keys.is_prefix(key) {
             self.chord = Some(Vec::new());
             self.force_redraw = true;
             return None;
@@ -792,7 +807,7 @@ impl Session {
     }
 
     fn write_prefix_key(&mut self) {
-        let prefix = self.keys.prefix;
+        let prefix = self.config.keys.prefix;
         let mut mods = CtMods::NONE;
         if prefix.ctrl {
             mods |= CtMods::CONTROL;
@@ -936,7 +951,7 @@ impl Session {
                     && sel.dragging
                 {
                     sel.dragging = false;
-                    if self.copy_on_select
+                    if self.config.copy_on_select
                         && let Some(text) = self.selection_text()
                     {
                         self.message = Some(format!(
@@ -1151,6 +1166,7 @@ impl Session {
                 return Some(Effect::YankTab(id));
             }
             Command::PasteTab => return Some(Effect::PasteTab),
+            Command::YankOutput => return self.yank_last_output(),
             Command::SendPrefix => {
                 self.write_prefix_key();
                 self.send_prefix_repeat = Some(Instant::now() + SEND_PREFIX_REPEAT);
@@ -1163,6 +1179,32 @@ impl Session {
             }
         }
         None
+    }
+
+    fn yank_last_output(&mut self) -> Option<Effect> {
+        let win = self.windows.get_mut(&self.focus)?;
+        let output = win.active_tab_mut().last_command_output();
+        self.force_redraw = true;
+        let text = match output {
+            LastOutput::Text(text) if text.is_empty() => {
+                self.message = Some("last command produced no output".into());
+                return None;
+            }
+            LastOutput::Text(text) => text,
+            LastOutput::NoneCompleted => {
+                self.message = Some("no completed command output".into());
+                return None;
+            }
+            LastOutput::NoBoundaries => {
+                self.message = Some("shell reports no command boundaries".into());
+                return None;
+            }
+        };
+        self.message = Some(format!(
+            "copied {}",
+            count(text.chars().count(), "character")
+        ));
+        Some(Effect::Copy(text))
     }
 
     fn open_prompt(&mut self, kind: PromptKind, text: String) {
@@ -1200,7 +1242,7 @@ impl Session {
                         None => {}
                     },
                     PromptKind::Rename => {
-                        let osc_titles = self.osc_titles;
+                        let osc_titles = self.config.osc_titles;
                         let win = self
                             .windows
                             .get_mut(&self.focus)
@@ -1254,10 +1296,6 @@ impl Session {
             count(out.len(), "byte")
         ));
         self.force_redraw = true;
-    }
-
-    fn find_tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
-        self.windows.values_mut().find_map(|w| w.find_tab_mut(id))
     }
 
     fn split(&mut self, kind: SplitKind) {
@@ -1728,6 +1766,11 @@ impl Session {
         };
         let now = Instant::now();
         let yanked = self.yanked.clone();
+        let palette = self.config.palette;
+        // An active tab is in view, so its activity has been seen.
+        for win in self.windows.values_mut() {
+            win.active_tab_mut().activity = None;
+        }
         let mut chrome = Vec::with_capacity(rects.len());
         for (id, rect) in rects {
             let Some(win) = self.windows.get_mut(&id) else {
@@ -1741,6 +1784,8 @@ impl Session {
             {
                 tracker.mark_seen();
             }
+            let phase = win.active_tab_mut().advance_shimmer(now);
+            let progress = win.active_tab().progress();
             let active = win.active;
             let bar = win.tab_bar_rect();
             // Room for the controls past the two-cell rule lead-in.
@@ -1753,14 +1798,21 @@ impl Session {
                 .map(|t| t.agent.as_ref().map(|a| a.visual(now)))
                 .collect();
             let marks: Vec<bool> = win.tabs.iter().map(|t| yanked.contains(&t.id)).collect();
+            let dots: Vec<Option<Activity>> = win
+                .tabs
+                .iter()
+                .map(|t| t.activity.filter(|_| t.agent.is_none()))
+                .collect();
             let fixed: usize = visuals
                 .iter()
                 .zip(&marks)
+                .zip(&dots)
                 .enumerate()
-                .map(|(i, (v, &mark))| {
+                .map(|(i, ((v, &mark), dot))| {
                     format!(" {}:", i).chars().count()
                         + v.as_ref().map_or(0, |v| 1 + v.text.chars().count())
                         + mark as usize
+                        + dot.is_some() as usize * 2
                         + 1
                 })
                 .sum();
@@ -1778,6 +1830,7 @@ impl Session {
                     let name = truncate_name(&tab.name, widths[i]);
                     let mut width = format!(" {}:{}", i, name).chars().count() as u16;
                     width += marks[i] as u16;
+                    width += dots[i].is_some() as u16 * 2;
                     if let Some(visual) = &agent {
                         width += 1 + visual.text.chars().count() as u16;
                     }
@@ -1788,24 +1841,38 @@ impl Session {
                         active: i == active,
                         name,
                         yanked: marks[i],
+                        activity: dots[i],
                         agent,
                         span: start..next_x,
                     }
                 })
                 .collect();
-            let (rule_anim, rule_color) = tabs
+            let status = tabs
                 .get(active)
                 .and_then(|badge| badge.agent.as_ref())
-                .map_or((Anim::None, Color::Reset), |visual| {
-                    (visual.anim, visual.color)
-                });
+                .map(|visual| (visual.status, visual.anim));
+            let rule = match (progress, status) {
+                // A program with no agent status still reports progress
+                // on work in flight.
+                (Some(percent), status) => Rule::Progress {
+                    percent,
+                    color: palette.status(status.map_or(agent::Status::Working, |(s, _)| s)),
+                },
+                (None, Some((status, Anim::Shimmer))) => Rule::Shimmer {
+                    phase,
+                    color: palette.status(status),
+                },
+                (None, Some((status, Anim::Breathe))) => Rule::Breathe {
+                    color: palette.status(status),
+                },
+                (None, _) => Rule::Plain,
+            };
             chrome.push(Chrome {
                 window: id,
                 tab_bar: bar,
                 tabs,
                 scroll: win.active_tab().scroll_mode(),
-                rule_anim,
-                rule_color,
+                rule,
                 controls,
                 maximized: self.maximized == Some(id),
                 hover: self
@@ -1863,7 +1930,7 @@ impl Session {
     /// Bottom-right corner, one row above the status row.
     fn compute_hint_chrome(&self) -> Option<HintChrome> {
         let path = self.chord.as_ref()?;
-        let rows = self.keys.node_at(path)?.hints();
+        let rows = self.config.keys.node_at(path)?.hints();
         let width = |s: &str| s.chars().count() as u16;
         let key_width = rows.iter().map(|(keys, _)| width(keys)).max()?;
         let body = rows
@@ -1916,38 +1983,52 @@ impl Session {
 
     /// Draws from `self.view` and engine state only, with no geometry math.
     fn render_to_buffer(&self, buf: &mut Buffer) {
+        let palette = &self.config.palette;
         for win in self.windows.values() {
             if self.maximized.is_some_and(|id| id != win.id) || self.minimized.contains(&win.id) {
                 continue;
             }
-            render_tab(win.active_tab(), buf);
+            let tab = win.active_tab();
+            render_tab(tab, buf);
+            if self.config.dim_unfocused && win.id != self.focus {
+                palette::shade(buf, win.content_rect(), palette, palette::DIM);
+            }
+            if let Some(metrics) = tab.scroll_metrics() {
+                render_scrollbar(win.content_rect(), metrics, palette, buf);
+            }
         }
         for chrome in &self.view.chrome {
-            render_tab_bar(chrome, self.focus, buf, self.view.elapsed);
+            render_tab_bar(chrome, self.focus, palette, buf, self.view.elapsed);
         }
         if let Some(sel) = &self.selection
             && self.maximized.is_none_or(|id| id == sel.window)
             && let Some(win) = self.windows.get(&sel.window)
         {
-            render_selection(sel, win.content_rect(), buf);
+            render_selection(sel, win.content_rect(), palette, buf);
         }
         for sep in &self.view.separators {
-            render_separator(sep, buf);
+            render_separator(sep, palette, buf);
         }
         if let Some(status) = &self.view.status {
-            render_status(status, self.view.elapsed, buf);
+            render_status(status, palette, self.view.elapsed, buf);
         }
         if let Some((row, text)) = &self.view.message {
-            render_message(*row, text, buf);
+            render_message(*row, text, palette, buf);
         }
         if let Some(chrome) = &self.view.prompt {
-            render_prompt_chrome(chrome, buf);
+            render_prompt_chrome(chrome, palette, buf);
             if let Some(prompt) = &self.prompt {
                 prompt.textarea.render(chrome.input, buf);
             }
+            if self.config.shadows {
+                palette::shadow(buf, chrome.input, self.area, palette);
+            }
         }
         if let Some(hints) = &self.view.hints {
-            render_hints(hints, buf);
+            render_hints(hints, palette, buf);
+            if self.config.shadows {
+                palette::shadow(buf, hints.rect, self.area, palette);
+            }
         }
     }
 
@@ -2046,7 +2127,13 @@ fn truncate_name(name: &str, width: usize) -> String {
 }
 
 /// Rule brightness marks window focus.
-fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: Duration) {
+fn render_tab_bar(
+    chrome: &Chrome,
+    focus: WindowId,
+    palette: &Palette,
+    buf: &mut Buffer,
+    elapsed: Duration,
+) {
     let bar = chrome.tab_bar;
     if bar.height == 0 || bar.width == 0 {
         return;
@@ -2065,59 +2152,73 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         *x += 1;
         true
     };
-    // Focused uses the terminal's default foreground, not hardcoded white.
-    // The animation indexes by bar position so it sweeps the whole width.
-    let rule_at = |x: u16| -> Style {
-        let base = if focused {
-            Color::Reset
-        } else {
-            Color::DarkGray
+    // The animation and the fill index by bar position so they span the
+    // whole width.
+    let rule_at = |x: u16| -> (char, Style) {
+        if !focused {
+            return ('─', Style::default().fg(palette.dim));
+        }
+        let i = (x - bar.x) as usize;
+        let (ch, color) = match chrome.rule {
+            Rule::Plain => ('─', palette.text),
+            Rule::Progress { percent, color } => {
+                let filled = (bar.width as usize * percent as usize + 50) / 100;
+                if i < filled {
+                    ('━', color)
+                } else {
+                    ('─', palette.text)
+                }
+            }
+            Rule::Shimmer { phase, color } => {
+                ('─', anim::shimmer_at(color, i, bar.width as usize, phase))
+            }
+            Rule::Breathe { color } => ('─', anim::breathe(color, elapsed)),
         };
-        let color = match (focused, chrome.rule_anim) {
-            (false, _) | (_, Anim::None) => base,
-            (true, Anim::Shimmer) => anim::shimmer(
-                chrome.rule_color,
-                (x - bar.x) as usize,
-                bar.width as usize,
-                elapsed,
-            ),
-            (true, Anim::Breathe) => anim::breathe(chrome.rule_color, elapsed),
-        };
-        Style::default().fg(color)
+        (ch, Style::default().fg(color))
     };
     // Badges stop where the bar runs out, but the controls still draw.
     'badges: {
         for _ in 0..2 {
-            let style = rule_at(x);
-            if !put(&mut x, '─', style) {
+            let (ch, style) = rule_at(x);
+            if !put(&mut x, ch, style) {
                 break 'badges;
             }
         }
         for (i, badge) in chrome.tabs.iter().enumerate() {
             let style = if badge.active {
-                let color = if focused { Color::Reset } else { Color::Gray };
+                let color = if focused { palette.text } else { palette.muted };
                 Style::default().fg(color)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(palette.dim)
             };
             for ch in format!(" {}:{}", i, badge.name).chars() {
                 if !put(&mut x, ch, style) {
                     break 'badges;
                 }
             }
-            if badge.yanked && !put(&mut x, '*', style.fg(Color::Yellow)) {
+            if badge.yanked && !put(&mut x, '*', style.fg(palette.mark)) {
                 break 'badges;
+            }
+            if let Some(activity) = badge.activity {
+                let color = match activity {
+                    Activity::Output => palette.muted,
+                    Activity::Bell => palette.done,
+                };
+                if !put(&mut x, ' ', style) || !put(&mut x, '●', style.fg(color)) {
+                    break 'badges;
+                }
             }
             if let Some(visual) = &badge.agent {
                 if !put(&mut x, ' ', style) {
                     break 'badges;
                 }
+                let status_color = palette.status(visual.status);
                 let len = visual.text.chars().count();
                 for (j, ch) in visual.text.chars().enumerate() {
                     let color = match visual.anim {
-                        Anim::None => visual.color,
-                        Anim::Shimmer => anim::shimmer(visual.color, j, len, elapsed),
-                        Anim::Breathe => anim::breathe(visual.color, elapsed),
+                        Anim::None => status_color,
+                        Anim::Shimmer => anim::shimmer(status_color, j, len, elapsed),
+                        Anim::Breathe => anim::breathe(status_color, elapsed),
                     };
                     if !put(&mut x, ch, style.fg(color)) {
                         break 'badges;
@@ -2131,9 +2232,10 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
     }
     let indicators_end = x;
     while x < badges_end {
+        let (ch, style) = rule_at(x);
         if let Some(dst) = buf.cell_mut(Position::new(x, bar.y)) {
-            dst.set_symbol("─");
-            dst.set_style(rule_at(x));
+            dst.set_char(ch);
+            dst.set_style(style);
         }
         x += 1;
     }
@@ -2143,7 +2245,7 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
         let len = label.len() as u16;
         if badges_end >= bar.x + len && badges_end - len >= indicators_end {
             let style = Style::default()
-                .fg(Color::Yellow)
+                .fg(palette.mark)
                 .add_modifier(Modifier::REVERSED);
             let start = badges_end - len;
             for (i, ch) in label.chars().enumerate() {
@@ -2157,9 +2259,9 @@ fn render_tab_bar(chrome: &Chrome, focus: WindowId, buf: &mut Buffer, elapsed: D
     // Glyphs any monospace font covers.
     if let Some(controls) = chrome.controls {
         let (rest, bright) = if focused {
-            (Color::Reset, Color::White)
+            (palette.text, palette.bright)
         } else {
-            (Color::DarkGray, Color::Gray)
+            (palette.dim, palette.muted)
         };
         let toggle = if chrome.maximized { '❐' } else { '□' };
         let glyphs = [
@@ -2226,18 +2328,41 @@ fn count(n: usize, unit: &str) -> String {
     format!("{n} {unit}{s}")
 }
 
-fn render_message(row: Rect, text: &str, buf: &mut Buffer) {
+/// Overlays the last column of a scrolled tab's content.
+fn render_scrollbar(
+    content: Rect,
+    (top, viewport, total): (usize, usize, usize),
+    palette: &Palette,
+    buf: &mut Buffer,
+) {
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+    // Content length counts top-row positions, so the thumb spans the
+    // viewport's share of history exactly.
+    let mut state = ScrollbarState::new(total.saturating_sub(viewport) + 1)
+        .position(top)
+        .viewport_content_length(viewport);
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_style(Style::default().fg(palette.dim).bg(palette.chrome_bg))
+        .thumb_style(Style::default().fg(palette.muted).bg(palette.chrome_bg))
+        .render(content, buf, &mut state);
+}
+
+fn render_message(row: Rect, text: &str, palette: &Palette, buf: &mut Buffer) {
     if row.height == 0 || row.width == 0 {
         return;
     }
-    let fill = Style::default().bg(CHROME_BG);
+    let fill = Style::default().bg(palette.chrome_bg);
     for x in row.x..row.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
             dst.set_char(' ');
             dst.set_style(fill);
         }
     }
-    let style = fill.fg(Color::Gray);
+    let style = fill.fg(palette.muted);
     for (i, ch) in text.chars().enumerate() {
         let x = row.x + 1 + i as u16;
         if x >= row.right() {
@@ -2250,12 +2375,12 @@ fn render_message(row: Rect, text: &str, buf: &mut Buffer) {
     }
 }
 
-fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
+fn render_status(status: &StatusChrome, palette: &Palette, elapsed: Duration, buf: &mut Buffer) {
     let row = status.row;
     if row.height == 0 || row.width == 0 {
         return;
     }
-    let fill = Style::default().bg(CHROME_BG);
+    let fill = Style::default().bg(palette.chrome_bg);
     for x in row.x..row.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
             dst.set_char(' ');
@@ -2265,9 +2390,9 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
     // The menu icon.
     if let Some(dst) = buf.cell_mut(Position::new(row.x, row.y)) {
         dst.set_char('☢');
-        dst.set_style(fill.fg(Color::Gray));
+        dst.set_style(fill.fg(palette.muted));
     }
-    let name_style = fill.fg(Color::Green);
+    let name_style = fill.fg(palette.accent);
     for (i, ch) in format!(" {}", status.name).chars().enumerate() {
         let x = row.x + 1 + i as u16;
         if x >= row.right() {
@@ -2278,7 +2403,7 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
             dst.set_style(name_style);
         }
     }
-    let title_style = fill.fg(Color::Gray);
+    let title_style = fill.fg(palette.muted);
     for title in &status.minimized {
         for (i, ch) in title.name.chars().enumerate() {
             let x = title.span.start + i as u16;
@@ -2291,7 +2416,7 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
             }
         }
     }
-    let clock_style = fill.fg(Color::Gray);
+    let clock_style = fill.fg(palette.muted);
     let (text, ind_len) = match &status.indicator {
         Some((ind, _)) => (format!("{}  {} ", ind, status.clock), ind.chars().count()),
         None => (format!("{}  {} ", status.host, status.clock), 0),
@@ -2303,7 +2428,7 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
             if let Some(dst) = buf.cell_mut(Position::new(start + i as u16, row.y)) {
                 dst.set_char(ch);
                 dst.set_style(if i < ind_len {
-                    clock_style.fg(anim::shimmer(Color::Gray, i, ind_len, elapsed))
+                    clock_style.fg(anim::shimmer(palette.muted, i, ind_len, elapsed))
                 } else {
                     clock_style
                 });
@@ -2312,13 +2437,13 @@ fn render_status(status: &StatusChrome, elapsed: Duration, buf: &mut Buffer) {
     }
 }
 
-fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
+fn render_hints(chrome: &HintChrome, palette: &Palette, buf: &mut Buffer) {
     let rect = chrome.rect;
     if rect.width < 2 || rect.height < 2 {
         return;
     }
-    let fill = Style::default().bg(CHROME_BG);
-    let border = fill.fg(Color::DarkGray);
+    let fill = Style::default().bg(palette.chrome_bg);
+    let border = fill.fg(palette.dim);
     for y in rect.top()..rect.bottom() {
         for x in rect.left()..rect.right() {
             let Some(dst) = buf.cell_mut(Position::new(x, y)) else {
@@ -2341,8 +2466,8 @@ fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
             dst.set_style(if ch == ' ' { fill } else { border });
         }
     }
-    let keys_style = fill.fg(Color::Reset);
-    let desc_style = fill.fg(Color::Gray);
+    let keys_style = fill.fg(palette.text);
+    let desc_style = fill.fg(palette.muted);
     for (i, (keys, desc)) in chrome.rows.iter().enumerate() {
         let y = rect.y + 1 + i as u16;
         if y >= rect.bottom() - 1 {
@@ -2364,9 +2489,8 @@ fn render_hints(chrome: &HintChrome, buf: &mut Buffer) {
     }
 }
 
-/// Toggles REVERSED rather than setting it, so already-reversed content
-/// stays visible.
-fn render_selection(sel: &Selection, content: Rect, buf: &mut Buffer) {
+/// The background changes and the text keeps its own color.
+fn render_selection(sel: &Selection, content: Rect, palette: &Palette, buf: &mut Buffer) {
     if content.width == 0 || content.height == 0 {
         return;
     }
@@ -2376,20 +2500,14 @@ fn render_selection(sel: &Selection, content: Rect, buf: &mut Buffer) {
         for col in from..=to.min(content.width - 1) {
             let pos = Position::new(content.x + col, content.y + row);
             if let Some(dst) = buf.cell_mut(pos) {
-                let mut style = dst.style();
-                if style.add_modifier.contains(Modifier::REVERSED) {
-                    style.add_modifier.remove(Modifier::REVERSED);
-                } else {
-                    style.add_modifier.insert(Modifier::REVERSED);
-                }
-                dst.set_style(style);
+                dst.bg = palette.selection_bg;
             }
         }
     }
 }
 
 /// The textarea renders separately, over the cleared input area.
-fn render_prompt_chrome(chrome: &PromptChrome, buf: &mut Buffer) {
+fn render_prompt_chrome(chrome: &PromptChrome, palette: &Palette, buf: &mut Buffer) {
     for x in chrome.line.left()..chrome.line.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, chrome.line.y)) {
             dst.reset();
@@ -2403,7 +2521,7 @@ fn render_prompt_chrome(chrome: &PromptChrome, buf: &mut Buffer) {
     let Some(row) = chrome.suggestion_row else {
         return;
     };
-    let style = Style::default().fg(Color::Gray).bg(Color::Indexed(236));
+    let style = Style::default().fg(palette.muted).bg(palette.suggestion_bg);
     let mut x = row.x;
     for name in &chrome.suggestions {
         for ch in format!(" {name} ").chars() {
@@ -2420,8 +2538,8 @@ fn render_prompt_chrome(chrome: &PromptChrome, buf: &mut Buffer) {
 }
 
 /// Always dim, since the tab bar's rule marks focus.
-fn render_separator(sep: &Separator, buf: &mut Buffer) {
-    let style = Style::default().fg(Color::DarkGray);
+fn render_separator(sep: &Separator, palette: &Palette, buf: &mut Buffer) {
+    let style = Style::default().fg(palette.dim);
     for y in sep.rect.top()..sep.rect.bottom() {
         for x in sep.rect.left()..sep.rect.right() {
             if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
@@ -2491,11 +2609,27 @@ pub(crate) fn cell_style(attrs: &CellAttributes) -> Style {
     if attrs.italic() {
         style = style.add_modifier(Modifier::ITALIC);
     }
+    // Every underline style draws as the single one ratatui can carry.
     if attrs.underline() != Underline::None {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
+    let underline = attrs.underline_color();
+    if underline != ColorAttribute::Default {
+        style = style.underline_color(cell_color(underline));
+    }
     if attrs.reverse() {
         style = style.add_modifier(Modifier::REVERSED);
+    }
+    if attrs.strikethrough() {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
+    match attrs.blink() {
+        Blink::None => {}
+        Blink::Slow => style = style.add_modifier(Modifier::SLOW_BLINK),
+        Blink::Rapid => style = style.add_modifier(Modifier::RAPID_BLINK),
+    }
+    if attrs.invisible() {
+        style = style.add_modifier(Modifier::HIDDEN);
     }
     style
 }

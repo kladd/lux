@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use ratatui::crossterm::event::KeyCode as CtKeyCode;
 
 use crate::server::keys::{KeyMatch, KeyTable};
+use crate::server::palette::Palette;
 
 /// Which tabs may take their name from the program's OSC window title.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -26,6 +27,11 @@ pub struct Config {
     /// Yank a drag selection to the system clipboard on release.
     pub copy_on_select: bool,
     pub osc_titles: OscTitles,
+    pub palette: Palette,
+    /// Darken every window but the focused one.
+    pub dim_unfocused: bool,
+    /// Popovers cast a shadow on the content beneath them.
+    pub shadows: bool,
 }
 
 impl Default for Config {
@@ -37,6 +43,9 @@ impl Default for Config {
             automode: false,
             copy_on_select: true,
             osc_titles: OscTitles::default(),
+            palette: Palette::default(),
+            dim_unfocused: false,
+            shadows: false,
         }
     }
 }
@@ -109,6 +118,24 @@ fn from_toml(text: &str, origin: &str) -> Config {
             Some("agents") => config.osc_titles = OscTitles::Agents,
             Some("all") => config.osc_titles = OscTitles::All,
             _ => eprintln!("lux: {origin}: invalid osc-titles value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("palette") {
+        match value.as_str().and_then(Palette::named) {
+            Some(palette) => config.palette = palette,
+            None => eprintln!("lux: {origin}: unknown palette {value}"),
+        }
+    }
+    if let Some(value) = doc.get("dim-unfocused") {
+        match value.as_bool() {
+            Some(dim) => config.dim_unfocused = dim,
+            None => eprintln!("lux: {origin}: invalid dim-unfocused value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("shadows") {
+        match value.as_bool() {
+            Some(shadows) => config.shadows = shadows,
+            None => eprintln!("lux: {origin}: invalid shadows value {value}"),
         }
     }
     config
@@ -211,6 +238,36 @@ mod tests {
             from_toml("osc-titles = true", "test").osc_titles,
             OscTitles::Agents
         );
+    }
+
+    #[test]
+    fn palette_option_selects_a_named_set_and_defaults_otherwise() {
+        assert_eq!(from_toml("", "test").palette, Palette::DEFAULT);
+        assert_eq!(
+            from_toml("palette = \"default\"", "test").palette,
+            Palette::DEFAULT
+        );
+        assert_eq!(
+            from_toml("palette = \"nope\"", "test").palette,
+            Palette::DEFAULT
+        );
+        assert_eq!(from_toml("palette = 3", "test").palette, Palette::DEFAULT);
+    }
+
+    #[test]
+    fn dim_unfocused_option_parses_and_defaults_off() {
+        assert!(!from_toml("", "test").dim_unfocused);
+        assert!(from_toml("dim-unfocused = true", "test").dim_unfocused);
+        assert!(!from_toml("dim-unfocused = false", "test").dim_unfocused);
+        assert!(!from_toml("dim-unfocused = \"yes\"", "test").dim_unfocused);
+    }
+
+    #[test]
+    fn shadows_option_parses_and_defaults_off() {
+        assert!(!from_toml("", "test").shadows);
+        assert!(from_toml("shadows = true", "test").shadows);
+        assert!(!from_toml("shadows = false", "test").shadows);
+        assert!(!from_toml("shadows = 1", "test").shadows);
     }
 
     #[test]

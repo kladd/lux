@@ -4,12 +4,14 @@ use std::collections::BTreeMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Widget};
 use tui_textarea::TextArea;
 
+use crate::server::config::Config;
 use crate::server::grid;
 use crate::server::layout::WindowId;
+use crate::server::palette::{self, Palette};
 use crate::server::session::Session;
 use crate::server::window::TabId;
 use crate::server::{SessionId, clear_region};
@@ -117,20 +119,41 @@ pub fn render(
     area: Rect,
     sessions: &mut BTreeMap<SessionId, Session>,
     state: &FinderState,
+    config: &Config,
 ) {
     let window = float_rect(area);
     if window.width < 4 || window.height < 4 {
         return;
     }
+    let palette = &config.palette;
     clear_region(buf, window);
     Block::bordered()
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(palette.dim))
         .render(window, buf);
-    let inner = window.inner(Margin::new(1, 1));
+    render_panes(
+        buf,
+        window.inner(Margin::new(1, 1)),
+        sessions,
+        state,
+        palette,
+    );
+    if config.shadows {
+        palette::shadow(buf, window, area, palette);
+    }
+}
+
+/// The match list beside or above the preview, whichever the shape fits.
+fn render_panes(
+    buf: &mut Buffer,
+    inner: Rect,
+    sessions: &mut BTreeMap<SessionId, Session>,
+    state: &FinderState,
+    palette: &Palette,
+) {
     let items = items(sessions);
     let matched = matches(&items, &state.query());
     let highlight = state.highlight.min(matched.len().saturating_sub(1));
-    let dim = Style::default().fg(Color::DarkGray);
+    let dim = Style::default().fg(palette.dim);
     if inner.width > inner.height {
         let list_w = 32.min(inner.width);
         render_list(
@@ -143,6 +166,7 @@ pub fn render(
             &matched,
             highlight,
             state,
+            palette,
         );
         if inner.width <= list_w {
             return;
@@ -171,6 +195,7 @@ pub fn render(
             &matched,
             highlight,
             state,
+            palette,
         );
         if inner.height <= list_h + 1 {
             return;
@@ -208,13 +233,14 @@ fn render_list(
     matched: &[usize],
     highlight: usize,
     state: &FinderState,
+    palette: &Palette,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     if let Some(dst) = buf.cell_mut(Position::new(area.x, area.y)) {
         dst.set_char('>');
-        dst.set_style(Style::default().fg(Color::Green));
+        dst.set_style(Style::default().fg(palette.accent));
     }
     let input = Rect::new(
         area.x + 2,
@@ -236,11 +262,11 @@ fn render_list(
         let selected = row == highlight;
         let (name_style, session_style) = if selected {
             let style = Style::default()
-                .fg(Color::Green)
+                .fg(palette.accent)
                 .add_modifier(Modifier::REVERSED);
             (style, style)
         } else {
-            (Style::default(), Style::default().fg(Color::DarkGray))
+            (Style::default(), Style::default().fg(palette.dim))
         };
         let mut x = area.x;
         let mut put = |x: &mut u16, ch: char, style: Style| -> bool {

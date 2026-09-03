@@ -5,10 +5,11 @@ use std::collections::BTreeMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 
 use crate::server::anim::{self, Anim};
 use crate::server::grid;
+use crate::server::palette::Palette;
 use crate::server::session::Session;
 use crate::server::window::TabId;
 use crate::server::{SessionId, clear_region};
@@ -30,7 +31,12 @@ type Run = Vec<(char, Style)>;
 
 /// Draws the fallback screen. The working list grows up from the bottom
 /// and drops lines before it reaches the message.
-pub fn render_blank(buf: &mut Buffer, area: Rect, sessions: &BTreeMap<SessionId, Session>) {
+pub fn render_blank(
+    buf: &mut Buffer,
+    area: Rect,
+    sessions: &BTreeMap<SessionId, Session>,
+    palette: &Palette,
+) {
     clear_region(buf, area);
     if area.width == 0 || area.height == 0 {
         return;
@@ -50,12 +56,12 @@ pub fn render_blank(buf: &mut Buffer, area: Rect, sessions: &BTreeMap<SessionId,
     }
     let width = area.width.min(LIST_WIDTH);
     let x0 = area.x + (area.width - width) / 2;
-    let mut entries = working_entries(sessions);
+    let mut entries = working_entries(sessions, palette);
     if entries.is_empty() {
         entries = vec![
             ALL_IDLE
                 .chars()
-                .map(|c| (c, Style::default().fg(Color::DarkGray)))
+                .map(|c| (c, Style::default().fg(palette.dim)))
                 .collect(),
         ];
     }
@@ -76,7 +82,7 @@ pub fn render_blank(buf: &mut Buffer, area: Rect, sessions: &BTreeMap<SessionId,
 
 /// Working agent tabs in grid order, formatted like the grid's tile headers
 /// but with the status uncolored.
-fn working_entries(sessions: &BTreeMap<SessionId, Session>) -> Vec<Run> {
+fn working_entries(sessions: &BTreeMap<SessionId, Session>, palette: &Palette) -> Vec<Run> {
     let now = std::time::Instant::now();
     let elapsed = anim::elapsed();
     grid::items(sessions)
@@ -90,19 +96,19 @@ fn working_entries(sessions: &BTreeMap<SessionId, Session>) -> Vec<Run> {
             let len = visual.text.chars().count();
             for (j, ch) in visual.text.chars().enumerate() {
                 let color = match visual.anim {
-                    Anim::None => Color::Reset,
-                    Anim::Shimmer => anim::shimmer(Color::Reset, j, len, elapsed),
-                    Anim::Breathe => anim::breathe(Color::Reset, elapsed),
+                    Anim::None => palette.text,
+                    Anim::Shimmer => anim::shimmer(palette.text, j, len, elapsed),
+                    Anim::Breathe => anim::breathe(palette.text, elapsed),
                 };
                 run.push((ch, Style::default().fg(color)));
             }
             run.push((' ', Style::default()));
             for ch in session.name.chars() {
-                run.push((ch, Style::default().fg(Color::Gray)));
+                run.push((ch, Style::default().fg(palette.muted)));
             }
-            run.push((':', Style::default().fg(Color::DarkGray)));
+            run.push((':', Style::default().fg(palette.dim)));
             for ch in tab.name.chars() {
-                run.push((ch, Style::default().fg(Color::DarkGray)));
+                run.push((ch, Style::default().fg(palette.dim)));
             }
             Some(run)
         })

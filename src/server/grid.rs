@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::server::anim::{self, Anim};
 use crate::server::layout::{Dir, WindowId};
+use crate::server::palette::Palette;
 use crate::server::session::{Session, cell_style};
 use crate::server::window::{Tab, TabId};
 use crate::server::{SessionId, clear_region};
@@ -135,6 +136,7 @@ pub fn render(
     area: Rect,
     sessions: &mut BTreeMap<SessionId, Session>,
     state: &mut GridState,
+    palette: &Palette,
 ) {
     let items = items(sessions);
     state.highlight = state.highlight.min(items.len().saturating_sub(1));
@@ -150,14 +152,21 @@ pub fn render(
         Some(state.highlight),
         state.scroll,
         state.capture,
+        palette,
     );
 }
 
-pub fn render_preview(buf: &mut Buffer, area: Rect, sessions: &mut BTreeMap<SessionId, Session>) {
+pub fn render_preview(
+    buf: &mut Buffer,
+    area: Rect,
+    sessions: &mut BTreeMap<SessionId, Session>,
+    palette: &Palette,
+) {
     let items = items(sessions);
-    draw(buf, area, sessions, &items, None, 0, None);
+    draw(buf, area, sessions, &items, None, 0, None, palette);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     buf: &mut Buffer,
     area: Rect,
@@ -166,10 +175,11 @@ fn draw(
     highlight: Option<usize>,
     scroll: usize,
     capture: Option<TabId>,
+    palette: &Palette,
 ) {
     clear_region(buf, area);
     if items.is_empty() {
-        draw_empty(buf, area);
+        draw_empty(buf, area, palette);
         return;
     }
     let Some(l) = layout(area, items.len()) else {
@@ -216,12 +226,13 @@ fn draw(
             highlight == Some(i),
             captured,
             elapsed,
+            palette,
         );
     }
 }
 
 /// An emptied grid stays on screen, so tell the viewer why it's blank.
-fn draw_empty(buf: &mut Buffer, area: Rect) {
+fn draw_empty(buf: &mut Buffer, area: Rect, palette: &Palette) {
     let msg = "no agent tabs";
     let len = msg.chars().count() as u16;
     if area.width < len || area.height == 0 {
@@ -229,7 +240,7 @@ fn draw_empty(buf: &mut Buffer, area: Rect) {
     }
     let x = area.x + (area.width - len) / 2;
     let y = area.y + area.height / 2;
-    let style = Style::default().fg(Color::DarkGray);
+    let style = Style::default().fg(palette.dim);
     for (i, ch) in msg.chars().enumerate() {
         if let Some(dst) = buf.cell_mut(Position::new(x + i as u16, y)) {
             dst.set_char(ch);
@@ -268,6 +279,7 @@ pub fn render_tail(buf: &mut Buffer, area: Rect, tab: &Tab) {
 /// The highlight uses line weight, not color, so it never fights the
 /// status color. A captured tile is also highlighted, so it needs its own
 /// label.
+#[allow(clippy::too_many_arguments)]
 fn draw_tile(
     buf: &mut Buffer,
     rect: Rect,
@@ -276,18 +288,19 @@ fn draw_tile(
     highlighted: bool,
     captured: bool,
     elapsed: Duration,
+    palette: &Palette,
 ) {
     if rect.width < 2 || rect.height < 2 {
         return;
     }
     let now = std::time::Instant::now();
-    let (color, border_anim) =
-        tab.agent
-            .as_ref()
-            .map_or((Color::DarkGray, Anim::None), |tracker| {
-                let visual = tracker.visual(now);
-                (visual.color, visual.anim)
-            });
+    let (color, border_anim) = tab
+        .agent
+        .as_ref()
+        .map_or((palette.dim, Anim::None), |tracker| {
+            let visual = tracker.visual(now);
+            (palette.status(visual.status), visual.anim)
+        });
     draw_border(buf, rect, highlighted, color, border_anim, elapsed);
     render_tail(
         buf,
@@ -309,12 +322,13 @@ fn draw_tile(
     };
     if let Some(tracker) = &tab.agent {
         let visual = tracker.visual(now);
+        let status_color = palette.status(visual.status);
         let len = visual.text.chars().count();
         for (j, ch) in visual.text.chars().enumerate() {
             let color = match visual.anim {
-                Anim::None => visual.color,
-                Anim::Shimmer => anim::shimmer(visual.color, j, len, elapsed),
-                Anim::Breathe => anim::breathe(visual.color, elapsed),
+                Anim::None => status_color,
+                Anim::Shimmer => anim::shimmer(status_color, j, len, elapsed),
+                Anim::Breathe => anim::breathe(status_color, elapsed),
             };
             if !put(&mut x, ch, base.fg(color)) {
                 break;
@@ -323,23 +337,23 @@ fn draw_tile(
         put(&mut x, ' ', base);
     }
     for ch in session.chars() {
-        if !put(&mut x, ch, base.fg(Color::Gray)) {
+        if !put(&mut x, ch, base.fg(palette.muted)) {
             break;
         }
     }
-    put(&mut x, ':', base.fg(Color::DarkGray));
+    put(&mut x, ':', base.fg(palette.dim));
     for ch in tab.name.chars() {
-        if !put(&mut x, ch, base.fg(Color::DarkGray)) {
+        if !put(&mut x, ch, base.fg(palette.dim)) {
             break;
         }
     }
-    // Cyan so the label never matches an agent status color.
+    // Its own color, so the label never matches an agent status color.
     if captured {
         let label = " capture ";
         let len = label.chars().count() as u16;
         if rect.width >= len + 2 {
             let style = Style::default()
-                .fg(Color::Cyan)
+                .fg(palette.capture)
                 .add_modifier(Modifier::REVERSED);
             let start = rect.right() - 1 - len;
             for (i, ch) in label.chars().enumerate() {

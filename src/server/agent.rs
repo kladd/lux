@@ -5,7 +5,6 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use ratatui::style::Color;
 use regex::Regex;
 use wezterm_term::{Progress, Terminal as Engine};
 
@@ -37,15 +36,24 @@ pub enum Urgency {
 }
 
 impl Urgency {
-    /// The state's status text color and the animation a single-line
-    /// entry carries for it.
-    pub fn visual(self) -> (Color, Anim) {
+    /// The state's status and the animation a single-line entry carries
+    /// for it.
+    pub fn visual(self) -> (Status, Anim) {
         match self {
-            Urgency::Working => (Color::Yellow, Anim::Shimmer),
-            Urgency::Done => (Color::Green, Anim::Shimmer),
-            Urgency::Blocked => (Color::Red, Anim::Breathe),
+            Urgency::Working => (Status::Working, Anim::Shimmer),
+            Urgency::Done => (Status::Done, Anim::Shimmer),
+            Urgency::Blocked => (Status::Blocked, Anim::Breathe),
         }
     }
+}
+
+/// The state a tab's status text names, which the palette colors.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Status {
+    Working,
+    Blocked,
+    Done,
+    Idle,
 }
 
 enum Source {
@@ -546,18 +554,18 @@ impl Tracker {
     }
 
     pub fn visual(&self, now: Instant) -> Visual {
-        let (state, color, anim) = match (self.displayed, self.seen) {
-            (AgentState::Working, _) => ("working", Color::Yellow, Anim::Shimmer),
-            (AgentState::Blocked, _) => ("blocked", Color::Red, Anim::Breathe),
-            (AgentState::Idle, false) => ("done", Color::Green, Anim::None),
-            (AgentState::Idle, true) => ("idle", Color::DarkGray, Anim::None),
+        let (state, status, anim) = match (self.displayed, self.seen) {
+            (AgentState::Working, _) => ("working", Status::Working, Anim::Shimmer),
+            (AgentState::Blocked, _) => ("blocked", Status::Blocked, Anim::Breathe),
+            (AgentState::Idle, false) => ("done", Status::Done, Anim::None),
+            (AgentState::Idle, true) => ("idle", Status::Idle, Anim::None),
         };
         let text = if self.animated() {
             format!("[{state} {}]", elapsed_text(now.duration_since(self.since)))
         } else {
             format!("[{state}]")
         };
-        Visual { text, color, anim }
+        Visual { text, status, anim }
     }
 }
 
@@ -576,7 +584,7 @@ fn elapsed_text(elapsed: Duration) -> String {
 /// A tab's status text as the tab bar draws it.
 pub struct Visual {
     pub text: String,
-    pub color: Color,
+    pub status: Status,
     pub anim: Anim,
 }
 

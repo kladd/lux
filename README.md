@@ -65,7 +65,8 @@ All window commands start with the prefix key (default `Ctrl-b`):
 | `y` | yank the active tab (`*` marks it in the tab bar) |
 | `P` | paste the yanked tab into the focused window, even in another session |
 | `Esc` | cancel a pending yank |
-| `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit) |
+| `Y` | copy the last completed command's output to the clipboard (needs the shell's OSC 133 integration) |
+| `[` | enter scroll mode (mouse or keys; `q`/`Esc` to exit; a scrollbar on the right edge shows where you are) |
 | `d` | detach from the session |
 | `s` | open the session switcher |
 | `g` | open the CLAUDECOM grid |
@@ -155,6 +156,9 @@ notify = false   # no desktop notifications for Claude Code tabs
 automode = true  # CLAUDECOM opens auto mode instead of the grid
 copy-on-select = false   # selections yank only on right-click
 osc-titles = "all"       # which tabs are named by the program's OSC title
+palette = "default"      # the interface color set
+dim-unfocused = true     # darken every window but the focused one
+shadows = true           # popovers cast a shadow on the content beneath
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`
@@ -164,3 +168,11 @@ for Ctrl.
 by hand is named after its foreground process; where the option allows it,
 a window title the program sets with OSC 0/2 replaces that name. Agent tabs
 use the title by default; a Claude Code session name outranks it.
+
+`palette` names the color set lux draws its own chrome in: agent status,
+tab bars, the status line, selections, and popovers. Only `default` exists
+so far. Terminal content always keeps your terminal's own colors.
+
+`dim-unfocused` and `shadows` are off by default. Both darken cells, and a
+cell in the terminal's default colors is darkened from the palette's
+stand-ins (light grey on black), so they look best on a dark terminal.
