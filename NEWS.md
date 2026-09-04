@@ -1,5 +1,13 @@
 # News
 
+## 2026-09-03
+
+- Configuration `progress-animation` (`sweep`, `flow`, or `pulse`; default
+  `pulse`) selects the tab bar rule's working animation; `pulse` fades in
+  a shifting braille texture that brightens with the tab's output.
+- `:config-open` edits the config file in a new `$EDITOR` tab, and
+  `:config-reload` applies it to every running session.
+
 ## 2026-09-02
 
 - Middle-clicking a tab indicator closes that tab.

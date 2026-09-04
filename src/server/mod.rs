@@ -760,6 +760,19 @@ impl Server {
                     self.end_session(target_sid);
                 }
             }
+            Effect::ReloadConfig => match config::reload() {
+                Ok(config) => {
+                    self.config = Arc::new(config);
+                    for session in self.sessions.values_mut() {
+                        session.set_config(self.config.clone());
+                    }
+                    if let Some(session) = self.sessions.get_mut(&sid) {
+                        session.show_message("config reloaded".into());
+                    }
+                }
+                // Every session keeps the config it has.
+                Err(err) => eprintln!("lux: {err}"),
+            },
             // OSC 52 too, so an outer terminal or SSH hop sees it.
             Effect::Copy(text) => {
                 if let Some(clipboard) = &mut self.clipboard {

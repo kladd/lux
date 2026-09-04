@@ -24,7 +24,7 @@ use tui_textarea::TextArea;
 
 use crate::server::agent;
 use crate::server::anim::{self, Anim};
-use crate::server::config::Config;
+use crate::server::config::{self, Config, ProgressAnimation};
 use crate::server::ex::{self, ExCommand};
 use crate::server::input;
 use crate::server::keys::{Command, KeyMatch, KeyTrie};
@@ -56,6 +56,8 @@ pub enum Effect {
     RenameSession(String),
     /// Kill a named session, or the current one if `None`.
     KillSession(Option<String>),
+    /// Re-read the config file and apply it to every session.
+    ReloadConfig,
     Copy(String),
     Paste,
     /// Mouse pointer shape, as an OSC 22 name.
@@ -174,9 +176,24 @@ struct TabBadge {
 #[derive(Clone, Copy)]
 enum Rule {
     Plain,
-    Progress { percent: u8, color: Color },
-    Shimmer { phase: f32, color: Color },
-    Breathe { color: Color },
+    Progress {
+        percent: u8,
+        color: Color,
+    },
+    Shimmer {
+        phase: f32,
+        color: Color,
+    },
+    Breathe {
+        color: Color,
+    },
+    /// Every cell flickers, `brightness` scaling them all, with braille
+    /// covering the `takeover` share of the rule.
+    Pulse {
+        brightness: f32,
+        takeover: f32,
+        color: Color,
+    },
 }
 
 /// One window's per-frame chrome geometry.
@@ -572,6 +589,16 @@ impl Session {
     }
 
     pub fn request_redraw(&mut self) {
+        self.force_redraw = true;
+    }
+
+    pub fn set_config(&mut self, config: Arc<Config>) {
+        self.config = config;
+        self.force_redraw = true;
+    }
+
+    pub fn show_message(&mut self, text: String) {
+        self.message = Some(text);
         self.force_redraw = true;
     }
 
@@ -1251,6 +1278,8 @@ impl Session {
                         Some(ExCommand::KillSession(name)) => {
                             return Some(Effect::KillSession(name));
                         }
+                        Some(ExCommand::ConfigOpen) => self.open_config(),
+                        Some(ExCommand::ConfigReload) => return Some(Effect::ReloadConfig),
                         None => {}
                     },
                     PromptKind::Rename => {
@@ -1335,14 +1364,39 @@ impl Session {
     }
 
     fn new_tab(&mut self) {
+        let win = &self.windows[&self.focus];
+        let cwd = win.active_tab().working_dir();
+        if let Ok(tab) = Tab::spawn(win.content_rect(), cwd, self.tx.clone()) {
+            self.push_tab(tab);
+        }
+    }
+
+    /// Runs `$EDITOR` on the config file in a new tab.
+    fn open_config(&mut self) {
+        let editor = std::env::var("EDITOR").unwrap_or_default();
+        let mut argv: Vec<&str> = editor.split_whitespace().collect();
+        if argv.is_empty() {
+            self.show_message("$EDITOR is not set".into());
+            return;
+        }
+        let Some(path) = config::path() else {
+            return;
+        };
+        let path = path.to_string_lossy();
+        argv.push(&path);
+        let win = &self.windows[&self.focus];
+        let cwd = win.active_tab().working_dir();
+        if let Ok(tab) = Tab::spawn_argv(win.content_rect(), cwd, &argv, self.tx.clone()) {
+            self.push_tab(tab);
+        }
+    }
+
+    /// Appends `tab` to the focused window and makes it active.
+    fn push_tab(&mut self, tab: Tab) {
         let win = self
             .windows
             .get_mut(&self.focus)
             .expect("focused window exists");
-        let cwd = win.active_tab().working_dir();
-        let Ok(tab) = Tab::spawn(win.content_rect(), cwd, self.tx.clone()) else {
-            return;
-        };
         win.tabs.push(tab);
         win.active = win.tabs.len() - 1;
         self.drop_selection_in(self.focus);
@@ -1779,6 +1833,7 @@ impl Session {
         let now = Instant::now();
         let yanked = self.yanked.clone();
         let palette = self.config.palette;
+        let animation = self.config.progress_animation;
         // An active tab is in view, so its activity has been seen.
         for win in self.windows.values_mut() {
             win.active_tab_mut().activity = None;
@@ -1862,19 +1917,30 @@ impl Session {
             let status = tabs
                 .get(active)
                 .and_then(|badge| badge.agent.as_ref())
-                .map(|visual| (visual.status, visual.anim));
+                .map(|visual| (visual.status, visual.anim, visual.age));
             let rule = match (progress, status) {
                 // A program with no agent status still reports progress
                 // on work in flight.
                 (Some(percent), status) => Rule::Progress {
                     percent,
-                    color: palette.status(status.map_or(agent::Status::Working, |(s, _)| s)),
+                    color: palette.status(status.map_or(agent::Status::Working, |(s, ..)| s)),
                 },
-                (None, Some((status, Anim::Shimmer))) => Rule::Shimmer {
-                    phase,
-                    color: palette.status(status),
+                (None, Some((status, Anim::Shimmer, age))) => match animation {
+                    ProgressAnimation::Sweep => Rule::Shimmer {
+                        phase: anim::phase(anim::elapsed()),
+                        color: palette.status(status),
+                    },
+                    ProgressAnimation::Flow => Rule::Shimmer {
+                        phase,
+                        color: palette.status(status),
+                    },
+                    ProgressAnimation::Pulse => Rule::Pulse {
+                        brightness: win.active_tab_mut().brightness(now),
+                        takeover: anim::takeover(age),
+                        color: palette.status(status),
+                    },
                 },
-                (None, Some((status, Anim::Breathe))) => Rule::Breathe {
+                (None, Some((status, Anim::Breathe, _))) => Rule::Breathe {
                     color: palette.status(status),
                 },
                 (None, _) => Rule::Plain,
@@ -2195,6 +2261,14 @@ fn render_tab_bar(
                 ('─', anim::shimmer_at(color, i, bar.width as usize, phase))
             }
             Rule::Breathe { color } => ('─', anim::breathe(color, elapsed)),
+            Rule::Pulse {
+                brightness,
+                takeover,
+                color,
+            } => (
+                anim::pulse_glyph(i, elapsed, takeover),
+                anim::flicker(color, i, elapsed, brightness),
+            ),
         };
         (ch, Style::default().fg(color))
     };

@@ -1,4 +1,4 @@
-//! Loads the TOML config file once at startup.
+//! Loads the TOML config file at startup and on `:config-reload`.
 
 use std::path::PathBuf;
 
@@ -16,6 +16,15 @@ pub enum OscTitles {
     All,
 }
 
+/// The working-state animation on a window's tab bar rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ProgressAnimation {
+    Sweep,
+    Flow,
+    #[default]
+    Pulse,
+}
+
 pub struct Config {
     pub keys: KeyTable,
     /// Restore persisted sessions at startup. Saving happens either way.
@@ -27,6 +36,7 @@ pub struct Config {
     /// Yank a drag selection to the system clipboard on release.
     pub copy_on_select: bool,
     pub osc_titles: OscTitles,
+    pub progress_animation: ProgressAnimation,
     pub palette: Palette,
     /// Darken every window but the focused one.
     pub dim_unfocused: bool,
@@ -43,6 +53,7 @@ impl Default for Config {
             automode: false,
             copy_on_select: true,
             osc_titles: OscTitles::default(),
+            progress_animation: ProgressAnimation::default(),
             palette: Palette::default(),
             dim_unfocused: true,
             shadows: false,
@@ -50,7 +61,7 @@ impl Default for Config {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
+pub fn path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
@@ -58,29 +69,30 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("lux").join("config.toml"))
 }
 
+/// The startup load: a file that can't be read or parsed yields defaults.
 pub fn load() -> Config {
-    let Some(path) = config_path() else {
-        return Config::default();
+    reload().unwrap_or_else(|err| {
+        eprintln!("lux: {err}");
+        Config::default()
+    })
+}
+
+/// Reads the file afresh, failing rather than falling back so a running
+/// server can keep the config it has.
+pub fn reload() -> Result<Config, String> {
+    let Some(path) = path() else {
+        return Ok(Config::default());
     };
     match std::fs::read_to_string(&path) {
         // No config file is not an error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
-        Err(err) => {
-            eprintln!("lux: {}: {err}", path.display());
-            Config::default()
-        }
-        Ok(text) => from_toml(&text, &path.display().to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(err) => Err(format!("{}: {err}", path.display())),
+        Ok(text) => parse(&text, &path.display().to_string()),
     }
 }
 
-fn from_toml(text: &str, origin: &str) -> Config {
-    let doc: toml::Table = match toml::from_str(text) {
-        Ok(doc) => doc,
-        Err(err) => {
-            eprintln!("lux: {origin}: {err}");
-            return Config::default();
-        }
-    };
+fn parse(text: &str, origin: &str) -> Result<Config, String> {
+    let doc: toml::Table = toml::from_str(text).map_err(|err| format!("{origin}: {err}"))?;
     let mut config = Config::default();
     if let Some(value) = doc.get("prefix") {
         match value.as_str().and_then(parse_key_spec) {
@@ -120,6 +132,14 @@ fn from_toml(text: &str, origin: &str) -> Config {
             _ => eprintln!("lux: {origin}: invalid osc-titles value {value}"),
         }
     }
+    if let Some(value) = doc.get("progress-animation") {
+        match value.as_str() {
+            Some("sweep") => config.progress_animation = ProgressAnimation::Sweep,
+            Some("flow") => config.progress_animation = ProgressAnimation::Flow,
+            Some("pulse") => config.progress_animation = ProgressAnimation::Pulse,
+            _ => eprintln!("lux: {origin}: invalid progress-animation value {value}"),
+        }
+    }
     if let Some(value) = doc.get("palette") {
         match value.as_str().and_then(Palette::named) {
             Some(palette) => config.palette = palette,
@@ -138,7 +158,7 @@ fn from_toml(text: &str, origin: &str) -> Config {
             None => eprintln!("lux: {origin}: invalid shadows value {value}"),
         }
     }
-    config
+    Ok(config)
 }
 
 /// A single character, optionally prefixed with `C-` for Ctrl.
@@ -163,8 +183,18 @@ fn parse_key_spec(spec: &str) -> Option<KeyMatch> {
 mod tests {
     use super::*;
 
+    fn from_toml(text: &str, origin: &str) -> Config {
+        parse(text, origin).unwrap_or_default()
+    }
+
     fn table(text: &str) -> KeyTable {
         from_toml(text, "test").keys
+    }
+
+    #[test]
+    fn malformed_toml_is_an_error() {
+        assert!(parse("prefix = [broken", "test").is_err());
+        assert!(parse("", "test").is_ok());
     }
 
     #[test]
@@ -238,6 +268,29 @@ mod tests {
             from_toml("osc-titles = true", "test").osc_titles,
             OscTitles::Agents
         );
+    }
+
+    #[test]
+    fn progress_animation_option_parses_and_defaults_to_pulse() {
+        let parse = |text: &str| from_toml(text, "test").progress_animation;
+        assert_eq!(parse(""), ProgressAnimation::Pulse);
+        assert_eq!(
+            parse("progress-animation = \"sweep\""),
+            ProgressAnimation::Sweep
+        );
+        assert_eq!(
+            parse("progress-animation = \"flow\""),
+            ProgressAnimation::Flow
+        );
+        assert_eq!(
+            parse("progress-animation = \"pulse\""),
+            ProgressAnimation::Pulse
+        );
+        assert_eq!(
+            parse("progress-animation = \"bounce\""),
+            ProgressAnimation::Pulse
+        );
+        assert_eq!(parse("progress-animation = 2"), ProgressAnimation::Pulse);
     }
 
     #[test]

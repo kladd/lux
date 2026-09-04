@@ -560,12 +560,18 @@ impl Tracker {
             (AgentState::Idle, false) => ("done", Status::Done, Anim::None),
             (AgentState::Idle, true) => ("idle", Status::Idle, Anim::None),
         };
+        let age = now.duration_since(self.since);
         let text = if self.animated() {
-            format!("[{state} {}]", elapsed_text(now.duration_since(self.since)))
+            format!("[{state} {}]", elapsed_text(age))
         } else {
             format!("[{state}]")
         };
-        Visual { text, status, anim }
+        Visual {
+            text,
+            status,
+            anim,
+            age,
+        }
     }
 }
 
@@ -586,6 +592,8 @@ pub struct Visual {
     pub text: String,
     pub status: Status,
     pub anim: Anim,
+    /// Time in the current state.
+    pub age: Duration,
 }
 
 #[cfg(test)]

@@ -99,6 +99,8 @@ Ex commands (typed after `:`, with autocomplete):
 - `:rename-session <name>` — rename the current session
 - `:kill-session [name]` — kill the named session, or the current one
   without an argument
+- `:config-open` — open the config file in a new tab running `$EDITOR`
+- `:config-reload` — re-read the config file and apply it to every session
 
 ### Navigating sessions
 
@@ -144,9 +146,10 @@ now" — with a list of tabs still working underneath.
 ## Configuration
 
 Lux reads `$XDG_CONFIG_HOME/lux/config.toml` (falling back to
-`~/.config/lux/config.toml`) at startup. A missing file is fine; a malformed
-one falls back to defaults and prints an error to stderr. The keybinding
-table itself is not configurable:
+`~/.config/lux/config.toml`) at startup and again on `:config-reload`. A
+missing file is fine. A malformed one prints an error to stderr: at startup
+lux falls back to defaults, and on reload every session keeps the settings
+it has. The keybinding table itself is not configurable:
 
 ```toml
 # ~/.config/lux/config.toml
@@ -156,6 +159,7 @@ notify = false   # no desktop notifications for Claude Code tabs
 automode = true  # CLAUDECOM opens auto mode instead of the grid
 copy-on-select = false   # selections yank only on right-click
 osc-titles = "all"       # which tabs are named by the program's OSC title
+progress-animation = "flow"  # the tab bar rule's working animation
 palette = "default"      # the interface color set
 dim-unfocused = false    # leave unfocused windows at full brightness
 shadows = true           # popovers cast a shadow on the content beneath
@@ -168,6 +172,15 @@ for Ctrl.
 by hand is named after its foreground process; where the option allows it,
 a window title the program sets with OSC 0/2 replaces that name. Agent tabs
 use the title by default; a Claude Code session name outranks it.
+
+`progress-animation` is `sweep`, `flow`, or `pulse` (the default) and picks
+what the focused tab bar's rule does while its tab is working and reports
+no progress percentage. `sweep` runs the shimmer at a fixed pace; `flow`
+paces it by the tab's output rate and holds it still when output stops;
+`pulse` lets braille glyphs take the rule over as work starts, each cell
+flickering at its own random brightness and reselecting its pattern as it
+goes, the whole rule brighter the more output the tab produces and dim
+when it stops.
 
 `palette` names the color set lux draws its own chrome in: agent status,
 tab bars, the status line, selections, and popovers. Only `default` exists
