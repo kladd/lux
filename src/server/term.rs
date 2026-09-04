@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter};
 
-use ratatui::backend::{Backend, CrosstermBackend, WindowSize};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::crossterm::cursor::Hide;
 use ratatui::crossterm::queue;
@@ -46,6 +46,8 @@ impl FdBackend {
 }
 
 impl Backend for FdBackend {
+    type Error = io::Error;
+
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -75,6 +77,11 @@ impl Backend for FdBackend {
     fn clear(&mut self) -> io::Result<()> {
         self.begin_sync()?;
         self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        self.begin_sync()?;
+        self.inner.clear_region(clear_type)
     }
 
     fn size(&self) -> io::Result<Size> {

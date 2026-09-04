@@ -16,13 +16,21 @@ pub enum OscTitles {
     All,
 }
 
-/// The working-state animation on a window's tab bar rule.
+/// The glyph a window's tab bar rule is drawn with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum ProgressAnimation {
-    Sweep,
-    Flow,
+pub enum RuleStyle {
     #[default]
-    Pulse,
+    Rule,
+    Dots,
+}
+
+impl RuleStyle {
+    pub fn glyph(self) -> char {
+        match self {
+            RuleStyle::Rule => '─',
+            RuleStyle::Dots => '⠶',
+        }
+    }
 }
 
 pub struct Config {
@@ -36,12 +44,16 @@ pub struct Config {
     /// Yank a drag selection to the system clipboard on release.
     pub copy_on_select: bool,
     pub osc_titles: OscTitles,
-    pub progress_animation: ProgressAnimation,
+    pub rule_style: RuleStyle,
     pub palette: Palette,
     /// Darken every window but the focused one.
     pub dim_unfocused: bool,
     /// Popovers cast a shadow on the content beneath them.
     pub shadows: bool,
+    /// Animate splits, window removal, and maximize.
+    pub layout_transitions: bool,
+    /// Materialize the first frame after a client attaches.
+    pub attach_transition: bool,
 }
 
 impl Default for Config {
@@ -53,10 +65,12 @@ impl Default for Config {
             automode: false,
             copy_on_select: true,
             osc_titles: OscTitles::default(),
-            progress_animation: ProgressAnimation::default(),
+            rule_style: RuleStyle::default(),
             palette: Palette::default(),
             dim_unfocused: true,
             shadows: false,
+            layout_transitions: true,
+            attach_transition: true,
         }
     }
 }
@@ -132,12 +146,11 @@ fn parse(text: &str, origin: &str) -> Result<Config, String> {
             _ => eprintln!("lux: {origin}: invalid osc-titles value {value}"),
         }
     }
-    if let Some(value) = doc.get("progress-animation") {
+    if let Some(value) = doc.get("rule-style") {
         match value.as_str() {
-            Some("sweep") => config.progress_animation = ProgressAnimation::Sweep,
-            Some("flow") => config.progress_animation = ProgressAnimation::Flow,
-            Some("pulse") => config.progress_animation = ProgressAnimation::Pulse,
-            _ => eprintln!("lux: {origin}: invalid progress-animation value {value}"),
+            Some("rule") => config.rule_style = RuleStyle::Rule,
+            Some("dots") => config.rule_style = RuleStyle::Dots,
+            _ => eprintln!("lux: {origin}: invalid rule-style value {value}"),
         }
     }
     if let Some(value) = doc.get("palette") {
@@ -156,6 +169,18 @@ fn parse(text: &str, origin: &str) -> Result<Config, String> {
         match value.as_bool() {
             Some(shadows) => config.shadows = shadows,
             None => eprintln!("lux: {origin}: invalid shadows value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("layout-transitions") {
+        match value.as_bool() {
+            Some(animate) => config.layout_transitions = animate,
+            None => eprintln!("lux: {origin}: invalid layout-transitions value {value}"),
+        }
+    }
+    if let Some(value) = doc.get("attach-transition") {
+        match value.as_bool() {
+            Some(animate) => config.attach_transition = animate,
+            None => eprintln!("lux: {origin}: invalid attach-transition value {value}"),
         }
     }
     Ok(config)
@@ -271,26 +296,31 @@ mod tests {
     }
 
     #[test]
-    fn progress_animation_option_parses_and_defaults_to_pulse() {
-        let parse = |text: &str| from_toml(text, "test").progress_animation;
-        assert_eq!(parse(""), ProgressAnimation::Pulse);
-        assert_eq!(
-            parse("progress-animation = \"sweep\""),
-            ProgressAnimation::Sweep
-        );
-        assert_eq!(
-            parse("progress-animation = \"flow\""),
-            ProgressAnimation::Flow
-        );
-        assert_eq!(
-            parse("progress-animation = \"pulse\""),
-            ProgressAnimation::Pulse
-        );
-        assert_eq!(
-            parse("progress-animation = \"bounce\""),
-            ProgressAnimation::Pulse
-        );
-        assert_eq!(parse("progress-animation = 2"), ProgressAnimation::Pulse);
+    fn rule_style_option_parses_and_defaults_to_rule() {
+        let parse = |text: &str| from_toml(text, "test").rule_style;
+        assert_eq!(parse(""), RuleStyle::Rule);
+        assert_eq!(parse("rule-style = \"rule\""), RuleStyle::Rule);
+        assert_eq!(parse("rule-style = \"dots\""), RuleStyle::Dots);
+        assert_eq!(parse("rule-style = \"dashes\""), RuleStyle::Rule);
+        assert_eq!(parse("rule-style = 2"), RuleStyle::Rule);
+        assert_eq!(RuleStyle::Rule.glyph(), '─');
+        assert_eq!(RuleStyle::Dots.glyph(), '\u{2836}');
+    }
+
+    #[test]
+    fn layout_transitions_option_parses_and_defaults_on() {
+        assert!(from_toml("", "test").layout_transitions);
+        assert!(from_toml("layout-transitions = true", "test").layout_transitions);
+        assert!(!from_toml("layout-transitions = false", "test").layout_transitions);
+        assert!(from_toml("layout-transitions = \"no\"", "test").layout_transitions);
+    }
+
+    #[test]
+    fn attach_transition_option_parses_and_defaults_on() {
+        assert!(from_toml("", "test").attach_transition);
+        assert!(from_toml("attach-transition = true", "test").attach_transition);
+        assert!(!from_toml("attach-transition = false", "test").attach_transition);
+        assert!(from_toml("attach-transition = \"no\"", "test").attach_transition);
     }
 
     #[test]

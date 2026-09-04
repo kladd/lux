@@ -171,6 +171,18 @@ pub fn remove_leaf(node: Node, target: WindowId) -> Option<Node> {
     }
 }
 
+/// The split directly above `id`'s leaf, and which side the leaf is on.
+pub fn parent_split(node: &Node, id: WindowId) -> Option<(SplitKind, Side)> {
+    let Node::Split(s) = node else { return None };
+    if matches!(*s.first, Node::Leaf(leaf) if leaf == id) {
+        return Some((s.kind, Side::First));
+    }
+    if matches!(*s.second, Node::Leaf(leaf) if leaf == id) {
+        return Some((s.kind, Side::Second));
+    }
+    parent_split(&s.first, id).or_else(|| parent_split(&s.second, id))
+}
+
 /// Nudge the boundary on `focused`'s `dir` side by one cell. Returns false
 /// when no split has a sibling on that side.
 pub fn resize_toward(node: &mut Node, area: Rect, focused: WindowId, dir: Dir) -> bool {
@@ -454,6 +466,27 @@ mod tests {
     }
 
     #[test]
+    fn parent_split_names_the_leafs_split_and_side() {
+        let mut tree = Node::Leaf(1);
+        assert_eq!(parent_split(&tree, 1), None);
+        split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
+        split_leaf(&mut tree, 2, SplitKind::Stacked, 3);
+        assert_eq!(
+            parent_split(&tree, 1),
+            Some((SplitKind::SideBySide, Side::First))
+        );
+        assert_eq!(
+            parent_split(&tree, 2),
+            Some((SplitKind::Stacked, Side::First))
+        );
+        assert_eq!(
+            parent_split(&tree, 3),
+            Some((SplitKind::Stacked, Side::Second))
+        );
+        assert_eq!(parent_split(&tree, 4), None);
+    }
+
+    #[test]
     fn compute_covers_all_leaves_without_overlap() {
         let mut tree = Node::Leaf(1);
         split_leaf(&mut tree, 1, SplitKind::SideBySide, 2);
@@ -461,9 +494,9 @@ mod tests {
         let (rects, seps) = compute(&tree, area());
         assert_eq!(rects.len(), 3);
         assert_eq!(seps.len(), 1);
-        let cells: u32 = rects.iter().map(|(_, r)| r.area() as u32).sum::<u32>()
-            + seps.iter().map(|s| s.rect.area() as u32).sum::<u32>();
-        assert_eq!(cells, area().area() as u32);
+        let cells: u32 = rects.iter().map(|(_, r)| r.area()).sum::<u32>()
+            + seps.iter().map(|s| s.rect.area()).sum::<u32>();
+        assert_eq!(cells, area().area());
     }
 
     #[test]

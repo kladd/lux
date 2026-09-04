@@ -2,11 +2,13 @@
 
 ## 2026-09-03
 
-- Configuration `progress-animation` (`sweep`, `flow`, or `pulse`; default
-  `pulse`) selects the tab bar rule's working animation; `pulse` fades in
-  a shifting braille texture that brightens with the tab's output.
-- `:config-open` edits the config file in a new `$EDITOR` tab, and
-  `:config-reload` applies it to every running session.
+- Configuration `rule-style` draws the tab bar rule as a dash (default) or
+  a braille dot line.
+- The tab bar rule's working shimmer runs at the status text's pace rather
+  than the tab's output rate.
+- `:config-open` edits the config file in a new `$EDITOR` tab (vim fallback),
+  and `:config-reload` applies it to every running session.
+- Updated dependencies.
 
 ## 2026-09-02
 

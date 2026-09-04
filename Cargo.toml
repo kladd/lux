@@ -12,28 +12,31 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 base64 = "0.22"
 # Local wall-clock for the session status line.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-ratatui = "0.29"
+ratatui = "0.30"
+# One-shot transitions: timed, eased, self-removing effects over the
+# rendered frame.
+tachyonfx = { version = "0.25", default-features = false, features = ["std", "std-duration"] }
 # Detection rule matchers.
 regex = "1"
 # Unix plumbing for the server/client split: winsize ioctl on passed fds
 #, setsid for daemonize, poll for
 # interruptible client-input reads, uname for the status-line hostname
 #.
-rustix = { version = "0.38", features = ["termios", "process", "event", "system"] }
+rustix = { version = "1", features = ["termios", "process", "event", "system"] }
 # SCM_RIGHTS fd passing over the attach socket.
 sendfd = "0.4"
 # Session persistence snapshots.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # SIGWINCH relay in the client.
-signal-hook = "0.3"
-# Command line editing; 0.7 tracks ratatui 0.29.
-tui-textarea = "0.7"
+signal-hook = "0.4"
+# Command line editing.
+ratatui-textarea = "0.9"
 # preserve_order: resolves duplicate key sequences to the
 # last entry defined in the file, which requires file-order iteration.
-toml = { version = "0.8", features = ["preserve_order"] }
+toml = { version = "1", features = ["preserve_order"] }
 # wezterm crates pinned to a single commit; termwiz must be
 # the same rev because its types appear in wezterm-term's public API.
-portable-pty = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }
-termwiz = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }
-wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "59d94d19f5275e36f8d5ed37d61395b5e6d938b6" }
+portable-pty = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047" }
+termwiz = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047" }
+wezterm-term = { git = "https://github.com/wezterm/wezterm", rev = "4fbd6b8e90e2326b8e25c589768f98bd71ddd047" }

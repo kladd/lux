@@ -159,10 +159,12 @@ notify = false   # no desktop notifications for Claude Code tabs
 automode = true  # CLAUDECOM opens auto mode instead of the grid
 copy-on-select = false   # selections yank only on right-click
 osc-titles = "all"       # which tabs are named by the program's OSC title
-progress-animation = "flow"  # the tab bar rule's working animation
+rule-style = "dots"      # draw tab bar rules as braille dots
 palette = "default"      # the interface color set
 dim-unfocused = false    # leave unfocused windows at full brightness
 shadows = true           # popovers cast a shadow on the content beneath
+layout-transitions = false  # snap splits, closes, and maximize into place
+attach-transition = false   # draw the first frame after attaching at once
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`
@@ -173,21 +175,27 @@ by hand is named after its foreground process; where the option allows it,
 a window title the program sets with OSC 0/2 replaces that name. Agent tabs
 use the title by default; a Claude Code session name outranks it.
 
-`progress-animation` is `sweep`, `flow`, or `pulse` (the default) and picks
-what the focused tab bar's rule does while its tab is working and reports
-no progress percentage. `sweep` runs the shimmer at a fixed pace; `flow`
-paces it by the tab's output rate and holds it still when output stops;
-`pulse` lets braille glyphs take the rule over as work starts, each cell
-flickering at its own random brightness and reselecting its pattern as it
-goes, the whole rule brighter the more output the tab produces and dim
-when it stops.
+`rule-style` is `rule` (the default) or `dots` and picks the glyph a
+window's tab bar rule is drawn with: a thin dash, or a two-dot braille
+line. Either one shimmers, breathes, fills with progress, and takes the
+status color the same way.
 
 `palette` names the color set lux draws its own chrome in: agent status,
 tab bars, the status line, selections, and popovers. Only `default` exists
 so far. Terminal content always keeps your terminal's own colors.
 
 `dim-unfocused` darkens every window but the focused one and is on by
-default; `shadows` is off by default. Both darken cells. Lux
+default; a window losing focus fades to that shade rather than snapping
+to it. `shadows` is off by default. Both darken cells. Lux
 asks your terminal for its default and ANSI colors when you attach, so a
 dimmed cell keeps its hue; a terminal that doesn't answer is darkened from
 the palette's stand-ins (light grey on black) instead.
+
+`layout-transitions` is on by default: a new split slides into place, a
+closed window slides out as its sibling takes the space, and maximizing
+animates the window between its place in the layout and the full area.
+Set it to `false` to snap instead.
+
+`attach-transition` is on by default: the first frame after attaching
+materializes cell by cell rather than appearing whole. Set it to `false`
+to draw it at once.

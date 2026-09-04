@@ -15,6 +15,7 @@ pub mod palette;
 pub mod persist;
 pub mod session;
 pub mod term;
+pub mod transition;
 pub mod window;
 
 use std::collections::{BTreeMap, HashMap};
@@ -169,19 +170,18 @@ pub fn run() -> i32 {
         server.restore_sessions(&snapshot);
     }
     loop {
-        let event = if server.needs_timed_tick() {
-            match rx.recv_timeout(std::time::Duration::from_millis(60)) {
-                Ok(event) => Some(event),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
-            }
+        let timeout = if server.needs_frame_tick() {
+            FRAME
+        } else if server.needs_timed_tick() {
+            TICK
         } else {
             // Wake at the next minute so the status line clock advances.
-            match rx.recv_timeout(until_next_minute()) {
-                Ok(event) => Some(event),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
-            }
+            until_next_minute()
+        };
+        let event = match rx.recv_timeout(timeout) {
+            Ok(event) => Some(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return 0,
         };
         if let Some(event) = event {
             server.handle(event);
@@ -198,6 +198,10 @@ pub fn run() -> i32 {
 }
 
 const SAVE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Between frames of a running animation.
+const TICK: std::time::Duration = std::time::Duration::from_millis(60);
+/// Between frames of a running transition.
+const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Truncating to whole seconds lands the wake just past the minute
 /// boundary, never before it.
@@ -281,24 +285,30 @@ impl Server {
         self.sessions.values().any(|s| s.has_pending_idle())
     }
 
-    /// The switcher, grid, and blank auto screen show every session, so
-    /// any session's animation counts there.
+    /// Whether a session some client is looking at satisfies `pred`. The
+    /// switcher, grid, and blank auto screen show every session.
+    fn any_shown(&self, pred: impl Fn(&Session) -> bool) -> bool {
+        self.clients.values().any(|c| {
+            if c.switcher.is_some()
+                || c.grid.is_some()
+                || c.auto.is_some_and(|a| a.presented.is_none())
+            {
+                self.sessions.values().any(&pred)
+            } else {
+                self.sessions.get(&c.attached).is_some_and(&pred)
+            }
+        })
+    }
+
     fn needs_timed_tick(&self) -> bool {
         self.has_pending_idle()
             || self.save_deadline.is_some()
             || self.sessions.values().any(|s| s.has_pending_repeat())
-            || self.clients.values().any(|c| {
-                if c.switcher.is_some()
-                    || c.grid.is_some()
-                    || c.auto.is_some_and(|a| a.presented.is_none())
-                {
-                    self.sessions.values().any(|s| s.has_animation())
-                } else {
-                    self.sessions
-                        .get(&c.attached)
-                        .is_some_and(|s| s.has_animation())
-                }
-            })
+            || self.any_shown(Session::has_animation)
+    }
+
+    fn needs_frame_tick(&self) -> bool {
+        self.any_shown(Session::has_transition)
     }
 
     fn tick_agents(&mut self) {
@@ -571,6 +581,7 @@ impl Server {
 
         if let Some(session) = self.sessions.get_mut(&sid) {
             session.set_area(area);
+            session.materialize();
         }
 
         self.clients.insert(
@@ -1021,7 +1032,7 @@ impl Server {
             // or resets to the top.
             _ => {
                 let followed = matched.get(highlight).map(|&i| items[i].id);
-                state.textarea.input(tui_textarea::Input::from(*key));
+                state.textarea.input(ratatui_textarea::Input::from(*key));
                 let matched = find::matches(&items, &state.query());
                 state.highlight = followed
                     .and_then(|id| matched.iter().position(|&i| items[i].id == id))
@@ -1759,6 +1770,10 @@ fn spawn_stdin_reader(
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let idle = rustix::event::Timespec {
+            tv_sec: 0,
+            tv_nsec: 25_000_000,
+        };
         // The first timeout after a burst signals idle exactly once.
         let mut busy = false;
         loop {
@@ -1769,7 +1784,7 @@ fn spawn_stdin_reader(
                 &stdin,
                 rustix::event::PollFlags::IN,
             )];
-            match rustix::event::poll(&mut fds, 25) {
+            match rustix::event::poll(&mut fds, Some(&idle)) {
                 Ok(0) => {
                     if busy {
                         busy = false;

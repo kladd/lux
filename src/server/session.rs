@@ -16,15 +16,15 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
+use ratatui_textarea::TextArea;
 use termwiz::cell::{Blink, CellAttributes, Intensity, Underline};
 use termwiz::color::ColorAttribute;
 use termwiz::input::{KeyCode, Modifiers as KeyModifiers};
 use termwiz::surface::CursorVisibility;
-use tui_textarea::TextArea;
 
 use crate::server::agent;
 use crate::server::anim::{self, Anim};
-use crate::server::config::{self, Config, ProgressAnimation};
+use crate::server::config::{self, Config};
 use crate::server::ex::{self, ExCommand};
 use crate::server::input;
 use crate::server::keys::{Command, KeyMatch, KeyTrie};
@@ -32,6 +32,7 @@ use crate::server::layout::{self, Dir, Node, Separator, Side, SplitKind, WindowI
 use crate::server::palette::{self, Palette};
 use crate::server::persist;
 use crate::server::term::FdBackend;
+use crate::server::transition::{Transitions, Zoom};
 use crate::server::window::{Activity, LastOutput, Notice, Tab, TabId, Window};
 use crate::server::{ServerEvent, SessionId};
 
@@ -176,24 +177,9 @@ struct TabBadge {
 #[derive(Clone, Copy)]
 enum Rule {
     Plain,
-    Progress {
-        percent: u8,
-        color: Color,
-    },
-    Shimmer {
-        phase: f32,
-        color: Color,
-    },
-    Breathe {
-        color: Color,
-    },
-    /// Every cell flickers, `brightness` scaling them all, with braille
-    /// covering the `takeover` share of the rule.
-    Pulse {
-        brightness: f32,
-        takeover: f32,
-        color: Color,
-    },
+    Progress { percent: u8, color: Color },
+    Shimmer { color: Color },
+    Breathe { color: Color },
 }
 
 /// One window's per-frame chrome geometry.
@@ -333,6 +319,7 @@ pub struct Session {
     clock: String,
     next_window_id: WindowId,
     force_redraw: bool,
+    transitions: Transitions,
     tx: Sender<ServerEvent>,
 }
 
@@ -371,6 +358,7 @@ impl Session {
             clock: String::new(),
             next_window_id: 1,
             force_redraw: true,
+            transitions: Transitions::default(),
             tx,
         })
     }
@@ -439,6 +427,7 @@ impl Session {
             clock: String::new(),
             next_window_id,
             force_redraw: true,
+            transitions: Transitions::default(),
             tx,
         })
     }
@@ -517,7 +506,6 @@ impl Session {
         let background = win.active_tab().id != id;
         let tab = win.find_tab_mut(id)?;
         tab.engine.advance_bytes(bytes);
-        tab.note_output(bytes.len(), Instant::now());
         let (mut changed, notice) = tab.refresh_identity(osc_titles);
         let rang = tab.take_bell();
         if background && tab.agent.is_none() {
@@ -590,6 +578,13 @@ impl Session {
 
     pub fn request_redraw(&mut self) {
         self.force_redraw = true;
+    }
+
+    /// Reveals the coming frames gradually, for a client that just attached.
+    pub fn materialize(&mut self) {
+        if self.config.attach_transition {
+            self.transitions.materialize();
+        }
     }
 
     pub fn set_config(&mut self, config: Arc<Config>) {
@@ -732,7 +727,7 @@ impl Session {
                 return;
             }
             self.focus_tab(window, index);
-            self.maximized = Some(window);
+            self.set_maximized(Some(window));
             return;
         }
         self.focus_tab(window, index);
@@ -1174,10 +1169,7 @@ impl Session {
                 }
             }
             Command::SwapDir(dir) => self.swap_dir(dir),
-            Command::Maximize => {
-                self.maximized = (self.maximized != Some(self.focus)).then_some(self.focus);
-                self.force_redraw = true;
-            }
+            Command::Maximize => self.toggle_maximize(self.focus),
             Command::Rotate => {
                 if layout::rotate(&mut self.tree, self.focus) {
                     self.force_redraw = true;
@@ -1248,7 +1240,7 @@ impl Session {
 
     fn open_prompt(&mut self, kind: PromptKind, text: String) {
         let mut textarea = TextArea::from([text]);
-        textarea.move_cursor(tui_textarea::CursorMove::End);
+        textarea.move_cursor(ratatui_textarea::CursorMove::End);
         // The default cursor-line underline looks like stray chrome here.
         textarea.set_cursor_line_style(Style::default());
         self.prompt = Some(Prompt { kind, textarea });
@@ -1299,7 +1291,7 @@ impl Session {
             }
             _ => {
                 let prompt = self.prompt.as_mut().expect("prompt is open");
-                prompt.textarea.input(tui_textarea::Input::from(key));
+                prompt.textarea.input(ratatui_textarea::Input::from(key));
             }
         }
         None
@@ -1359,6 +1351,9 @@ impl Session {
         self.next_window_id += 1;
         self.windows.insert(id, win);
         layout::split_leaf(&mut self.tree, self.focus, kind, id);
+        if self.config.layout_transitions {
+            self.transitions.slide_in(id, kind);
+        }
         self.set_focus(id);
         self.force_redraw = true;
     }
@@ -1371,13 +1366,13 @@ impl Session {
         }
     }
 
-    /// Runs `$EDITOR` on the config file in a new tab.
+    /// Runs `$EDITOR` (falling back to `vim`) on the config file in a new tab.
     fn open_config(&mut self) {
         let editor = std::env::var("EDITOR").unwrap_or_default();
         let mut argv: Vec<&str> = editor.split_whitespace().collect();
-        if argv.is_empty() {
-            self.show_message("$EDITOR is not set".into());
-            return;
+        let fallback = argv.is_empty();
+        if fallback {
+            argv.push("vim");
         }
         let Some(path) = config::path() else {
             return;
@@ -1386,8 +1381,12 @@ impl Session {
         argv.push(&path);
         let win = &self.windows[&self.focus];
         let cwd = win.active_tab().working_dir();
-        if let Ok(tab) = Tab::spawn_argv(win.content_rect(), cwd, &argv, self.tx.clone()) {
-            self.push_tab(tab);
+        match Tab::spawn_argv(win.content_rect(), cwd, &argv, self.tx.clone()) {
+            Ok(tab) => self.push_tab(tab),
+            Err(_) if fallback => {
+                self.show_message("$EDITOR is not set and vim was not found".into());
+            }
+            Err(_) => {}
         }
     }
 
@@ -1502,10 +1501,7 @@ impl Session {
     fn click_control(&mut self, id: WindowId, control: Control) {
         match control {
             Control::Minimize => self.minimize_window(id),
-            Control::Maximize => {
-                self.maximized = (self.maximized != Some(id)).then_some(id);
-                self.force_redraw = true;
-            }
+            Control::Maximize => self.toggle_maximize(id),
             Control::Exit => self.kill_window(id),
         }
     }
@@ -1518,6 +1514,7 @@ impl Session {
         if self.maximized == Some(id) {
             self.maximized = None;
         }
+        self.transitions.forget(id);
         self.drop_selection_in(id);
         if self.focus == id {
             let pos = ids.iter().position(|i| *i == id).unwrap_or(0);
@@ -1573,10 +1570,87 @@ impl Session {
     }
 
     fn set_focus(&mut self, id: WindowId) {
+        if id != self.focus && self.config.dim_unfocused && self.windows.contains_key(&self.focus) {
+            self.transitions
+                .dim(self.focus, self.config.palette, self.term_colors);
+        }
+        self.transitions.undim(id);
         self.focus = id;
         if self.maximized.is_some_and(|m| m != id) {
-            self.maximized = None;
+            self.set_maximized(None);
         }
+    }
+
+    fn toggle_maximize(&mut self, id: WindowId) {
+        self.set_maximized((self.maximized != Some(id)).then_some(id));
+    }
+
+    /// Maximizes `target`, or restores the layout for `None`, animating
+    /// the window's rectangle between the two.
+    fn set_maximized(&mut self, target: Option<WindowId>) {
+        if target == self.maximized {
+            return;
+        }
+        if self.config.layout_transitions {
+            let full = tree_area(self.area);
+            let tree_rect = |s: &Self, id: WindowId| {
+                s.layout_rects()
+                    .iter()
+                    .find(|(w, _)| *w == id)
+                    .map(|(_, rect)| *rect)
+            };
+            // A toggle mid-transition picks up from where the window is.
+            let underway = |s: &Self, id: WindowId| {
+                s.transitions
+                    .zoom_state()
+                    .filter(|z| z.window == id)
+                    .map(Zoom::rect)
+            };
+            match (self.maximized, target) {
+                (None, Some(id)) => {
+                    if let Some(from) = underway(self, id).or_else(|| tree_rect(self, id)) {
+                        self.transitions.zoom(id, from, full, None);
+                    }
+                }
+                (Some(id), None) => {
+                    let from = underway(self, id).unwrap_or(full);
+                    if let (Some(to), Some(snapshot)) =
+                        (tree_rect(self, id), self.snapshot_window(id))
+                    {
+                        self.transitions.zoom(id, from, to, Some(snapshot));
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.maximized = target;
+        self.force_redraw = true;
+    }
+
+    /// The window as drawn this frame: content, tab bar, and shade.
+    fn snapshot_window(&self, id: WindowId) -> Option<Buffer> {
+        let win = self.windows.get(&id)?;
+        let mut buf = Buffer::empty(win.rect);
+        render_window(win, &self.config.palette, &mut buf);
+        if let Some(chrome) = self.view.chrome.iter().find(|c| c.window == id) {
+            render_tab_bar(
+                chrome,
+                self.focus,
+                &self.config,
+                &mut buf,
+                self.view.elapsed,
+            );
+        }
+        if self.config.dim_unfocused && id != self.focus {
+            palette::shade(
+                &mut buf,
+                win.rect,
+                &self.config.palette,
+                &self.term_colors,
+                palette::DIM,
+            );
+        }
+        Some(buf)
     }
 
     /// From the tree, ignoring the maximized override.
@@ -1692,13 +1766,23 @@ impl Session {
             self.force_redraw = true;
             return None;
         }
+        let snapshot = self.departure_snapshot(win_id);
         let mut win = self.windows.remove(&win_id).expect("window exists");
         win.tabs.pop().expect("last tab exists").wait();
-        self.collapse_window(win_id)
+        self.collapse_window(win_id, snapshot)
+    }
+
+    /// The window's last frame, for sliding out of the layout.
+    fn departure_snapshot(&self, id: WindowId) -> Option<Buffer> {
+        self.config
+            .layout_transitions
+            .then(|| self.snapshot_window(id))
+            .flatten()
     }
 
     /// The window must already be out of `windows`.
-    fn collapse_window(&mut self, win_id: WindowId) -> Option<Effect> {
+    fn collapse_window(&mut self, win_id: WindowId, snapshot: Option<Buffer>) -> Option<Effect> {
+        self.transitions.forget(win_id);
         if self.windows.is_empty() {
             return Some(Effect::Ended);
         }
@@ -1719,10 +1803,18 @@ impl Session {
             self.force_redraw = true;
             return None;
         }
+        if self.maximized == Some(win_id) {
+            self.maximized = None;
+        }
         // Refocus before the leaf leaves the tree.
         if self.focus == win_id {
             let pos = ids.iter().position(|i| *i == win_id).unwrap_or(0);
             self.set_focus(ids[(pos + 1) % ids.len()]);
+        }
+        if let (Some(snapshot), Some((kind, side))) =
+            (snapshot, layout::parent_split(&self.tree, win_id))
+        {
+            self.transitions.slide_out(snapshot, kind, side);
         }
         let tree = std::mem::replace(&mut self.tree, Node::Leaf(self.focus));
         if let Some(tree) = layout::remove_leaf(tree, win_id) {
@@ -1748,9 +1840,10 @@ impl Session {
             self.force_redraw = true;
             return Some((tab, false));
         }
+        let snapshot = self.departure_snapshot(win_id);
         let mut win = self.windows.remove(&win_id).expect("window exists");
         let tab = win.tabs.pop().expect("last tab exists");
-        let ended = matches!(self.collapse_window(win_id), Some(Effect::Ended));
+        let ended = matches!(self.collapse_window(win_id, snapshot), Some(Effect::Ended));
         self.force_redraw = true;
         Some((tab, ended))
     }
@@ -1782,9 +1875,14 @@ impl Session {
             })
     }
 
+    pub fn has_transition(&self) -> bool {
+        self.transitions.running()
+    }
+
     /// The indicator always shimmers, so it counts on its own.
     pub fn has_animation(&self) -> bool {
         self.indicator.is_some()
+            || self.transitions.running()
             || self.windows.values().any(|w| {
                 !self.minimized.contains(&w.id)
                     && w.tabs
@@ -1826,14 +1924,26 @@ impl Session {
     }
 
     fn compute_view(&mut self) {
-        let (rects, separators) = match self.maximized {
-            Some(id) => (vec![(id, tree_area(self.area))], Vec::new()),
-            None => layout::compute(&self.tree, tree_area(self.area)),
-        };
         let now = Instant::now();
+        self.transitions.tick(now);
+        let tree = tree_area(self.area);
+        let zooming = self.transitions.zoom_state().map(|z| z.window);
+        let (rects, separators) = match self.maximized {
+            Some(id) if zooming != Some(id) => (vec![(id, tree)], Vec::new()),
+            // The rest stay laid out under a window growing to full size.
+            Some(id) => {
+                let (mut rects, separators) = layout::compute(&self.tree, tree);
+                for (win, rect) in &mut rects {
+                    if *win == id {
+                        *rect = tree;
+                    }
+                }
+                (rects, separators)
+            }
+            None => layout::compute(&self.tree, tree),
+        };
         let yanked = self.yanked.clone();
         let palette = self.config.palette;
-        let animation = self.config.progress_animation;
         // An active tab is in view, so its activity has been seen.
         for win in self.windows.values_mut() {
             win.active_tab_mut().activity = None;
@@ -1851,7 +1961,6 @@ impl Session {
             {
                 tracker.mark_seen();
             }
-            let phase = win.active_tab_mut().advance_shimmer(now);
             let progress = win.active_tab().progress();
             let active = win.active;
             let bar = win.tab_bar_rect();
@@ -1917,30 +2026,18 @@ impl Session {
             let status = tabs
                 .get(active)
                 .and_then(|badge| badge.agent.as_ref())
-                .map(|visual| (visual.status, visual.anim, visual.age));
+                .map(|visual| (visual.status, visual.anim));
             let rule = match (progress, status) {
                 // A program with no agent status still reports progress
                 // on work in flight.
                 (Some(percent), status) => Rule::Progress {
                     percent,
-                    color: palette.status(status.map_or(agent::Status::Working, |(s, ..)| s)),
+                    color: palette.status(status.map_or(agent::Status::Working, |(s, _)| s)),
                 },
-                (None, Some((status, Anim::Shimmer, age))) => match animation {
-                    ProgressAnimation::Sweep => Rule::Shimmer {
-                        phase: anim::phase(anim::elapsed()),
-                        color: palette.status(status),
-                    },
-                    ProgressAnimation::Flow => Rule::Shimmer {
-                        phase,
-                        color: palette.status(status),
-                    },
-                    ProgressAnimation::Pulse => Rule::Pulse {
-                        brightness: win.active_tab_mut().brightness(now),
-                        takeover: anim::takeover(age),
-                        color: palette.status(status),
-                    },
+                (None, Some((status, Anim::Shimmer))) => Rule::Shimmer {
+                    color: palette.status(status),
                 },
-                (None, Some((status, Anim::Breathe, _))) => Rule::Breathe {
+                (None, Some((status, Anim::Breathe))) => Rule::Breathe {
                     color: palette.status(status),
                 },
                 (None, _) => Rule::Plain,
@@ -2060,27 +2157,51 @@ impl Session {
     }
 
     /// Draws from `self.view` and engine state only, with no geometry math.
-    fn render_to_buffer(&self, buf: &mut Buffer) {
-        let palette = &self.config.palette;
+    fn render_to_buffer(&mut self, buf: &mut Buffer) {
+        let config = &self.config;
+        let palette = &config.palette;
         let colors = &self.term_colors;
+        let transitions = &mut self.transitions;
+        let zooming = transitions.zoom_state().map(|z| z.window);
+        let hidden = |id: WindowId| {
+            self.minimized.contains(&id)
+                || self
+                    .maximized
+                    .is_some_and(|m| m != id && zooming != Some(m))
+        };
         for win in self.windows.values() {
-            if self.maximized.is_some_and(|id| id != win.id) || self.minimized.contains(&win.id) {
+            if hidden(win.id) {
                 continue;
             }
-            let tab = win.active_tab();
-            render_tab(tab, buf);
-            if self.config.dim_unfocused && win.id != self.focus {
-                palette::shade(buf, win.content_rect(), palette, colors, palette::DIM);
-            }
-            if let Some(metrics) = tab.scroll_metrics() {
-                render_scrollbar(win.content_rect(), metrics, palette, buf);
+            match transitions.live(win.id) {
+                Some(frame) => {
+                    let mut frame = frame.borrow_mut();
+                    *frame = Buffer::empty(win.rect);
+                    render_window(win, palette, &mut frame);
+                }
+                None => render_window(win, palette, buf),
             }
         }
         for chrome in &self.view.chrome {
-            let dim = self.config.dim_unfocused;
-            render_tab_bar(chrome, self.focus, dim, palette, buf, self.view.elapsed);
-            if dim && chrome.window != self.focus {
-                palette::shade(buf, chrome.tab_bar, palette, colors, palette::DIM);
+            let Some(win) = self.windows.get(&chrome.window) else {
+                continue;
+            };
+            let unfocused = config.dim_unfocused && chrome.window != self.focus;
+            let frame = transitions.live(chrome.window);
+            let mut paint = |buf: &mut Buffer| {
+                render_tab_bar(chrome, self.focus, config, buf, self.view.elapsed);
+                if unfocused {
+                    match transitions.dim_mut(chrome.window) {
+                        Some(fade) => {
+                            fade.process(Duration::ZERO, buf, win.rect);
+                        }
+                        None => palette::shade(buf, win.rect, palette, colors, palette::DIM),
+                    }
+                }
+            };
+            match frame {
+                Some(frame) => paint(&mut frame.borrow_mut()),
+                None => paint(buf),
             }
         }
         if let Some(sel) = &self.selection
@@ -2092,6 +2213,7 @@ impl Session {
         for sep in &self.view.separators {
             render_separator(sep, palette, buf);
         }
+        transitions.overlay(buf);
         if let Some(status) = &self.view.status {
             render_status(status, palette, self.view.elapsed, buf);
         }
@@ -2103,22 +2225,37 @@ impl Session {
             if let Some(prompt) = &self.prompt {
                 prompt.textarea.render(chrome.input, buf);
             }
-            if self.config.shadows {
+            if config.shadows {
                 palette::shadow(buf, chrome.input, self.area, palette, colors);
             }
         }
         if let Some(hints) = &self.view.hints {
             render_hints(hints, palette, buf);
-            if self.config.shadows {
+            if config.shadows {
                 palette::shadow(buf, hints.rect, self.area, palette, colors);
             }
         }
+        transitions.reveal(buf);
+        if transitions.prune() {
+            self.force_redraw = true;
+        }
     }
 
-    fn render(&self, frame: &mut Frame) {
+    fn render(&mut self, frame: &mut Frame) {
         self.render_to_buffer(frame.buffer_mut());
         // The prompt's textarea draws its own cursor.
         if self.prompt.is_some() {
+            return;
+        }
+        // A window still sliding or zooming into place, or a frame still
+        // materializing, has no settled cursor cell.
+        if self.transitions.materializing()
+            || self.transitions.live(self.focus).is_some()
+            || self
+                .transitions
+                .zoom_state()
+                .is_some_and(|z| z.window == self.focus)
+        {
             return;
         }
         // The engine cursor belongs to the live view, so a scrolled tab
@@ -2209,12 +2346,20 @@ fn truncate_name(name: &str, width: usize) -> String {
     out
 }
 
+/// A window's active tab and, in scroll mode, its scrollbar.
+fn render_window(win: &Window, palette: &Palette, buf: &mut Buffer) {
+    let tab = win.active_tab();
+    render_tab(tab, buf);
+    if let Some(metrics) = tab.scroll_metrics() {
+        render_scrollbar(win.content_rect(), metrics, palette, buf);
+    }
+}
+
 /// Rule brightness marks window focus.
 fn render_tab_bar(
     chrome: &Chrome,
     focus: WindowId,
-    dim_unfocused: bool,
-    palette: &Palette,
+    config: &Config,
     buf: &mut Buffer,
     elapsed: Duration,
 ) {
@@ -2222,10 +2367,12 @@ fn render_tab_bar(
     if bar.height == 0 || bar.width == 0 {
         return;
     }
+    let palette = &config.palette;
+    let glyph = config.rule_style.glyph();
     let focused = chrome.window == focus;
     // With dimming on, the shade marks focus, so an unfocused rule keeps
     // its animation.
-    let animated = focused || dim_unfocused;
+    let animated = focused || config.dim_unfocused;
     let plain = if focused { palette.text } else { palette.dim };
     let badges_end = chrome.controls.map_or(bar.right(), |c| c.x);
     let mut x = bar.x;
@@ -2244,31 +2391,23 @@ fn render_tab_bar(
     // whole width.
     let rule_at = |x: u16| -> (char, Style) {
         if !animated {
-            return ('─', Style::default().fg(plain));
+            return (glyph, Style::default().fg(plain));
         }
         let i = (x - bar.x) as usize;
         let (ch, color) = match chrome.rule {
-            Rule::Plain => ('─', plain),
+            Rule::Plain => (glyph, plain),
             Rule::Progress { percent, color } => {
                 let filled = (bar.width as usize * percent as usize + 50) / 100;
                 if i < filled {
                     ('━', color)
                 } else {
-                    ('─', plain)
+                    (glyph, plain)
                 }
             }
-            Rule::Shimmer { phase, color } => {
-                ('─', anim::shimmer_at(color, i, bar.width as usize, phase))
+            Rule::Shimmer { color } => {
+                (glyph, anim::shimmer(color, i, bar.width as usize, elapsed))
             }
-            Rule::Breathe { color } => ('─', anim::breathe(color, elapsed)),
-            Rule::Pulse {
-                brightness,
-                takeover,
-                color,
-            } => (
-                anim::pulse_glyph(i, elapsed, takeover),
-                anim::flicker(color, i, elapsed, brightness),
-            ),
+            Rule::Breathe { color } => (glyph, anim::breathe(color, elapsed)),
         };
         (ch, Style::default().fg(color))
     };

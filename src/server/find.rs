@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Widget};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use crate::server::config::Config;
 use crate::server::grid;
