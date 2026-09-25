@@ -155,6 +155,29 @@ fn forward_mouse(tab: &mut Tab, mouse: &CtMouseEvent, content: Rect) {
     });
 }
 
+/// Returns whether the wheel scrolled lux's own view of the tab rather
+/// than going to the program.
+fn wheel(tab: &mut Tab, mouse: &CtMouseEvent, content: Rect) -> bool {
+    // On the alternate screen the engine turns wheel ticks into arrow
+    // keys.
+    if tab.mouse_grabbed() || tab.engine.is_alt_screen_active() {
+        forward_mouse(tab, mouse, content);
+        return false;
+    }
+    tab.enter_scroll_mode();
+    let delta = if mouse.kind == CtMouseKind::ScrollUp {
+        -3
+    } else {
+        3
+    };
+    // Reaching the live bottom resumes following, so a stray wheel-down
+    // can't trap the view.
+    if tab.scroll_by(delta) {
+        tab.exit_scroll_mode();
+    }
+    true
+}
+
 fn wz_button(button: CtMouseButton) -> wezterm_term::MouseButton {
     match button {
         CtMouseButton::Left => wezterm_term::MouseButton::Left,
@@ -1017,7 +1040,22 @@ impl Session {
             && let Some(win) = self.windows.get_mut(&window)
             && let Some(tab) = win.tabs.get_mut(index)
         {
+            // Typing into a scrolled-back tab would otherwise go unseen.
+            tab.exit_scroll_mode();
             tab.key_down(code, mods);
+        }
+    }
+
+    /// A wheel tick over a tab drawn at `content`, outside its window.
+    pub fn wheel_to_tab(
+        &mut self,
+        window: WindowId,
+        index: usize,
+        mouse: &CtMouseEvent,
+        content: Rect,
+    ) {
+        if let Some(tab) = self.tab_at_mut(window, index) {
+            wheel(tab, mouse, content);
         }
     }
 
@@ -1342,23 +1380,8 @@ impl Session {
                     return None;
                 }
                 let content = win.content_rect();
-                let tab = win.active_tab_mut();
-                // On the alternate screen the engine turns wheel ticks into
-                // arrow keys.
-                if tab.mouse_grabbed() || tab.engine.is_alt_screen_active() {
-                    forward_mouse(tab, &mouse, content);
+                if !wheel(win.active_tab_mut(), &mouse, content) {
                     return None;
-                }
-                tab.enter_scroll_mode();
-                let delta = if mouse.kind == CtMouseKind::ScrollUp {
-                    -3
-                } else {
-                    3
-                };
-                // Reaching the live bottom resumes following, so a stray
-                // wheel-down can't trap the view.
-                if tab.scroll_by(delta) {
-                    tab.exit_scroll_mode();
                 }
                 self.set_focus(id);
                 self.force_redraw = true;

@@ -1,5 +1,10 @@
 # News
 
+## 2026-10-02
+- Add mouse support to CLAUDECOM. Can be enabled with `grid-mouse = true`.
+  Single click enters capture mode, clicking again while in capture mode 
+  exits it. Double click opens the claude pane.
+
 ## 2026-10-01
 
 - A tab bar too narrow for its tabs scrolls to keep the active tab in view,
