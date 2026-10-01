@@ -93,6 +93,21 @@ pub fn suggestions(text: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// The longest prefix shared by every suggestion, or `None` when nothing
+/// matches.
+pub fn complete(text: &str) -> Option<String> {
+    let matches = suggestions(text);
+    let (first, rest) = matches.split_first()?;
+    let len = rest.iter().fold(first.len(), |len, m| {
+        first[..len]
+            .bytes()
+            .zip(m.bytes())
+            .take_while(|(a, b)| a == b)
+            .count()
+    });
+    Some(first[..len].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +208,22 @@ mod tests {
         assert_eq!(suggestions("w"), vec!["w"]);
         assert_eq!(suggestions("w /tmp"), Vec::<&str>::new());
         assert_eq!(suggestions("x"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn complete_extends_to_the_common_prefix() {
+        assert_eq!(complete("v").as_deref(), Some("vs"));
+        assert_eq!(complete("ren").as_deref(), Some("rename-session"));
+        assert_eq!(complete("con").as_deref(), Some("con"));
+        assert_eq!(complete("config-").as_deref(), Some("config-"));
+        assert_eq!(complete("config-r").as_deref(), Some("config-reload"));
+        assert_eq!(complete("ne").as_deref(), Some("new"));
+        assert_eq!(complete("").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn complete_without_matches_is_none() {
+        assert_eq!(complete("x"), None);
+        assert_eq!(complete("w /tmp"), None);
     }
 }

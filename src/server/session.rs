@@ -1624,6 +1624,16 @@ impl Session {
                     }
                 }
             }
+            CtKeyCode::Tab
+                if matches!(self.prompt.as_ref().map(|p| &p.kind), Some(PromptKind::Ex)) =>
+            {
+                let current = self.prompt.as_ref().expect("prompt is open").text();
+                if let Some(text) = ex::complete(&current)
+                    && text != current
+                {
+                    self.open_prompt(PromptKind::Ex, text);
+                }
+            }
             _ => {
                 let prompt = self.prompt.as_mut().expect("prompt is open");
                 prompt.textarea.input(ratatui_textarea::Input::from(key));

@@ -2,6 +2,8 @@
 
 ## 2026-09-24
 
+- Tab in the `:` command line completes to the longest common prefix of
+  the matching commands.
 - `sidebar = true` keeps the session list visible at the left; prefix+`s`
   focuses it and `Esc` returns to your window.
 - `:config-set <key> <value>` writes one config key and reloads, leaving
