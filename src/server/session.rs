@@ -174,7 +174,11 @@ enum Control {
 /// Three control glyphs, each led by a space.
 const CONTROLS_WIDTH: u16 = 6;
 
+/// Truncation stops here, ellipsis included; past it the bar scrolls.
+const MIN_NAME_WIDTH: usize = 8;
+
 struct TabBadge {
+    index: usize,
     active: bool,
     name: String,
     yanked: bool,
@@ -197,7 +201,10 @@ enum Rule {
 struct Chrome {
     window: WindowId,
     tab_bar: Rect,
+    /// Only the tabs in view; `more_left`/`more_right` mark hidden ones.
     tabs: Vec<TabBadge>,
+    more_left: bool,
+    more_right: bool,
     /// The scroll-mode label, with the match count once a search ran.
     scroll: Option<String>,
     rule: Rule,
@@ -318,6 +325,8 @@ pub struct Session {
     /// Out of the layout tree but still running, in minimize order.
     minimized: Vec<WindowId>,
     hover: Option<(WindowId, Control)>,
+    /// Index of the first tab shown in each overflowing tab bar.
+    bar_start: HashMap<WindowId, usize>,
     prompt: Option<Prompt>,
     config: Arc<Config>,
     /// Shown on the bottom row until the next key press.
@@ -382,6 +391,7 @@ impl Session {
             maximized: None,
             minimized: Vec::new(),
             hover: None,
+            bar_start: HashMap::new(),
             prompt: None,
             config,
             message: None,
@@ -454,6 +464,7 @@ impl Session {
             maximized: None,
             minimized: Vec::new(),
             hover: None,
+            bar_start: HashMap::new(),
             prompt: None,
             config,
             message: None,
@@ -520,6 +531,7 @@ impl Session {
             maximized: None,
             minimized,
             hover: None,
+            bar_start: HashMap::new(),
             prompt: None,
             config,
             message: None,
@@ -1317,6 +1329,18 @@ impl Session {
             CtMouseKind::ScrollUp | CtMouseKind::ScrollDown => {
                 let id = self.window_at(pos)?;
                 let win = self.windows.get_mut(&id).expect("window exists");
+                let bar = win.tab_bar_rect();
+                if bar.height > 0 && pos.y == bar.y {
+                    let index = if mouse.kind == CtMouseKind::ScrollUp {
+                        win.active.saturating_sub(1)
+                    } else {
+                        win.active + 1
+                    };
+                    self.set_focus(id);
+                    self.select_tab(index);
+                    self.force_redraw = true;
+                    return None;
+                }
                 let content = win.content_rect();
                 let tab = win.active_tab_mut();
                 // On the alternate screen the engine turns wheel ticks into
@@ -1806,7 +1830,11 @@ impl Session {
         if bar.height == 0 || pos.y != bar.y {
             return None;
         }
-        chrome.tabs.iter().position(|b| b.span.contains(&pos.x))
+        chrome
+            .tabs
+            .iter()
+            .find(|b| b.span.contains(&pos.x))
+            .map(|b| b.index)
     }
 
     /// Each control's click target is its glyph plus the space before it.
@@ -2345,7 +2373,7 @@ impl Session {
                 .iter()
                 .map(|t| t.activity.filter(|_| t.agent.is_none()))
                 .collect();
-            let fixed: usize = visuals
+            let fixed: Vec<usize> = visuals
                 .iter()
                 .zip(&marks)
                 .zip(&dots)
@@ -2357,17 +2385,36 @@ impl Session {
                         + dot.is_some() as usize * 2
                         + 1
                 })
-                .sum();
+                .collect();
+            let fixed_total: usize = fixed.iter().sum();
             let name_lens: Vec<usize> = win.tabs.iter().map(|t| t.name.chars().count()).collect();
+            let floors: Vec<usize> = name_lens.iter().map(|&l| l.min(MIN_NAME_WIDTH)).collect();
             let avail = badges_end.saturating_sub(bar.x.saturating_add(2)) as usize;
-            let widths = allocate_name_widths(&name_lens, avail.saturating_sub(fixed));
+            let (widths, run) = if fixed_total + floors.iter().sum::<usize>() <= avail {
+                self.bar_start.remove(&id);
+                let widths = allocate_name_widths(&name_lens, avail - fixed_total);
+                (widths, 0..win.tabs.len())
+            } else {
+                let sizes: Vec<usize> = fixed.iter().zip(&floors).map(|(f, n)| f + n).collect();
+                let start = self.bar_start.get(&id).copied().unwrap_or(0);
+                let run = visible_run(&sizes, avail, active, start);
+                self.bar_start.insert(id, run.start);
+                (floors, run)
+            };
+            let more_left = run.start > 0;
+            let more_right = run.end < win.tabs.len();
             // Spans must match render_tab_bar's layout.
-            let mut next_x = bar.x.saturating_add(2).min(badges_end);
+            let mut next_x = bar
+                .x
+                .saturating_add(2 + 2 * more_left as u16)
+                .min(badges_end);
             let tabs: Vec<TabBadge> = win
                 .tabs
                 .iter()
                 .zip(visuals)
                 .enumerate()
+                .skip(run.start)
+                .take(run.len())
                 .map(|(i, (tab, agent))| {
                     let name = truncate_name(&tab.name, widths[i]);
                     let mut width = format!(" {}:{}", i, name).chars().count() as u16;
@@ -2380,6 +2427,7 @@ impl Session {
                     let start = next_x;
                     next_x = next_x.saturating_add(width).min(badges_end);
                     TabBadge {
+                        index: i,
                         active: i == active,
                         name,
                         yanked: marks[i],
@@ -2390,7 +2438,8 @@ impl Session {
                 })
                 .collect();
             let status = tabs
-                .get(active)
+                .iter()
+                .find(|badge| badge.active)
                 .and_then(|badge| badge.agent.as_ref())
                 .map(|visual| (visual.status, visual.anim));
             // A waiting tab is quiet while its background work runs on.
@@ -2416,6 +2465,8 @@ impl Session {
                 window: id,
                 tab_bar: bar,
                 tabs,
+                more_left,
+                more_right,
                 scroll: scroll_label(win.active_tab()),
                 rule,
                 controls,
@@ -2717,6 +2768,35 @@ fn allocate_name_widths(lens: &[usize], budget: usize) -> Vec<usize> {
     alloc
 }
 
+/// The tabs to show when `sizes` overflow `avail`: a run holding `active`,
+/// moved from `start` only as far as needed. A two-cell marker, glyph and
+/// space, sits on each side with tabs hidden past it.
+fn visible_run(
+    sizes: &[usize],
+    avail: usize,
+    active: usize,
+    start: usize,
+) -> std::ops::Range<usize> {
+    let n = sizes.len();
+    let cost = |s: usize, e: usize| -> usize {
+        sizes[s..e].iter().sum::<usize>() + 2 * (s > 0) as usize + 2 * (e < n) as usize
+    };
+    let mut start = start.min(active);
+    while start < active && cost(start, active + 1) > avail {
+        start += 1;
+    }
+    let mut end = active + 1;
+    while end < n && cost(start, end + 1) <= avail {
+        end += 1;
+    }
+    // Room left at the end, such as after a close or a widen, goes to
+    // tabs hidden on the left.
+    while start > 0 && cost(start - 1, end) <= avail {
+        start -= 1;
+    }
+    start..end
+}
+
 fn truncate_name(name: &str, width: usize) -> String {
     if name.chars().count() <= width {
         return name.to_string();
@@ -2832,7 +2912,12 @@ fn render_tab_bar(
                 break 'badges;
             }
         }
-        for (i, badge) in chrome.tabs.iter().enumerate() {
+        let marker = Style::default().fg(palette.muted);
+        if chrome.more_left && !(put(&mut x, ' ', marker) && put(&mut x, '‹', marker)) {
+            break 'badges;
+        }
+        for badge in &chrome.tabs {
+            let i = badge.index;
             let style = if badge.active {
                 let color = if focused { palette.text } else { palette.muted };
                 Style::default().fg(color)
@@ -2876,6 +2961,9 @@ fn render_tab_bar(
             if !put(&mut x, ' ', style) {
                 break 'badges;
             }
+        }
+        if chrome.more_right && put(&mut x, '›', marker) {
+            put(&mut x, ' ', marker);
         }
     }
     let indicators_end = x;
@@ -3365,7 +3453,45 @@ fn cell_color(attr: ColorAttribute) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{allocate_name_widths, truncate_name};
+    use super::{allocate_name_widths, truncate_name, visible_run};
+
+    #[test]
+    fn run_starts_at_first_tab_with_right_marker() {
+        // 10 + 10 + `› ` fits in 22; a third tab doesn't.
+        assert_eq!(visible_run(&[10, 10, 10, 10], 22, 0, 0), 0..2);
+    }
+
+    #[test]
+    fn markers_include_their_spacing() {
+        assert_eq!(visible_run(&[10, 10, 10, 10], 21, 0, 0), 0..1);
+    }
+
+    #[test]
+    fn run_shifts_minimally_to_reach_active() {
+        // ` ‹` + 10 + 10 + `› ` = 24.
+        assert_eq!(visible_run(&[10, 10, 10, 10], 24, 2, 0), 1..3);
+    }
+
+    #[test]
+    fn run_keeps_its_start_while_active_stays_in_view() {
+        assert_eq!(visible_run(&[10, 10, 10, 10, 10], 24, 2, 1), 1..3);
+    }
+
+    #[test]
+    fn run_jumps_back_to_an_active_tab_left_of_it() {
+        assert_eq!(visible_run(&[10, 10, 10, 10], 22, 0, 2), 0..2);
+    }
+
+    #[test]
+    fn spare_room_at_the_end_reveals_hidden_tabs_on_the_left() {
+        // Ending at the last tab needs no `› `, so two tabs plus ` ‹` fit.
+        assert_eq!(visible_run(&[10, 10, 10, 10], 22, 3, 3), 2..4);
+    }
+
+    #[test]
+    fn active_tab_wider_than_the_bar_shows_alone() {
+        assert_eq!(visible_run(&[10, 30, 10], 20, 1, 0), 1..2);
+    }
 
     #[test]
     fn names_that_fit_keep_full_length() {

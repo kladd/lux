@@ -1,5 +1,11 @@
 # News
 
+## 2026-10-01
+
+- A tab bar too narrow for its tabs scrolls to keep the active tab in view,
+  with `‹`/`›` marking hidden tabs, and the mouse wheel over a tab bar
+  switches tabs.
+
 ## 2026-09-24
 
 - Tab in the `:` command line completes to the longest common prefix of
