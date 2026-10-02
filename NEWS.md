@@ -5,6 +5,7 @@
 - A tab bar too narrow for its tabs scrolls to keep the active tab in view,
   with `‹`/`›` marking hidden tabs, and the mouse wheel over a tab bar
   switches tabs.
+- Updates the rain attach animation like in the movie.
 
 ## 2026-09-24
 
