@@ -147,6 +147,12 @@ tab's home session, window, and tab; prefix+`s` and prefix+`f` open the
 switcher or finder directly; `q`/`Esc` returns to the session you came
 from.
 
+With `grid-mouse = true`, the mouse works there too: the highlight
+follows the pointer, a click captures the tile under it, a click on the
+captured tile or on empty space releases it, and a double click jumps to
+the tile's tab. The wheel scrolls the captured tab while the pointer is
+over its tile, and moves the highlight by a row when nothing is captured.
+
 ### Auto mode
 
 With `automode = true` (see Configuration), prefix+`g` opens auto mode
@@ -182,6 +188,7 @@ layout-transitions = false  # snap maximize into place
 attach-transition = false   # draw the first frame after attaching at once
 attach-style = "coalesce"   # how the first frame after attaching appears
 sidebar = true              # keep the session list visible at the left
+grid-mouse = true           # clicks and the wheel work in the CLAUDECOM grid
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`

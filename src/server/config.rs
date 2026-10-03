@@ -64,6 +64,8 @@ pub struct Config {
     pub attach_style: AttachStyle,
     /// Keep the session list visible beside the layout.
     pub sidebar: bool,
+    /// Clicks and the wheel work in the CLAUDECOM grid.
+    pub grid_mouse: bool,
 }
 
 impl Default for Config {
@@ -83,6 +85,7 @@ impl Default for Config {
             attach_transition: true,
             attach_style: AttachStyle::default(),
             sidebar: false,
+            grid_mouse: false,
         }
     }
 }
@@ -205,6 +208,7 @@ const KEYS: &[&str] = &[
     "attach-transition",
     "attach-style",
     "sidebar",
+    "grid-mouse",
 ];
 
 /// A key whose value was skipped, and why.
@@ -242,6 +246,7 @@ fn apply(config: &mut Config, key: &str, value: &toml::Value) -> bool {
         ("layout-transitions", _) => return flag(&mut config.layout_transitions),
         ("attach-transition", _) => return flag(&mut config.attach_transition),
         ("sidebar", _) => return flag(&mut config.sidebar),
+        ("grid-mouse", _) => return flag(&mut config.grid_mouse),
         ("osc-titles", Some("none")) => config.osc_titles = OscTitles::None,
         ("osc-titles", Some("agents")) => config.osc_titles = OscTitles::Agents,
         ("osc-titles", Some("all")) => config.osc_titles = OscTitles::All,
@@ -403,6 +408,14 @@ mod tests {
         assert_eq!(parse("attach-style = \"coalesce\""), AttachStyle::Coalesce);
         assert_eq!(parse("attach-style = \"snow\""), AttachStyle::Rain);
         assert_eq!(parse("attach-style = true"), AttachStyle::Rain);
+    }
+
+    #[test]
+    fn grid_mouse_option_parses_and_defaults_off() {
+        assert!(!from_toml("", "test").grid_mouse);
+        assert!(from_toml("grid-mouse = true", "test").grid_mouse);
+        assert!(!from_toml("grid-mouse = false", "test").grid_mouse);
+        assert!(!from_toml("grid-mouse = \"yes\"", "test").grid_mouse);
     }
 
     #[test]
