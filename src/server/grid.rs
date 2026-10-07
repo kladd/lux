@@ -1,7 +1,7 @@
 //! The CLAUDECOM grid: tiles every agent tab across all sessions.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -19,16 +19,23 @@ use crate::server::{SessionId, clear_region};
 const MIN_TILE_COLS: u16 = 60;
 const TILE_ROWS: u16 = 24;
 
+// Double-click window: 500ms
+const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(500);
+
 /// A client's view of the grid.
 #[derive(Clone, Copy, Default)]
 pub struct GridState {
     pub highlight: usize,
-    scroll: usize,
+    pub scroll: usize,
     /// The tab receiving key presses instead of grid navigation.
     pub capture: Option<TabId>,
     /// A prefix key awaiting its follow-up. In capture mode the prefix
     /// never reaches the tab.
     pub pending_prefix: bool,
+    /// Last click time for double-click detection.
+    last_click_time: Option<Instant>,
+    /// Last click position for double-click detection.
+    last_click_pos: Option<(u16, u16)>,
 }
 
 /// An agent tab, addressed by session, window, and position in the
@@ -121,6 +128,37 @@ pub fn navigate(state: &mut GridState, area: Rect, count: usize, dir: Dir) {
     state.highlight = target.unwrap_or(i);
 }
 
+/// The tile under `pos`, as its item's index and its rectangle.
+pub fn tile_at(area: Rect, count: usize, scroll: usize, pos: Position) -> Option<(usize, Rect)> {
+    let l = layout(area, count)?;
+    (0..l.visible)
+        .flat_map(|row| (0..l.cols).map(move |col| (row, col)))
+        .map(|(row, col)| ((scroll + row) * l.cols + col, l.tile_rect(area, col, row)))
+        .find(|(i, rect)| *i < count && rect.contains(pos))
+}
+
+/// The part of a tile its tab is drawn in, inside the border.
+pub fn tile_content(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x + 1,
+        rect.y + 1,
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    )
+}
+
+/// Check if this is a double-click: same position, within double-click window.
+pub fn is_double_click(state: &mut GridState, pos: Position) -> bool {
+    let now = Instant::now();
+    let is_double = state
+        .last_click_time
+        .is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK_TIME)
+        && state.last_click_pos == Some((pos.x, pos.y));
+    state.last_click_time = Some(now);
+    state.last_click_pos = Some((pos.x, pos.y));
+    is_double
+}
+
 fn ensure_visible(state: &mut GridState, l: &Layout) {
     let row = state.highlight / l.cols;
     state.scroll = state.scroll.min(l.rows - l.visible).min(row);
@@ -193,12 +231,7 @@ fn draw(
         // Resize the tab to the tile so its content reflows instead of
         // cropping. The home window restores the real size on its next
         // render.
-        let inner = Rect::new(
-            rect.x + 1,
-            rect.y + 1,
-            rect.width.saturating_sub(2),
-            rect.height.saturating_sub(2),
-        );
+        let inner = tile_content(rect);
         if inner.width > 0
             && inner.height > 0
             && (tab.rect.width, tab.rect.height) != (inner.width, inner.height)
@@ -246,6 +279,11 @@ pub fn render_tail(buf: &mut Buffer, area: Rect, tab: &Tab) {
     let screen = tab.engine.screen();
     let live_rows = screen.physical_rows as i64;
     let range = screen.phys_range(&((live_rows - area.height as i64).max(0)..live_rows));
+    render_rows(buf, area, tab, range);
+}
+
+fn render_rows(buf: &mut Buffer, area: Rect, tab: &Tab, range: std::ops::Range<usize>) {
+    let screen = tab.engine.screen();
     for (y, line) in screen.lines_in_phys_range(range).iter().enumerate() {
         if y >= area.height as usize {
             break;
@@ -290,11 +328,12 @@ fn draw_tile(
             (palette.status(visual.status), visual.anim)
         });
     draw_border(buf, rect, highlighted, color, border_anim, elapsed);
-    render_tail(
-        buf,
-        Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2),
-        tab,
-    );
+    // A tile is its tab's size, so a scrolled view fits it whole.
+    if tab.scroll_mode() {
+        render_rows(buf, tile_content(rect), tab, tab.view_range());
+    } else {
+        render_tail(buf, tile_content(rect), tab);
+    }
     let base = Style::default();
     let mut x = rect.x + 1;
     let mut put = |x: &mut u16, ch: char, style: Style| -> bool {
@@ -507,5 +546,69 @@ mod tests {
             );
             assert_eq!(buf.cell(Position::new(4, 2)).unwrap().symbol(), " ");
         }
+    }
+
+    fn tile_index(area: Rect, count: usize, scroll: usize, pos: Position) -> Option<usize> {
+        tile_at(area, count, scroll, pos).map(|(i, _)| i)
+    }
+
+    #[test]
+    fn a_tile_is_found_across_its_whole_drawn_width() {
+        // Three columns of 66, 66 and 65 cells.
+        let area = Rect::new(0, 0, 197, 30);
+        assert_eq!(tile_index(area, 3, 0, Position::new(65, 3)), Some(0));
+        assert_eq!(tile_index(area, 3, 0, Position::new(66, 3)), Some(1));
+        assert_eq!(tile_index(area, 3, 0, Position::new(132, 3)), Some(2));
+        assert_eq!(tile_index(area, 3, 0, Position::new(196, 3)), Some(2));
+        let (_, rect) = tile_at(area, 3, 0, Position::new(140, 3)).unwrap();
+        assert_eq!(tile_content(rect), Rect::new(133, 1, 63, 22));
+    }
+
+    #[test]
+    fn clicking_finds_the_right_grid_item() {
+        let area = Rect::new(0, 0, 240, 70);
+        // 4 columns, 6 items: 2 rows
+        assert_eq!(tile_index(area, 6, 0, Position::new(30, 12)), Some(0));
+        assert_eq!(tile_index(area, 6, 0, Position::new(90, 12)), Some(1));
+        assert_eq!(tile_index(area, 6, 0, Position::new(150, 12)), Some(2));
+        assert_eq!(tile_index(area, 6, 0, Position::new(210, 12)), Some(3));
+        assert_eq!(tile_index(area, 6, 0, Position::new(30, 36)), Some(4));
+        assert_eq!(tile_index(area, 6, 0, Position::new(90, 36)), Some(5));
+        assert_eq!(tile_index(area, 6, 0, Position::new(150, 36)), None);
+    }
+
+    #[test]
+    fn click_respects_scroll_offset() {
+        let area = Rect::new(0, 0, 240, 70);
+        // With 20 items in a 4-column layout: 5 rows, 2 visible
+        // Scrolled to show rows 2-3
+        assert_eq!(tile_index(area, 20, 2, Position::new(30, 12)), Some(8));
+        assert_eq!(tile_index(area, 20, 2, Position::new(90, 12)), Some(9));
+    }
+
+    #[test]
+    fn click_outside_grid_returns_none() {
+        let area = Rect::new(10, 5, 100, 50);
+        assert_eq!(tile_index(area, 10, 0, Position::new(5, 5)), None);
+        assert_eq!(tile_index(area, 10, 0, Position::new(110, 5)), None);
+        assert_eq!(tile_index(area, 10, 0, Position::new(10, 55)), None);
+    }
+
+    #[test]
+    fn double_click_detection_works() {
+        let mut state = GridState::default();
+        let pos = Position::new(30, 12);
+        assert!(
+            !is_double_click(&mut state, pos),
+            "first click is not double"
+        );
+        assert!(
+            is_double_click(&mut state, pos),
+            "second click at same pos is double"
+        );
+        assert!(
+            !is_double_click(&mut state, Position::new(31, 12)),
+            "different pos breaks streak"
+        );
     }
 }

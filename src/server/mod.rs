@@ -37,7 +37,7 @@ use ratatui::Terminal;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers as CtMods,
-    MouseButton as CtMouseButton, MouseEventKind as CtMouseKind,
+    MouseButton as CtMouseButton, MouseEvent as CtMouseEvent, MouseEventKind as CtMouseKind,
 };
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1844,6 +1844,12 @@ impl Server {
             return;
         };
         let items = grid::items(&self.sessions);
+        if let DecodedInput::Mouse(mouse) = event {
+            if self.config.grid_mouse {
+                self.grid_mouse(conn, state, &items, mouse);
+            }
+            return;
+        }
         // A captured tab that left the grid ends capture, and the event
         // falls through to navigation.
         if let Some(id) = state.capture {
@@ -1976,6 +1982,81 @@ impl Server {
             DecodedInput::Mouse(_) | DecodedInput::Color(..) => {}
         }
         None
+    }
+
+    /// A click captures the tile under it or releases it if it already
+    /// is, a double click goes to its tab, and a click on no tile ends
+    /// capture. The wheel scrolls the captured tab, or else the grid, and
+    /// the highlight follows the pointer.
+    fn grid_mouse(
+        &mut self,
+        conn: ConnId,
+        mut state: GridState,
+        items: &[grid::GridItem],
+        mouse: &CtMouseEvent,
+    ) {
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        let size = term::fd_size(&client.raw_out);
+        let area = Rect::new(0, 0, size.width, size.height);
+        let pos = Position::new(mouse.column, mouse.row);
+        let under = grid::tile_at(area, items.len(), state.scroll, pos)
+            .and_then(|(i, rect)| Some((i, *items.get(i)?, rect)));
+        let tab_id = |sessions: &BTreeMap<SessionId, Session>, item: grid::GridItem| {
+            sessions
+                .get(&item.session)
+                .and_then(|s| s.tab_at(item.window, item.tab))
+                .map(|tab| tab.id)
+        };
+        match mouse.kind {
+            CtMouseKind::Down(CtMouseButton::Left) => {
+                let double = grid::is_double_click(&mut state, pos);
+                state.pending_prefix = false;
+                match under {
+                    Some((_, item, _)) if double => {
+                        client.grid = None;
+                        self.attach_to_tab(conn, item.session, item.window, item.tab);
+                        return;
+                    }
+                    Some((i, item, _)) => {
+                        let id = tab_id(&self.sessions, item);
+                        state.highlight = i;
+                        state.capture = if state.capture == id { None } else { id };
+                    }
+                    None => state.capture = None,
+                }
+            }
+            CtMouseKind::ScrollUp | CtMouseKind::ScrollDown => match (state.capture, under) {
+                (Some(captured), Some((_, item, rect))) => {
+                    if tab_id(&self.sessions, item) == Some(captured)
+                        && let Some(session) = self.sessions.get_mut(&item.session)
+                    {
+                        let content = grid::tile_content(rect);
+                        session.wheel_to_tab(item.window, item.tab, mouse, content);
+                    }
+                }
+                (Some(_), None) => {}
+                (None, _) => {
+                    let dir = if mouse.kind == CtMouseKind::ScrollUp {
+                        Dir::Up
+                    } else {
+                        Dir::Down
+                    };
+                    grid::navigate(&mut state, area, items.len(), dir);
+                }
+            },
+            // A captured tile keeps the highlight, as it does with keys.
+            CtMouseKind::Moved => {
+                if state.capture.is_none()
+                    && let Some((i, _, _)) = under
+                {
+                    state.highlight = i;
+                }
+            }
+            _ => {}
+        }
+        self.store_grid_state(conn, state);
     }
 
     fn store_grid_state(&mut self, conn: ConnId, state: GridState) {
