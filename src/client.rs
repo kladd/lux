@@ -156,6 +156,32 @@ pub fn kill_server() -> i32 {
     0
 }
 
+pub fn upgrade() -> i32 {
+    let Some(mut stream) = connect_existing() else {
+        return 1;
+    };
+    if protocol::write_line(&mut stream, Request::Upgrade.encode().trim_end()).is_err() {
+        eprintln!("lux: server connection failed");
+        return 1;
+    }
+    match protocol::read_line(&mut stream) {
+        Ok(Some(line)) => match line.strip_prefix("ok ") {
+            Some(version) => {
+                println!("lux: server upgraded to {version}");
+                0
+            }
+            None => {
+                eprintln!("lux: {}", line.strip_prefix("err ").unwrap_or(&line));
+                1
+            }
+        },
+        _ => {
+            eprintln!("lux: server closed the connection during the upgrade");
+            1
+        }
+    }
+}
+
 /// Relays an adopting hub's frames between ssh's stdio and this host's
 /// server, starting the server if none is running.
 pub fn proxy() -> i32 {

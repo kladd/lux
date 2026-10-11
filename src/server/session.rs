@@ -34,6 +34,7 @@ use crate::server::palette::{self, Palette};
 use crate::server::persist;
 use crate::server::term::FdBackend;
 use crate::server::transition::{Transitions, Zoom};
+use crate::server::upgrade;
 use crate::server::window::{
     Activity, LastOutput, Notice, Synced, Tab, TabId, Window, content_rect,
 };
@@ -402,11 +403,33 @@ impl Session {
         let first = Window::with_tab(0, rect, tab);
         let mut windows = HashMap::new();
         windows.insert(first.id, first);
-        Ok(Self {
+        Ok(Self::assemble(
             name,
-            tree: Node::Leaf(0),
+            Node::Leaf(0),
             windows,
-            focus: 0,
+            0,
+            area,
+            config,
+            tx,
+        ))
+    }
+
+    /// A session showing `windows` with nothing open over them.
+    fn assemble(
+        name: String,
+        tree: Node,
+        windows: HashMap<WindowId, Window>,
+        focus: WindowId,
+        area: Rect,
+        config: Arc<Config>,
+        tx: Sender<ServerEvent>,
+    ) -> Self {
+        let next_window_id = windows.keys().max().copied().unwrap_or(0) + 1;
+        Self {
+            name,
+            tree,
+            windows,
+            focus,
             chord: None,
             resize_repeat: None,
             move_repeat: None,
@@ -426,14 +449,14 @@ impl Session {
             view: View::default(),
             area,
             clock: String::new(),
-            next_window_id: 1,
+            next_window_id,
             force_redraw: true,
             transitions: Transitions::default(),
             tx,
             host: None,
             offline: false,
             connecting: None,
-        })
+        }
     }
 
     /// Windows whose tabs all fail to spawn drop out of the tree. `None`
@@ -474,39 +497,83 @@ impl Session {
             }
         }
         let focus = layout::leaves(&tree).first().copied()?;
-        let next_window_id = windows.keys().max().copied().unwrap_or(0) + 1;
-        Some(Self {
-            name: snap.name.clone(),
+        Some(Self::assemble(
+            snap.name.clone(),
             tree,
             windows,
             focus,
-            chord: None,
-            resize_repeat: None,
-            move_repeat: None,
-            send_prefix_repeat: None,
-            maximized: None,
-            minimized: Vec::new(),
-            hover: None,
-            bar_start: HashMap::new(),
-            prompt: None,
-            config,
-            message: None,
-            selection: None,
-            border_drag: None,
-            indicator: None,
-            yanked: Vec::new(),
-            term_colors: palette::TermColors::default(),
-            view: View::default(),
             area,
-            clock: String::new(),
-            next_window_id,
-            force_redraw: true,
-            transitions: Transitions::default(),
+            config,
             tx,
-            host: None,
-            offline: false,
-            connecting: None,
-        })
+        ))
+    }
+
+    /// Carries on a session the previous image handed off. `None` when no
+    /// tab made it across.
+    pub fn resume(
+        state: upgrade::SessionState,
+        config: Arc<Config>,
+        tx: Sender<ServerEvent>,
+    ) -> Option<Self> {
+        let mut windows = HashMap::new();
+        for wstate in state.windows {
+            let tabs: Vec<Tab> = wstate
+                .tabs
+                .into_iter()
+                .filter_map(|t| Tab::resume(t, tx.clone()).ok())
+                .collect();
+            if tabs.is_empty() {
+                continue;
+            }
+            let active = wstate.active.min(tabs.len() - 1);
+            windows.insert(
+                wstate.id,
+                Window {
+                    id: wstate.id,
+                    rect: upgrade::state_rect(wstate.rect),
+                    tabs,
+                    active,
+                },
+            );
+        }
+        let (tree, minimized, focus) =
+            arrange(&state.tree, &state.minimized, state.focus, &windows)?;
+        let mut session = Self::assemble(
+            state.name,
+            tree,
+            windows,
+            focus,
+            upgrade::state_rect(state.area),
+            config,
+            tx,
+        );
+        session.minimized = minimized;
+        Some(session)
+    }
+
+    /// Everything the next image needs to carry the session on.
+    pub fn handoff(&mut self) -> upgrade::SessionState {
+        let order = self.window_order();
+        let windows = order
+            .into_iter()
+            .filter_map(|id| {
+                let win = self.windows.get_mut(&id)?;
+                Some(upgrade::WindowState {
+                    id,
+                    rect: upgrade::rect_state(win.rect),
+                    active: win.active,
+                    tabs: win.tabs.iter_mut().filter_map(Tab::handoff).collect(),
+                })
+            })
+            .collect();
+        upgrade::SessionState {
+            name: self.name.clone(),
+            area: upgrade::rect_state(self.area),
+            tree: persist::capture_node(&self.tree),
+            windows,
+            minimized: self.minimized.clone(),
+            focus: self.focus,
+        }
     }
 
     /// Windows and tree leaves without a counterpart drop out. `None` when
@@ -541,39 +608,10 @@ impl Session {
             );
         }
         let (tree, minimized, focus) = arrange(&snap.tree, &snap.minimized, snap.focus, &windows)?;
-        let next_window_id = windows.keys().max().copied().unwrap_or(0) + 1;
-        Some(Self {
-            name: snap.name,
-            tree,
-            windows,
-            focus,
-            chord: None,
-            resize_repeat: None,
-            move_repeat: None,
-            send_prefix_repeat: None,
-            maximized: None,
-            minimized,
-            hover: None,
-            bar_start: HashMap::new(),
-            prompt: None,
-            config,
-            message: None,
-            selection: None,
-            border_drag: None,
-            indicator: None,
-            yanked: Vec::new(),
-            term_colors: palette::TermColors::default(),
-            view: View::default(),
-            area,
-            clock: String::new(),
-            next_window_id,
-            force_redraw: true,
-            transitions: Transitions::default(),
-            tx,
-            host: Some(host),
-            offline: false,
-            connecting: None,
-        })
+        let mut session = Self::assemble(snap.name, tree, windows, focus, area, config, tx);
+        session.minimized = minimized;
+        session.host = Some(host);
+        Some(session)
     }
 
     pub fn is_remote(&self) -> bool {
@@ -791,7 +829,7 @@ impl Session {
             .find(|w| w.tabs.iter().any(|t| t.id == id))?;
         let background = win.active_tab().id != id;
         let tab = win.find_tab_mut(id)?;
-        tab.engine.advance_bytes(bytes);
+        tab.advance(bytes);
         tab.note_output(bytes.len(), Instant::now());
         let (mut changed, notice) = tab.refresh_identity(osc_titles);
         let rang = tab.take_bell();

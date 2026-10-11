@@ -295,7 +295,7 @@ impl Server {
         }
     }
 
-    fn add_host(&mut self, alias: &str) -> Result<HostId, String> {
+    pub(super) fn add_host(&mut self, alias: &str) -> Result<HostId, String> {
         let id = self.next_host_id;
         let mut host = Host::new(alias.to_string());
         host.start(id, &self.tx, self.instance)?;
@@ -450,7 +450,7 @@ impl Server {
         }
     }
 
-    fn restart_host(&mut self, id: HostId) {
+    pub(super) fn restart_host(&mut self, id: HostId) {
         let Some(host) = self.hosts.get_mut(&id) else {
             return;
         };
@@ -938,6 +938,9 @@ mod tests {
             hub: None,
             pending_hubs: Vec::new(),
             instance: next_token(),
+            exe: std::path::PathBuf::new(),
+            listener: -1,
+            pending_upgrade: None,
         };
         (server, rx)
     }

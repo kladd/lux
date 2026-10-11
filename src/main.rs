@@ -13,6 +13,7 @@ const COMMANDS: &[(&str, Option<&str>)] = &[
     ("kill-session", None),
     ("list-sessions", Some("ls")),
     ("new-session", Some("new")),
+    ("upgrade", None),
 ];
 
 /// Match a verb by exact name or alias first, then by unique prefix.
@@ -32,7 +33,7 @@ fn resolve(verb: &str) -> Option<&'static str> {
 
 fn usage() -> i32 {
     eprintln!(
-        "usage: lux [[new|new-session] [-s <name>] | [a|attach|attach-session] [-t <name>] | ls|list-sessions | kill-session -t <name> | kill-server]"
+        "usage: lux [[new|new-session] [-s <name>] | [a|attach|attach-session] [-t <name>] | ls|list-sessions | kill-session -t <name> | kill-server | upgrade]"
     );
     2
 }
@@ -43,7 +44,12 @@ fn main() {
     let code = match strs.as_slice() {
         [] => client::attach(Request::New),
         ["-s", name] | ["-t", name] => client::attach(Request::Session((*name).into())),
-        ["__server"] => server::run(),
+        ["__server"] => server::run(None),
+        ["__server", "--resume", state, reply] => match (state.parse(), reply.parse()) {
+            (Ok(state), Ok(reply)) => server::run(Some((state, reply))),
+            _ => usage(),
+        },
+        ["__upgrade-check", format] => server::upgrade::check_format(format),
         ["proxy"] => client::proxy(),
         [verb, rest @ ..] => match (resolve(verb), rest) {
             (Some("new-session"), []) => client::attach(Request::New),
@@ -55,6 +61,7 @@ fn main() {
             (Some("list-sessions"), []) => client::ls(),
             (Some("kill-session"), ["-t", name]) => client::kill_session(name),
             (Some("kill-server"), []) => client::kill_server(),
+            (Some("upgrade"), []) => client::upgrade(),
             _ => usage(),
         },
     };

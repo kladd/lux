@@ -1,7 +1,7 @@
 //! Windows and the tabs they own: each tab is one PTY plus a terminal engine.
 
 use std::collections::VecDeque;
-use std::io::Read;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,8 +25,13 @@ use crate::server::anim;
 use crate::server::config::OscTitles;
 use crate::server::host::HostLink;
 use crate::server::layout::WindowId;
+use crate::server::modes::ModeTracker;
 use crate::server::palette::TermColors;
+use crate::server::park;
 use crate::server::search;
+use crate::server::upgrade::{
+    self, AdoptedChild, AdoptedPty, ScreenState as SavedScreen, TabState,
+};
 use crate::server::wire::{HubMsg, RemoteTabId, ScreenState, TabMeta, TabRef, TabSnap, TabUpdate};
 
 pub type TabId = usize;
@@ -453,6 +458,7 @@ pub struct Tab {
     /// Output and bell not yet reported to an adopting hub.
     unsent_bytes: usize,
     unsent_bell: bool,
+    modes: ModeTracker,
     io: Io,
 }
 
@@ -538,41 +544,7 @@ impl Tab {
         let child = pair.slave.spawn_command(cmd).context("spawn shell")?;
         drop(pair.slave);
 
-        let mut reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
-        let relay_tx = tx.clone();
-
-        thread::spawn(move || {
-            let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    // EOF or EIO: child side of the PTY closed.
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx
-                            .send(ServerEvent::PtyOutput(id, buf[..n].to_vec()))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-            }
-            let _ = tx.send(ServerEvent::PtyExited(id));
-        });
-
-        let mut engine = Engine::new(
-            term_size(rect),
-            Arc::new(LuxConfig),
-            "lux",
-            env!("CARGO_PKG_VERSION"),
-            Box::new(writer),
-        );
-        let clipboard: Arc<dyn Clipboard> = Arc::new(ClipboardRelay {
-            tab: id,
-            tx: relay_tx,
-        });
-        engine.set_clipboard(&clipboard);
+        let engine = local_engine(id, term_size(rect), pair.master.as_ref(), tx)?;
         let mut tab = Self::assemble(
             id,
             engine,
@@ -617,6 +589,7 @@ impl Tab {
             output: RecentOutput::new(Instant::now()),
             unsent_bytes: 0,
             unsent_bell: false,
+            modes: ModeTracker::default(),
             io,
         }
     }
@@ -665,29 +638,8 @@ impl Tab {
         if state.alt {
             engine.advance_bytes(b"\x1b[?1049h");
         }
-        let rows = usize::from(state.rows.max(1));
-        let seqno = engine.current_seqno();
-        let screen = engine.screen_mut();
-        let mut missing = snap.lines.len().saturating_sub(screen.scrollback_rows());
-        while missing > 0 {
-            let step = missing.min(rows);
-            screen.scroll_up(
-                &(0..rows as i64),
-                step,
-                seqno,
-                CellAttributes::default(),
-                LuxConfig.bidi_mode(),
-            );
-            missing -= step;
-        }
-        // Lines align to the bottom, where the visible rows are.
-        let held = screen.scrollback_rows();
-        let skip = snap.lines.len().saturating_sub(held);
-        let first = held - (snap.lines.len() - skip);
-        for (i, line) in snap.lines.into_iter().skip(skip).enumerate() {
-            *screen.line_mut(first + i) = line;
-        }
-        io.delta = state.top - screen.visible_row_to_stable_row(0);
+        load_lines(&mut engine, snap.lines);
+        io.delta = state.top - engine.screen().visible_row_to_stable_row(0);
         io.primary_known = !state.alt;
         sync_cursor(&mut engine, &state);
         self.engine = engine;
@@ -1334,6 +1286,174 @@ impl Tab {
             Err(_) => 0,
         }
     }
+
+    /// Feeds the program's output to the engine.
+    pub fn advance(&mut self, bytes: &[u8]) {
+        let actions = self.modes.parse(bytes);
+        self.engine.perform_actions(actions);
+    }
+
+    /// What the next image needs to carry the tab on. `None` for a remote
+    /// tab, which its host keeps.
+    pub fn handoff(&mut self) -> Option<TabState> {
+        let Io::Local { master, child } = &self.io else {
+            return None;
+        };
+        let pty = master.as_raw_fd()?;
+        let pid = child.process_id();
+        let size = self.engine.get_size();
+        let cursor_visible =
+            self.engine.cursor_pos().visibility == termwiz::surface::CursorVisibility::Visible;
+        let alt = self.engine.is_alt_screen_active().then(|| {
+            let alt = saved_screen(&self.engine);
+            // To the primary screen without clearing either, with the
+            // cursor it saved on the way out.
+            self.engine.advance_bytes(b"\x1b[?47l\x1b8");
+            alt
+        });
+        let primary = saved_screen(&self.engine);
+        if let Some(alt) = &alt {
+            self.engine.advance_bytes(b"\x1b[?47h");
+            place_cursor(&mut self.engine, (alt.cursor_x, alt.cursor_y));
+        }
+        Some(TabState {
+            pty,
+            pid,
+            rect: upgrade::rect_state(self.rect),
+            name: self.name.clone(),
+            manual_name: self.manual_name,
+            claude_session: self.claude_session.clone(),
+            running_claude: self.running_claude,
+            osc_title: self.osc_title.lock().unwrap().clone(),
+            modes: self.modes.modes().to_vec(),
+            cols: size.cols as u16,
+            rows: size.rows as u16,
+            cursor_visible,
+            primary,
+            alt,
+        })
+    }
+
+    /// Carries on a tab the previous image handed off.
+    pub fn resume(state: TabState, tx: Sender<ServerEvent>) -> anyhow::Result<Self> {
+        // SAFETY: the previous image passed this descriptor for this tab
+        // alone.
+        let master = AdoptedPty(unsafe { upgrade::adopt_fd(state.pty) }?);
+        let id = NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let size = term_size(Rect::new(0, 0, state.cols, state.rows));
+        let mut engine = local_engine(id, size, &master, tx)?;
+        let mut cursor = (state.primary.cursor_x, state.primary.cursor_y);
+        load_lines(&mut engine, state.primary.lines);
+        place_cursor(&mut engine, cursor);
+        if let Some(alt) = state.alt {
+            // Saves the primary screen's cursor for the program's return.
+            engine.advance_bytes(b"\x1b[?1049h");
+            cursor = (alt.cursor_x, alt.cursor_y);
+            load_lines(&mut engine, alt.lines);
+        }
+        let pid = state
+            .pid
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32));
+        let mut tab = Self::assemble(
+            id,
+            engine,
+            upgrade::state_rect(state.rect),
+            Io::Local {
+                master: Box::new(master),
+                child: Box::new(AdoptedChild(pid)),
+            },
+        );
+        tab.modes = ModeTracker::with_modes(state.modes);
+        tab.engine.advance_bytes(tab.modes.replay());
+        // Margins and origin mode home the cursor, so it goes last.
+        place_cursor(&mut tab.engine, cursor);
+        if !state.cursor_visible {
+            tab.engine.advance_bytes(b"\x1b[?25l");
+        }
+        if let Some(title) = state.osc_title {
+            tab.engine.advance_bytes(format!("\x1b]2;{title}\x1b\\"));
+        }
+        tab.name = state.name;
+        tab.manual_name = state.manual_name;
+        tab.claude_session = state.claude_session;
+        tab.running_claude = state.running_claude;
+        Ok(tab)
+    }
+
+    /// Signals the foreground program that its window changed, which most
+    /// programs answer by redrawing.
+    pub fn prompt_redraw(&self) {
+        if let Some(group) = self
+            .process_group_leader()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::WINCH);
+        }
+    }
+}
+
+/// The current screen's lines and cursor.
+fn saved_screen(engine: &Engine) -> SavedScreen {
+    let screen = engine.screen();
+    let cursor = engine.cursor_pos();
+    SavedScreen {
+        lines: screen.lines_in_phys_range(0..screen.scrollback_rows()),
+        cursor_x: cursor.x,
+        cursor_y: cursor.y,
+    }
+}
+
+fn place_cursor(engine: &mut Engine, (x, y): (usize, i64)) {
+    engine.advance_bytes(format!("\x1b[{};{}H", y + 1, x + 1));
+}
+
+/// An engine that answers the program on `master`, whose output a new
+/// reader thread feeds back as events.
+fn local_engine(
+    id: TabId,
+    size: TerminalSize,
+    master: &dyn MasterPty,
+    tx: Sender<ServerEvent>,
+) -> anyhow::Result<Engine> {
+    let fd = master.as_raw_fd().context("PTY has no descriptor")?;
+    // SAFETY: `master` keeps the descriptor open for this call.
+    let reader = rustix::io::dup(unsafe { BorrowedFd::borrow_raw(fd) })?;
+    let writer = master.take_writer()?;
+    spawn_pty_reader(id, reader, tx.clone());
+    let mut engine = Engine::new(
+        size,
+        Arc::new(LuxConfig),
+        "lux",
+        env!("CARGO_PKG_VERSION"),
+        Box::new(writer),
+    );
+    let clipboard: Arc<dyn Clipboard> = Arc::new(ClipboardRelay { tab: id, tx });
+    engine.set_clipboard(&clipboard);
+    Ok(engine)
+}
+
+fn spawn_pty_reader(id: TabId, pty: OwnedFd, tx: Sender<ServerEvent>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match park::when_readable(&pty, park::WAIT, || rustix::io::read(&pty, &mut buf)) {
+                Ok(None)
+                | Err(rustix::io::Errno::INTR)
+                | Ok(Some(Err(rustix::io::Errno::INTR))) => {}
+                // EOF or EIO: child side of the PTY closed.
+                Ok(Some(Ok(0) | Err(_))) | Err(_) => break,
+                Ok(Some(Ok(n))) => {
+                    if tx
+                        .send(ServerEvent::PtyOutput(id, buf[..n].to_vec()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(ServerEvent::PtyExited(id));
+    });
 }
 
 /// Writes nowhere: the host's own engine answers the program.
@@ -1345,6 +1465,32 @@ fn mirror_engine(cols: u16, rows: u16) -> Engine {
         env!("CARGO_PKG_VERSION"),
         Box::new(std::io::sink()),
     )
+}
+
+/// Fills the current screen from the bottom up, history included, with as
+/// many of `lines` as it holds.
+fn load_lines(engine: &mut Engine, lines: Vec<wezterm_term::Line>) {
+    let rows = engine.screen().physical_rows.max(1);
+    let seqno = engine.current_seqno();
+    let screen = engine.screen_mut();
+    let mut missing = lines.len().saturating_sub(screen.scrollback_rows());
+    while missing > 0 {
+        let step = missing.min(rows);
+        screen.scroll_up(
+            &(0..rows as i64),
+            step,
+            seqno,
+            CellAttributes::default(),
+            LuxConfig.bidi_mode(),
+        );
+        missing -= step;
+    }
+    let held = screen.scrollback_rows();
+    let skip = lines.len().saturating_sub(held);
+    let first = held - (lines.len() - skip);
+    for (i, line) in lines.into_iter().skip(skip).enumerate() {
+        *screen.line_mut(first + i) = line;
+    }
 }
 
 /// Pushes `count` blank rows in at the bottom, moving the top rows into
@@ -1810,6 +1956,55 @@ mod tests {
             .iter()
             .map(|line| line.as_str().trim_end().to_string())
             .collect()
+    }
+
+    /// A handoff as the next image would take it: its own descriptor on
+    /// the same PTY.
+    fn handed_off(tab: &mut Tab) -> TabState {
+        let mut state = tab.handoff().unwrap();
+        // SAFETY: `tab` keeps the descriptor open for this call.
+        let pty = unsafe { BorrowedFd::borrow_raw(state.pty) };
+        state.pty = std::os::fd::IntoRawFd::into_raw_fd(rustix::io::dup(pty).unwrap());
+        state
+    }
+
+    #[test]
+    fn a_resumed_tab_keeps_both_screens_its_modes_and_cursors() {
+        let mut tab = source_tab(20, 5);
+        tab.advance(b"one\r\ntwo\r\n\x1b[?2004h\x1b[?1h\x1b[?1049h\x1b[2;3Hfull screen");
+        let (tx, _) = std::sync::mpsc::channel();
+        let mut resumed = Tab::resume(handed_off(&mut tab), tx).unwrap();
+
+        assert!(resumed.engine.is_alt_screen_active());
+        assert!(resumed.engine.bracketed_paste_enabled());
+        assert_eq!(visible_text(&resumed.engine)[1], "  full screen");
+        assert_eq!(
+            (resumed.engine.cursor_pos().x, resumed.engine.cursor_pos().y),
+            (13, 1)
+        );
+        resumed.advance(b"\x1b[?1049l");
+        assert_eq!(&visible_text(&resumed.engine)[..3], ["one", "two", ""]);
+        assert_eq!(resumed.engine.cursor_pos().y, 2);
+
+        // The handoff leaves the source as it was, for an exec that fails.
+        assert!(tab.engine.is_alt_screen_active());
+        assert_eq!(visible_text(&tab.engine)[1], "  full screen");
+        tab.kill();
+    }
+
+    #[test]
+    fn a_resumed_tab_keeps_its_history_and_names() {
+        let mut tab = source_tab(20, 3);
+        for i in 0..10 {
+            tab.advance(format!("line {i}\r\n").as_bytes());
+        }
+        tab.set_name("work".into());
+        let (tx, _) = std::sync::mpsc::channel();
+        let resumed = Tab::resume(handed_off(&mut tab), tx).unwrap();
+        assert_eq!(all_text(&resumed.engine), all_text(&tab.engine));
+        assert_eq!(resumed.name, "work");
+        assert!(resumed.is_manually_named());
+        tab.kill();
     }
 
     fn assert_mirrors(mirror: &Tab, source: &Tab) {

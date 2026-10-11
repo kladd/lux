@@ -12,13 +12,16 @@ pub mod host;
 pub mod input;
 pub mod keys;
 pub mod layout;
+pub mod modes;
 pub mod palette;
+pub mod park;
 pub mod persist;
 pub mod search;
 pub mod serve;
 pub mod session;
 pub mod term;
 pub mod transition;
+pub mod upgrade;
 pub mod window;
 pub mod wire;
 
@@ -26,8 +29,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::net::Shutdown;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -73,6 +77,7 @@ pub enum ServerEvent {
     Ls(UnixStream),
     Kill(UnixStream),
     KillSession(UnixStream, String),
+    Upgrade(UnixStream),
     Resized(ConnId),
     ConnGone(ConnId),
     Input(ConnId, Vec<u8>),
@@ -109,6 +114,7 @@ struct Client {
     terminal: Terminal<FdBackend>,
     /// A second handle on stdout for raw escape writes.
     raw_out: File,
+    stdin: Arc<OwnedFd>,
     decoder: InputDecoder,
     stdin_stop: Arc<AtomicBool>,
     attached: SessionId,
@@ -139,35 +145,63 @@ struct HostChoice {
     from_command_line: bool,
 }
 
-pub fn run() -> i32 {
+/// `resume` holds the descriptors of an upgrade's state and of the
+/// upgrade command's connection.
+pub fn run(resume: Option<(RawFd, RawFd)>) -> i32 {
     // Detach from the controlling terminal so the server outlives it.
     // Fails harmlessly if already a session leader.
     let _ = rustix::process::setsid();
 
-    let dir = protocol::socket_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        eprintln!("lux server: cannot create {}", dir.display());
-        return 1;
-    }
-    let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-    let path = protocol::socket_path();
-    let _ = std::fs::remove_file(&path);
-    let listener = match UnixListener::bind(&path) {
-        Ok(listener) => listener,
-        Err(err) => {
-            eprintln!("lux server: bind {}: {err}", path.display());
-            return 1;
+    let (mut handoff, mut reply) = (None, None);
+    if let Some((state, reply_fd)) = resume {
+        // SAFETY: the previous image passed this for the upgrade command
+        // alone.
+        let mut stream = unsafe { upgrade::adopt_fd(reply_fd) }
+            .ok()
+            .map(UnixStream::from);
+        match upgrade::load(state) {
+            Ok(state) => handoff = Some(state),
+            Err(err) => {
+                if let Some(stream) = stream.as_mut() {
+                    let _ = protocol::write_line(stream, &format!("err cannot resume: {err}"));
+                }
+                stream = None;
+            }
         }
+        reply = stream;
+    }
+
+    let listener = match &handoff {
+        // SAFETY: the previous image passed the listener in the state.
+        Some(state) => match unsafe { upgrade::adopt_fd(state.listener) } {
+            Ok(fd) => UnixListener::from(fd),
+            Err(err) => {
+                eprintln!("lux server: resume listener: {err}");
+                return 1;
+            }
+        },
+        None => match bind() {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!("lux server: {err}");
+                return 1;
+            }
+        },
     };
+    let listener_fd = listener.as_raw_fd();
 
     let config = Arc::new(config::load());
     let (tx, rx) = mpsc::channel::<ServerEvent>();
 
     let accept_tx = tx.clone();
     thread::spawn(move || {
-        static NEXT_CONN: AtomicU64 = AtomicU64::new(0);
-        for stream in listener.incoming().flatten() {
-            let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let Ok(Some(Ok((stream, _)))) =
+                park::when_readable(&listener, park::WAIT, || listener.accept())
+            else {
+                continue;
+            };
+            let conn = next_conn();
             let tx = accept_tx.clone();
             thread::spawn(move || connection_thread(conn, stream, tx));
         }
@@ -203,11 +237,19 @@ pub fn run() -> i32 {
         hub: None,
         pending_hubs: Vec::new(),
         instance: instance_id(),
+        // Read now, while the path still names the running build.
+        exe: std::env::current_exe().unwrap_or_default(),
+        listener: listener_fd,
+        pending_upgrade: None,
     };
-    if config.restore
-        && let Some(snapshot) = persist::load()
-    {
-        server.restore_sessions(&snapshot);
+    match handoff {
+        Some(state) => server.resume(state, reply),
+        None if config.restore => {
+            if let Some(snapshot) = persist::load() {
+                server.restore_sessions(&snapshot);
+            }
+        }
+        None => {}
     }
     loop {
         let timeout = if server.needs_frame_tick() {
@@ -230,6 +272,9 @@ pub fn run() -> i32 {
                 server.handle(event);
             }
         }
+        if let Some(reply) = server.pending_upgrade.take() {
+            server.upgrade(reply, &rx);
+        }
         server.tick_agents();
         server.tick_auto();
         server.tick_hosts();
@@ -239,6 +284,20 @@ pub fn run() -> i32 {
         server.tick_save();
         server.render_all();
     }
+}
+
+fn bind() -> Result<UnixListener, String> {
+    let dir = protocol::socket_dir();
+    std::fs::create_dir_all(&dir).map_err(|_| format!("cannot create {}", dir.display()))?;
+    let _ = std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let path = protocol::socket_path();
+    let _ = std::fs::remove_file(&path);
+    UnixListener::bind(&path).map_err(|err| format!("bind {}: {err}", path.display()))
+}
+
+fn next_conn() -> ConnId {
+    static NEXT_CONN: AtomicU64 = AtomicU64::new(0);
+    NEXT_CONN.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Tells this server apart from others, so a hub never adopts itself.
@@ -279,6 +338,9 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
         Request::KillSession(name) => {
             let _ = tx.send(ServerEvent::KillSession(stream, name));
         }
+        Request::Upgrade => {
+            let _ = tx.send(ServerEvent::Upgrade(stream));
+        }
         Request::Proxy => {
             let Ok(reader) = stream.try_clone() else {
                 return;
@@ -303,7 +365,7 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
             let (Some(stdin), Some(stdout)) = (fds.next(), fds.next()) else {
                 return;
             };
-            let Ok(mut control) = stream.try_clone() else {
+            let Ok(control) = stream.try_clone() else {
                 return;
             };
             if tx
@@ -318,20 +380,25 @@ fn connection_thread(conn: ConnId, stream: UnixStream, tx: Sender<ServerEvent>) 
             {
                 return;
             }
-            loop {
-                match protocol::read_line(&mut control) {
-                    Ok(Some(line)) if Request::decode(&line) == Some(Request::Resize) => {
-                        let _ = tx.send(ServerEvent::Resized(conn));
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => {
-                        let _ = tx.send(ServerEvent::ConnGone(conn));
-                        return;
-                    }
-                }
-            }
+            watch_control(conn, control, tx);
         }
         Request::Resize => {}
+    }
+}
+
+/// Relays an attached client's resizes until its connection closes.
+fn watch_control(conn: ConnId, mut control: UnixStream, tx: Sender<ServerEvent>) {
+    loop {
+        match protocol::read_line(&mut control) {
+            Ok(Some(line)) if Request::decode(&line) == Some(Request::Resize) => {
+                let _ = tx.send(ServerEvent::Resized(conn));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = tx.send(ServerEvent::ConnGone(conn));
+                return;
+            }
+        }
     }
 }
 
@@ -357,6 +424,11 @@ struct Server {
     /// Hubs mid-handshake while another holds this host.
     pending_hubs: Vec<serve::Hub>,
     instance: u64,
+    /// The executable an upgrade execs.
+    exe: PathBuf,
+    listener: RawFd,
+    /// The upgrade command waiting for this pass's events to finish.
+    pending_upgrade: Option<UnixStream>,
 }
 
 impl Server {
@@ -514,6 +586,7 @@ impl Server {
             ServerEvent::Ls(_)
             | ServerEvent::Kill(_)
             | ServerEvent::KillSession(..)
+            | ServerEvent::Upgrade(_)
             | ServerEvent::Resized(_)
             | ServerEvent::ConnGone(_)
             | ServerEvent::ProgramCopy(..)
@@ -581,6 +654,13 @@ impl Server {
                     );
                 }
             },
+            ServerEvent::Upgrade(mut stream) => {
+                if self.pending_upgrade.is_some() {
+                    let _ = protocol::write_line(&mut stream, "err an upgrade is under way");
+                } else {
+                    self.pending_upgrade = Some(stream);
+                }
+            }
             ServerEvent::Resized(conn) => {
                 let Some(client) = self.clients.get_mut(&conn) else {
                     return;
@@ -677,6 +757,22 @@ impl Server {
         if protocol::write_line(&mut stream, "ok").is_err() {
             return;
         }
+        self.seat_client(conn, stream, sid, stdin, stdout_file);
+        if let Some(session) = self.sessions.get_mut(&sid) {
+            session.materialize();
+        }
+        self.note_attached(sid);
+    }
+
+    /// Hands an acknowledged client's terminal to `sid`.
+    fn seat_client(
+        &mut self,
+        conn: ConnId,
+        stream: UnixStream,
+        sid: SessionId,
+        stdin: OwnedFd,
+        stdout_file: File,
+    ) {
         let size = term::fd_size(&stdout_file);
         let area = session_area(&self.config, size);
 
@@ -699,12 +795,12 @@ impl Server {
         let _ = terminal.clear();
         query_colors(&mut raw_out);
 
+        let stdin = Arc::new(stdin);
         let stdin_stop = Arc::new(AtomicBool::new(false));
-        spawn_stdin_reader(conn, stdin, stdin_stop.clone(), self.tx.clone());
+        spawn_stdin_reader(conn, stdin.clone(), stdin_stop.clone(), self.tx.clone());
 
         if let Some(session) = self.sessions.get_mut(&sid) {
             session.set_area(area);
-            session.materialize();
         }
 
         self.clients.insert(
@@ -713,6 +809,7 @@ impl Server {
                 control: stream,
                 terminal,
                 raw_out,
+                stdin,
                 decoder: InputDecoder::default(),
                 stdin_stop,
                 attached: sid,
@@ -727,7 +824,6 @@ impl Server {
                 colors: palette::TermColors::default(),
             },
         );
-        self.note_attached(sid);
     }
 
     fn create_session(&mut self, name: Option<String>, area: Rect) -> Result<SessionId, String> {
@@ -2603,28 +2699,21 @@ pub(crate) fn clear_region(buf: &mut Buffer, area: Rect) {
 /// detach.
 fn spawn_stdin_reader(
     conn: ConnId,
-    stdin: OwnedFd,
+    stdin: Arc<OwnedFd>,
     stop: Arc<AtomicBool>,
     tx: Sender<ServerEvent>,
 ) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
-        let idle = rustix::event::Timespec {
-            tv_sec: 0,
-            tv_nsec: 25_000_000,
-        };
+        let idle = std::time::Duration::from_millis(25);
         // The first timeout after a burst signals idle exactly once.
         let mut busy = false;
         loop {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            let mut fds = [rustix::event::PollFd::new(
-                &stdin,
-                rustix::event::PollFlags::IN,
-            )];
-            match rustix::event::poll(&mut fds, Some(&idle)) {
-                Ok(0) => {
+            match park::when_readable(&*stdin, idle, || rustix::io::read(&*stdin, &mut buf)) {
+                Ok(None) => {
                     if busy {
                         busy = false;
                         if tx.send(ServerEvent::InputIdle(conn)).is_err() {
@@ -2632,19 +2721,16 @@ fn spawn_stdin_reader(
                         }
                     }
                 }
-                Ok(_) => match rustix::io::read(&stdin, &mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        busy = true;
-                        if tx
-                            .send(ServerEvent::Input(conn, buf[..n].to_vec()))
-                            .is_err()
-                        {
-                            return;
-                        }
+                Ok(Some(Ok(0) | Err(_))) | Err(_) => return,
+                Ok(Some(Ok(n))) => {
+                    busy = true;
+                    if tx
+                        .send(ServerEvent::Input(conn, buf[..n].to_vec()))
+                        .is_err()
+                    {
+                        return;
                     }
-                },
-                Err(_) => return,
+                }
             }
         }
     });

@@ -26,9 +26,11 @@ const RAIN_FALL: (f32, f32) = (0.35, 0.6);
 const RAIN_TRAIL: (f32, f32) = (8.0, 20.0);
 /// The most decoy streams falling ahead of a column's revealing one.
 const RAIN_DECOYS: u32 = 2;
-/// How long a scrambled glyph holds before changing.
-const RAIN_GLYPH_MS: f32 = 70.0;
-/// The chance a revealed cell flashes bold in any glyph period.
+/// The shortest and longest a scrambled glyph holds before changing.
+const RAIN_GLYPH_MS: (f32, f32) = (50.0, 300.0);
+/// How often a revealed cell may flash bold.
+const RAIN_FLICKER_MS: f32 = 70.0;
+/// The chance a revealed cell flashes bold in any flicker period.
 const RAIN_FLICKER: f32 = 0.02;
 /// Digits and symbols scrambled glyphs draw from besides half-width
 /// katakana.
@@ -250,7 +252,8 @@ fn rain(palette: Palette, colors: TermColors) -> Effect {
         let area = ctx.area;
         let alpha = ctx.alpha();
         let rows = f32::from(area.height);
-        let period = alpha * ms as f32 / RAIN_GLYPH_MS;
+        let elapsed = alpha * ms as f32;
+        let period = elapsed / RAIN_FLICKER_MS;
         let accent = colors.rgb(palette.accent).unwrap_or((0, 205, 0));
         let bg = colors
             .bg
@@ -283,7 +286,7 @@ fn rain(palette: Palette, colors: TermColors) -> Effect {
                     let settle = reveal.trail * (0.3 + 0.6 * noise(x, y, 4));
                     if scrambles && behind < settle {
                         let (color, bold) = glyph_color(behind, reveal.trail);
-                        draw_glyph(&mut buf[pos], glyph(x, y, period), color, bold);
+                        draw_glyph(&mut buf[pos], glyph(x, y, elapsed), color, bold);
                     } else {
                         let settled = ((behind - settle) / (reveal.trail - settle)).max(0.0);
                         dim_cell(buf, pos, &palette, &colors, 0.25 + 0.75 * settled);
@@ -296,7 +299,7 @@ fn rain(palette: Palette, colors: TermColors) -> Effect {
                         .find(|&(behind, trail)| behind > 0.0 && behind < trail);
                     if let Some((behind, trail)) = decoy.filter(|_| scrambles) {
                         let (color, bold) = glyph_color(behind, trail);
-                        draw_glyph(&mut buf[pos], glyph(x, y, period), color, bold);
+                        draw_glyph(&mut buf[pos], glyph(x, y, elapsed), color, bold);
                     }
                 }
             }
@@ -319,10 +322,13 @@ fn draw_glyph(cell: &mut Cell, ch: char, color: Color, bold: bool) {
     }
 }
 
-/// The glyph at a cell `period` glyph periods into the run; each cell
-/// changes on its own beat.
-fn glyph(x: u16, y: u16, period: f32) -> char {
-    let step = (period + noise(x, y, 3)) as u32;
+/// The glyph at a cell `elapsed` ms into the run; each cell changes on its
+/// own interval, most holding a while and a few churning.
+fn glyph(x: u16, y: u16, elapsed: f32) -> char {
+    let (shortest, longest) = RAIN_GLYPH_MS;
+    let slow = 1.0 - (1.0 - noise(x, y, 5)).powi(2);
+    let interval = shortest + (longest - shortest) * slow;
+    let step = (elapsed / interval + noise(x, y, 3)) as u32;
     let count = KATAKANA.1 as usize + RAIN_SYMBOLS.len();
     nth_glyph((noise(x, y, 1000 + step) * count as f32) as usize % count)
 }
@@ -643,6 +649,21 @@ mod tests {
         assert!(heads.len() >= 3, "frames falling: {heads:?}");
         assert!(heads.is_sorted_by_key(|p| p.y), "moves down: {heads:?}");
         assert!(changed, "trail glyphs change in place");
+    }
+
+    #[test]
+    fn rain_glyphs_change_at_different_rates() {
+        let changes: Vec<usize> = (0..20)
+            .map(|x| {
+                let glyphs: Vec<char> = (0..3000).map(|ms| glyph(x, 0, ms as f32)).collect();
+                glyphs.windows(2).filter(|w| w[0] != w[1]).count()
+            })
+            .collect();
+        let (fewest, most) = (changes.iter().min(), changes.iter().max());
+        assert!(
+            most.unwrap() >= &(2 * fewest.unwrap()),
+            "glyphs change in step: {changes:?}"
+        );
     }
 
     #[test]

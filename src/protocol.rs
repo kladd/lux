@@ -24,6 +24,8 @@ pub enum Request {
     /// Hand the stream to an adopting hub's frames once the server
     /// answers `ok`.
     Proxy,
+    /// Replace the server with a new build; answered `ok <version>`.
+    Upgrade,
 }
 
 impl Request {
@@ -37,6 +39,7 @@ impl Request {
             Request::KillSession(name) => format!("kill-session {name}\n"),
             Request::Resize => "resize\n".into(),
             Request::Proxy => "proxy\n".into(),
+            Request::Upgrade => "upgrade\n".into(),
         }
     }
 
@@ -52,6 +55,7 @@ impl Request {
                 "kill" => Request::Kill,
                 "resize" => Request::Resize,
                 "proxy" => Request::Proxy,
+                "upgrade" => Request::Upgrade,
                 _ => return None,
             },
             _ => return None,
@@ -138,10 +142,31 @@ mod tests {
             Request::Kill,
             Request::KillSession("work".into()),
             Request::Resize,
+            Request::Proxy,
+            Request::Upgrade,
         ] {
             assert_eq!(Request::decode(&req.encode()), Some(req));
         }
         assert_eq!(Request::decode("bogus\n"), None);
         assert_eq!(Request::decode("session \n"), None);
+    }
+
+    /// Clients attached before an upgrade keep running the old build and
+    /// still send these.
+    #[test]
+    fn earlier_builds_requests_still_decode() {
+        for (line, req) in [
+            ("new\n", Request::New),
+            ("session work\n", Request::Session("work".into())),
+            ("recent\n", Request::Recent),
+            ("ls\n", Request::Ls),
+            ("kill\n", Request::Kill),
+            ("kill-session work\n", Request::KillSession("work".into())),
+            ("resize\n", Request::Resize),
+            ("resize", Request::Resize),
+            ("proxy\n", Request::Proxy),
+        ] {
+            assert_eq!(Request::decode(line), Some(req));
+        }
     }
 }

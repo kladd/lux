@@ -1,5 +1,11 @@
 # News
 
+## 2026-10-07
+
+- `lux upgrade` swaps in a new build of the server without stopping tab
+  programs or detaching clients.
+- Rain attach glyphs change at varied rates instead of in lockstep.
+
 ## 2026-10-02
 - Add mouse support to CLAUDECOM. Can be enabled with `grid-mouse = true`.
   Single click enters capture mode, clicking again while in capture mode 
