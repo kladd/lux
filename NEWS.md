@@ -1,5 +1,11 @@
 # News
 
+## 2026-10-10
+
+- Resizing the terminal restores mouse capture if the terminal dropped it.
+- `:upgrade` upgrades the server from inside lux, reporting the result as
+  a status message.
+
 ## 2026-10-07
 
 - `lux upgrade` swaps in a new build of the server without stopping tab

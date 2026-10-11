@@ -13,6 +13,7 @@ pub const COMMANDS: &[&str] = &[
     "new-session",
     "rename-session",
     "sp",
+    "upgrade",
     "vs",
     "w",
 ];
@@ -36,6 +37,8 @@ pub enum ExCommand {
     /// Adopt the sessions of the host at this ssh alias.
     Connect(String),
     Disconnect(String),
+    /// Replace the server with the executable it started from.
+    Upgrade,
 }
 
 pub fn parse(text: &str) -> Option<ExCommand> {
@@ -46,6 +49,7 @@ pub fn parse(text: &str) -> Option<ExCommand> {
         "kill-session" => Some(ExCommand::KillSession(None)),
         "config-open" => Some(ExCommand::ConfigOpen),
         "config-reload" => Some(ExCommand::ConfigReload),
+        "upgrade" => Some(ExCommand::Upgrade),
         _ => {
             if let Some(name) = arg(text, "new").or_else(|| arg(text, "new-session")) {
                 return Some(ExCommand::NewSession(Some(name.to_string())));
@@ -123,6 +127,7 @@ mod tests {
         assert_eq!(parse("w   spaced"), Some(ExCommand::Write("spaced".into())));
         assert_eq!(parse("config-open"), Some(ExCommand::ConfigOpen));
         assert_eq!(parse("config-reload"), Some(ExCommand::ConfigReload));
+        assert_eq!(parse("upgrade"), Some(ExCommand::Upgrade));
     }
 
     #[test]
@@ -193,6 +198,7 @@ mod tests {
                 "new-session",
                 "rename-session",
                 "sp",
+                "upgrade",
                 "vs",
                 "w"
             ]

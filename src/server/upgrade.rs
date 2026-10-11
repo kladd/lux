@@ -242,7 +242,43 @@ fn exec(exe: &Path, state: &State, reply: &UnixStream) -> std::io::Error {
     err
 }
 
+/// Written ahead of an upgrade `:upgrade` started, for the new image to
+/// find on its reply.
+const EX_MARKER: &str = "ex";
+
 impl Server {
+    /// Queues an upgrade whose outcome shows as a status message, since
+    /// no upgrade command is waiting on a reply.
+    pub(super) fn start_ex_upgrade(&mut self, conn: ConnId) {
+        if self.pending_upgrade.is_some() {
+            self.tell(conn, "an upgrade is under way".into());
+            return;
+        }
+        let pair = UnixStream::pair().and_then(|(mut ours, theirs)| {
+            protocol::write_line(&mut ours, EX_MARKER)?;
+            Ok((ours, theirs))
+        });
+        match pair {
+            Ok((ours, theirs)) => {
+                self.pending_upgrade = Some(theirs);
+                self.ex_upgrade = Some((conn, ours));
+            }
+            Err(err) => self.tell(conn, format!("upgrade: {err}")),
+        }
+    }
+
+    /// Shows the error an `:upgrade` that returned wrote to its reply.
+    pub(super) fn report_ex_upgrade_failure(&mut self) {
+        let Some((conn, mut ours)) = self.ex_upgrade.take() else {
+            return;
+        };
+        let _ = ours.set_nonblocking(true);
+        if let Ok(Some(line)) = protocol::read_line(&mut ours) {
+            let err = line.strip_prefix("err ").unwrap_or(&line);
+            self.tell(conn, format!("upgrade: {err}"));
+        }
+    }
+
     pub(super) fn upgrade(&mut self, mut reply: UnixStream, rx: &Receiver<ServerEvent>) {
         if let Err(err) = check(&self.exe) {
             let _ = protocol::write_line(&mut reply, &format!("err {err}"));
@@ -359,7 +395,16 @@ impl Server {
                 tab.prompt_redraw();
             }
         }
-        if let Some(reply) = reply.as_mut() {
+        let Some(reply) = reply.as_mut() else {
+            return;
+        };
+        // The upgrade command sends nothing after its request, so only
+        // `:upgrade` leaves a line to read.
+        let _ = reply.set_nonblocking(true);
+        if matches!(protocol::read_line(reply), Ok(Some(line)) if line == EX_MARKER) {
+            self.tell_all(format!("upgraded to {}", version()));
+        } else {
+            let _ = reply.set_nonblocking(false);
             let _ = protocol::write_line(reply, &format!("ok {}", version()));
         }
     }

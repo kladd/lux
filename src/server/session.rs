@@ -71,6 +71,7 @@ pub enum Effect {
     /// Adopt a host's sessions by ssh alias.
     Connect(String),
     Disconnect(String),
+    Upgrade,
     Copy(String),
     Paste,
     /// Mouse pointer shape, as an OSC 22 name.
@@ -1682,6 +1683,7 @@ impl Session {
                         Some(ExCommand::Disconnect(alias)) => {
                             return Some(Effect::Disconnect(alias));
                         }
+                        Some(ExCommand::Upgrade) => return Some(Effect::Upgrade),
                         None => {}
                     },
                     PromptKind::Rename => {

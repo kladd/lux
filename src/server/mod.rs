@@ -40,7 +40,7 @@ use std::thread;
 use ratatui::Terminal;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
-    KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers as CtMods,
+    EnableMouseCapture, KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers as CtMods,
     MouseButton as CtMouseButton, MouseEvent as CtMouseEvent, MouseEventKind as CtMouseKind,
 };
 use ratatui::layout::{Position, Rect};
@@ -241,6 +241,7 @@ pub fn run(resume: Option<(RawFd, RawFd)>) -> i32 {
         exe: std::env::current_exe().unwrap_or_default(),
         listener: listener_fd,
         pending_upgrade: None,
+        ex_upgrade: None,
     };
     match handoff {
         Some(state) => server.resume(state, reply),
@@ -274,6 +275,7 @@ pub fn run(resume: Option<(RawFd, RawFd)>) -> i32 {
         }
         if let Some(reply) = server.pending_upgrade.take() {
             server.upgrade(reply, &rx);
+            server.report_ex_upgrade_failure();
         }
         server.tick_agents();
         server.tick_auto();
@@ -429,6 +431,8 @@ struct Server {
     listener: RawFd,
     /// The upgrade command waiting for this pass's events to finish.
     pending_upgrade: Option<UnixStream>,
+    /// The client that ran `:upgrade`, and its end of the reply.
+    ex_upgrade: Option<(ConnId, UnixStream)>,
 }
 
 impl Server {
@@ -665,6 +669,8 @@ impl Server {
                 let Some(client) = self.clients.get_mut(&conn) else {
                     return;
                 };
+                // The host terminal may have dropped mouse capture.
+                let _ = ratatui::crossterm::execute!(client.raw_out, EnableMouseCapture);
                 let size = term::fd_size(&client.raw_out);
                 client.terminal.backend_mut().set_size(size);
                 if let Some(session) = self.sessions.get_mut(&client.attached) {
@@ -1138,6 +1144,7 @@ impl Server {
             }
             Effect::Connect(alias) => self.connect(conn, alias),
             Effect::Disconnect(alias) => self.disconnect(conn, alias),
+            Effect::Upgrade => self.start_ex_upgrade(conn),
             Effect::ReloadConfig => self.apply_config(sid, config::reload()),
             Effect::SetConfig(key, value) => self.apply_config(sid, config::set(&key, &value)),
             // OSC 52 too, so an outer terminal or SSH hop sees it.

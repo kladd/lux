@@ -941,6 +941,7 @@ mod tests {
             exe: std::path::PathBuf::new(),
             listener: -1,
             pending_upgrade: None,
+            ex_upgrade: None,
         };
         (server, rx)
     }
