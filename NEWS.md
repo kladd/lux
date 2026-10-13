@@ -1,5 +1,13 @@
 # News
 
+## 2026-10-13
+
+- Clicking a session in the switcher switches to it and leaves the
+  switcher open.
+- Closing a tab hangs up its terminal even after an upgrade or while a
+  host is connected, so jobs left on it no longer linger.
+- New splits start in the focused tab's working directory, like new tabs.
+
 ## 2026-10-10
 
 - Resizing the terminal restores mouse capture if the terminal dropped it.

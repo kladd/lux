@@ -1259,7 +1259,7 @@ impl Server {
                         if let Some(client) = self.clients.get_mut(&conn) {
                             client.switcher = Some(index);
                         }
-                        self.switcher_select(conn, index);
+                        self.switcher_attach(conn, index);
                     }
                 }
                 return;
@@ -1491,6 +1491,13 @@ impl Server {
         };
         client.switcher = None;
         client.new_session = None;
+        self.switcher_attach(conn, highlight);
+    }
+
+    fn switcher_attach(&mut self, conn: ConnId, highlight: usize) {
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
         client.auto = None;
         let Some(&target) = switcher_order(&self.sessions).get(highlight) else {
             return;

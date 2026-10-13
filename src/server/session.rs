@@ -1776,8 +1776,9 @@ impl Session {
             }
         }
         let id = self.next_window_id;
+        let beside = self.windows[&self.focus].active_tab().id;
         // If the shell can't spawn, keep the current layout.
-        let Ok(tab) = self.spawn_tab(content_rect(second), None) else {
+        let Ok(tab) = self.spawn_tab(content_rect(second), Some(beside)) else {
             return;
         };
         self.next_window_id += 1;

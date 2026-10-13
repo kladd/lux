@@ -1417,7 +1417,7 @@ fn local_engine(
 ) -> anyhow::Result<Engine> {
     let fd = master.as_raw_fd().context("PTY has no descriptor")?;
     // SAFETY: `master` keeps the descriptor open for this call.
-    let reader = rustix::io::dup(unsafe { BorrowedFd::borrow_raw(fd) })?;
+    let reader = rustix::io::fcntl_dupfd_cloexec(unsafe { BorrowedFd::borrow_raw(fd) }, 0)?;
     let writer = master.take_writer()?;
     spawn_pty_reader(id, reader, tx.clone());
     let mut engine = Engine::new(

@@ -468,11 +468,15 @@ impl MasterPty for AdoptedPty {
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
-        Ok(Box::new(File::from(rustix::io::dup(&self.0)?)))
+        Ok(Box::new(File::from(rustix::io::fcntl_dupfd_cloexec(
+            &self.0, 0,
+        )?)))
     }
 
     fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
-        Ok(Box::new(File::from(rustix::io::dup(&self.0)?)))
+        Ok(Box::new(File::from(rustix::io::fcntl_dupfd_cloexec(
+            &self.0, 0,
+        )?)))
     }
 
     fn process_group_leader(&self) -> Option<i32> {
