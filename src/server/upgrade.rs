@@ -23,7 +23,7 @@ use crate::protocol;
 use crate::server::layout::WindowId;
 use crate::server::persist::NodeSnapshot;
 use crate::server::session::Session;
-use crate::server::{ConnId, Server, ServerEvent, SessionId, park};
+use crate::server::{ConnId, HostId, Server, ServerEvent, SessionId, park, switcher_order};
 
 /// Bumped whenever `State` changes shape, including through the wezterm
 /// types it carries.
@@ -313,11 +313,12 @@ impl Server {
     }
 
     fn capture(&mut self) -> State {
-        let local: Vec<SessionId> = self
-            .sessions
+        // In list order, which resuming keeps.
+        let order = switcher_order(&self.sessions, &self.list_order);
+        let local: Vec<SessionId> = order
             .iter()
-            .filter(|(_, s)| !s.is_remote())
-            .map(|(&sid, _)| sid)
+            .copied()
+            .filter(|sid| self.sessions.get(sid).is_some_and(|s| !s.is_remote()))
             .collect();
         let position = |sid: &SessionId| local.iter().position(|s| s == sid);
         let attach_order = self.attach_order.iter().filter_map(position).collect();
@@ -337,9 +338,20 @@ impl Server {
                 })
             })
             .collect();
-        let hosts = self
-            .hosts
-            .values()
+        // Reconnected in this order, so their groups keep their places.
+        let mut host_ids: Vec<HostId> = Vec::new();
+        for id in order
+            .iter()
+            .filter_map(|sid| self.sessions.get(sid)?.host.as_ref().map(|h| h.id))
+            .chain(self.hosts.keys().copied())
+        {
+            if !host_ids.contains(&id) {
+                host_ids.push(id);
+            }
+        }
+        let hosts = host_ids
+            .iter()
+            .filter_map(|id| self.hosts.get(id))
             .filter(|h| h.online())
             .map(|h| h.alias.clone())
             .collect();

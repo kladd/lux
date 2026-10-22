@@ -1,5 +1,10 @@
 # News
 
+## 2026-10-19
+
+- Drag sessions, hosts' session groups, and tabs with the mouse to
+  reorder them; session order survives restarts.
+
 ## 2026-10-13
 
 - Clicking a session in the switcher switches to it and leaves the

@@ -934,6 +934,7 @@ mod tests {
             tx,
             hosts: BTreeMap::new(),
             next_host_id: 0,
+            list_order: crate::server::order::ListOrder::default(),
             pending_attaches: HashMap::new(),
             hub: None,
             pending_hubs: Vec::new(),

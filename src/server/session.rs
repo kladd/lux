@@ -95,6 +95,48 @@ struct BorderDrag {
     moved: bool,
 }
 
+struct TabDrag {
+    window: WindowId,
+    index: usize,
+    /// The bar's row and each shown badge's columns as the drag began, so
+    /// the preview's shifting badges don't move the drop position.
+    bar: u16,
+    spans: Vec<(usize, std::ops::Range<u16>)>,
+    /// The pointer's column at the press.
+    grab: u16,
+    /// A press released without leaving its badge is a click.
+    moved: bool,
+    /// The badge whose position the tab would take.
+    target: Option<usize>,
+}
+
+impl TabDrag {
+    fn badge_at(&self, pos: Position) -> Option<usize> {
+        (pos.y == self.bar)
+            .then(|| self.spans.iter().find(|(_, s)| s.contains(&pos.x)))
+            .flatten()
+            .map(|(i, _)| *i)
+    }
+
+    /// A pointer drifted a few rows below the bar still drops by its column,
+    /// and one past either end of the tabs drops at that end.
+    fn drop_target(&self, pos: Position) -> Option<usize> {
+        if !(self.bar..=self.bar.saturating_add(TAB_DRAG_DRIFT)).contains(&pos.y) {
+            return None;
+        }
+        let ((first, first_span), (last, last_span)) = (self.spans.first()?, self.spans.last()?);
+        let target = if pos.x < first_span.start {
+            *first
+        } else if pos.x >= last_span.end {
+            *last
+        } else {
+            let shift = pos.x as i32 - self.grab as i32;
+            return drop_target(&self.spans, self.index, shift);
+        };
+        (target != self.index).then_some(target)
+    }
+}
+
 /// A linear text selection in content-relative cell coordinates.
 struct Selection {
     window: WindowId,
@@ -201,6 +243,9 @@ const CONTROLS_WIDTH: u16 = 6;
 
 /// Truncation stops here, ellipsis included; past it the bar scrolls.
 const MIN_NAME_WIDTH: usize = 8;
+
+/// Rows below a tab bar a tab drag may stray and still drop.
+const TAB_DRAG_DRIFT: u16 = 4;
 
 struct TabBadge {
     index: usize,
@@ -358,6 +403,7 @@ pub struct Session {
     message: Option<String>,
     selection: Option<Selection>,
     border_drag: Option<BorderDrag>,
+    tab_drag: Option<TabDrag>,
     /// Set by the server each render pass.
     indicator: Option<Indicator>,
     /// Tabs held as pending yanks, set by the server each render pass.
@@ -444,6 +490,7 @@ impl Session {
             message: None,
             selection: None,
             border_drag: None,
+            tab_drag: None,
             indicator: None,
             yanked: Vec::new(),
             term_colors: palette::TermColors::default(),
@@ -1274,6 +1321,13 @@ impl Session {
         if self.border_drag.is_some() {
             return self.drag_border(&mouse, pos);
         }
+        // A press means the drag's release went missing.
+        if matches!(mouse.kind, CtMouseKind::Down(_)) && self.tab_drag.take().is_some() {
+            self.force_redraw = true;
+        }
+        if self.tab_drag.is_some() {
+            return self.drag_tab(&mouse, pos);
+        }
         match mouse.kind {
             CtMouseKind::Down(button) => {
                 if button == CtMouseButton::Left
@@ -1289,6 +1343,31 @@ impl Session {
                 }
                 if button == CtMouseButton::Left && self.menu_icon_at(pos) {
                     return Some(Effect::OpenSwitcher);
+                }
+                // Badges win over a tab bar's drag boundary.
+                if button == CtMouseButton::Left
+                    && let Some(id) = self.window_at(pos)
+                    && let Some(index) = self.tab_badge_at(id, pos)
+                {
+                    if self.focus != id {
+                        self.set_focus(id);
+                        self.force_redraw = true;
+                    }
+                    let chrome = self.view.chrome.iter().find(|c| c.window == id)?;
+                    self.tab_drag = Some(TabDrag {
+                        window: id,
+                        index,
+                        bar: chrome.tab_bar.y,
+                        spans: chrome
+                            .tabs
+                            .iter()
+                            .map(|b| (b.index, b.span.clone()))
+                            .collect(),
+                        grab: pos.x,
+                        moved: false,
+                        target: None,
+                    });
+                    return None;
                 }
                 // A press on a boundary starts a drag. A click on the chrome
                 // underneath resolves on release if nothing moved.
@@ -1309,12 +1388,6 @@ impl Session {
                     && let Some(control) = self.control_at(id, pos)
                 {
                     self.click_control(id, control);
-                    return None;
-                }
-                if button == CtMouseButton::Left
-                    && let Some(index) = self.tab_badge_at(id, pos)
-                {
-                    self.select_tab(index);
                     return None;
                 }
                 if button == CtMouseButton::Middle
@@ -1457,14 +1530,59 @@ impl Session {
                     }
                     if let Some(control) = self.control_at(id, pos) {
                         self.click_control(id, control);
-                    } else if let Some(index) = self.tab_badge_at(id, pos) {
-                        self.select_tab(index);
                     }
                 }
             }
             _ => {}
         }
         None
+    }
+
+    /// A release without leaving the badge is a plain click.
+    fn drag_tab(&mut self, mouse: &CtMouseEvent, pos: Position) -> Option<Effect> {
+        let drag = self.tab_drag.as_ref().expect("drag in progress");
+        let (id, index) = (drag.window, drag.index);
+        match mouse.kind {
+            CtMouseKind::Drag(CtMouseButton::Left) => {
+                let drag = self.tab_drag.as_mut().expect("drag in progress");
+                let moved = drag.moved || drag.badge_at(pos) != Some(index);
+                let target = drag.drop_target(pos);
+                if drag.moved != moved || drag.target != target {
+                    drag.moved = moved;
+                    drag.target = target;
+                    self.force_redraw = true;
+                }
+                if moved {
+                    return Some(Effect::Pointer("grabbing"));
+                }
+            }
+            CtMouseKind::Up(CtMouseButton::Left) => {
+                let drag = self.tab_drag.take().expect("drag in progress");
+                if !drag.moved {
+                    self.select_tab(index);
+                } else if let Some(target) = drag.drop_target(pos) {
+                    self.move_tab_within(id, index, target);
+                }
+                self.force_redraw = true;
+                return Some(Effect::Pointer(self.pointer_shape(pos)));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The active tab stays active wherever it lands.
+    fn move_tab_within(&mut self, id: WindowId, from: usize, to: usize) {
+        let Some(win) = self.windows.get_mut(&id) else {
+            return;
+        };
+        if from >= win.tabs.len() || to >= win.tabs.len() {
+            return;
+        }
+        let tab = win.tabs.remove(from);
+        win.tabs.insert(to, tab);
+        win.active = moved_index(win.active, from, to);
+        self.force_redraw = true;
     }
 
     /// An OSC 22 pointer name. Terminals without pointer support ignore it.
@@ -2420,20 +2538,30 @@ impl Session {
                 win.active_tab_mut().mark_seen();
             }
             let progress = win.active_tab().progress();
-            let active = win.active;
+            // A dragged tab shows in the place it would land.
+            let drag = self.tab_drag.as_ref().filter(|d| d.window == id && d.moved);
+            let mut order: Vec<usize> = (0..win.tabs.len()).collect();
+            if let Some(d) = drag
+                && let Some(to) = d.target
+                && d.index < order.len()
+                && to < order.len()
+            {
+                let from = order.remove(d.index);
+                order.insert(to, from);
+            }
+            let shown: Vec<&Tab> = order.iter().map(|&j| &win.tabs[j]).collect();
+            let active = order.iter().position(|&j| j == win.active).unwrap_or(0);
             let bar = win.tab_bar_rect();
             // Room for the controls past the two-cell rule lead-in.
             let controls = (bar.height > 0 && bar.width >= CONTROLS_WIDTH + 2)
                 .then(|| Rect::new(bar.right() - CONTROLS_WIDTH, bar.y, CONTROLS_WIDTH, 1));
             let badges_end = controls.map_or(bar.right(), |c| c.x);
-            let visuals: Vec<Option<agent::Visual>> = win
-                .tabs
+            let visuals: Vec<Option<agent::Visual>> = shown
                 .iter()
                 .map(|t| t.agent.as_ref().map(|a| a.visual(now)))
                 .collect();
-            let marks: Vec<bool> = win.tabs.iter().map(|t| yanked.contains(&t.id)).collect();
-            let dots: Vec<Option<Activity>> = win
-                .tabs
+            let marks: Vec<bool> = shown.iter().map(|t| yanked.contains(&t.id)).collect();
+            let dots: Vec<Option<Activity>> = shown
                 .iter()
                 .map(|t| t.activity.filter(|_| t.agent.is_none()))
                 .collect();
@@ -2451,7 +2579,7 @@ impl Session {
                 })
                 .collect();
             let fixed_total: usize = fixed.iter().sum();
-            let name_lens: Vec<usize> = win.tabs.iter().map(|t| t.name.chars().count()).collect();
+            let name_lens: Vec<usize> = shown.iter().map(|t| t.name.chars().count()).collect();
             let floors: Vec<usize> = name_lens.iter().map(|&l| l.min(MIN_NAME_WIDTH)).collect();
             let avail = badges_end.saturating_sub(bar.x.saturating_add(2)) as usize;
             let (widths, run) = if fixed_total + floors.iter().sum::<usize>() <= avail {
@@ -2472,8 +2600,7 @@ impl Session {
                 .x
                 .saturating_add(2 + 2 * more_left as u16)
                 .min(badges_end);
-            let tabs: Vec<TabBadge> = win
-                .tabs
+            let tabs: Vec<TabBadge> = shown
                 .iter()
                 .zip(visuals)
                 .enumerate()
@@ -2830,6 +2957,43 @@ fn allocate_name_widths(lens: &[usize], budget: usize) -> Vec<usize> {
         }
     }
     alloc
+}
+
+/// The place a tab dragged from `from` and moved `shift` columns takes: the
+/// farthest badge its moved leading edge reaches a quarter of the way into.
+fn drop_target(spans: &[(usize, std::ops::Range<u16>)], from: usize, shift: i32) -> Option<usize> {
+    // In quarter cells, so a quarter of any width stays whole.
+    let q = |x: u16| 4 * x as i32;
+    let width = |s: &std::ops::Range<u16>| (s.end - s.start) as i32;
+    let (_, span) = spans.iter().find(|(i, _)| *i == from)?;
+    if shift > 0 {
+        let edge = q(span.end) + 4 * shift;
+        spans
+            .iter()
+            .filter(|(i, s)| *i > from && edge >= q(s.start) + width(s))
+            .map(|(i, _)| *i)
+            .max()
+    } else {
+        let edge = q(span.start) + 4 * shift;
+        spans
+            .iter()
+            .filter(|(i, s)| *i < from && edge <= q(s.end) - width(s))
+            .map(|(i, _)| *i)
+            .min()
+    }
+}
+
+/// Where the item at `i` ends up once the item at `from` moves to `to`.
+fn moved_index(i: usize, from: usize, to: usize) -> usize {
+    if i == from {
+        to
+    } else if from < i && i <= to {
+        i - 1
+    } else if to <= i && i < from {
+        i + 1
+    } else {
+        i
+    }
 }
 
 /// The tabs to show when `sizes` overflow `avail`: a run holding `active`,
@@ -3517,7 +3681,88 @@ fn cell_color(attr: ColorAttribute) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{allocate_name_widths, truncate_name, visible_run};
+    use ratatui::layout::Position;
+
+    use super::{
+        TabDrag, allocate_name_widths, drop_target, moved_index, truncate_name, visible_run,
+    };
+
+    /// Widths 6, 12, 6.
+    fn spans() -> Vec<(usize, std::ops::Range<u16>)> {
+        vec![(0, 2..8), (1, 8..20), (2, 20..26)]
+    }
+
+    #[test]
+    fn moves_take_the_same_travel_either_way() {
+        // A quarter of 6 is 1.5 cells.
+        assert_eq!(drop_target(&spans(), 1, 1), None);
+        assert_eq!(drop_target(&spans(), 1, 2), Some(2));
+        assert_eq!(drop_target(&spans(), 1, -1), None);
+        assert_eq!(drop_target(&spans(), 1, -2), Some(0));
+    }
+
+    #[test]
+    fn a_long_move_passes_several_badges() {
+        assert_eq!(drop_target(&spans(), 0, 3), Some(1));
+        assert_eq!(drop_target(&spans(), 0, 13), Some(1));
+        assert_eq!(drop_target(&spans(), 0, 14), Some(2));
+        assert_eq!(drop_target(&spans(), 2, -3), Some(1));
+        assert_eq!(drop_target(&spans(), 2, -14), Some(0));
+    }
+
+    #[test]
+    fn reaching_exactly_a_quarter_in_counts() {
+        let spans = vec![(0, 0..4), (1, 4..8)];
+        assert_eq!(drop_target(&spans, 0, 0), None);
+        assert_eq!(drop_target(&spans, 0, 1), Some(1));
+        assert_eq!(drop_target(&spans, 1, -1), Some(0));
+    }
+
+    fn drag(index: usize, grab: u16) -> TabDrag {
+        TabDrag {
+            window: 0,
+            index,
+            bar: 5,
+            spans: spans(),
+            grab,
+            moved: true,
+            target: None,
+        }
+    }
+
+    #[test]
+    fn where_the_tab_was_grabbed_does_not_matter() {
+        assert_eq!(drag(1, 8).drop_target(Position::new(10, 5)), Some(2));
+        assert_eq!(drag(1, 19).drop_target(Position::new(17, 5)), Some(0));
+    }
+
+    #[test]
+    fn drift_below_the_bar_keeps_dropping_by_column() {
+        assert_eq!(drag(0, 5).drop_target(Position::new(19, 9)), Some(2));
+        assert_eq!(drag(0, 5).drop_target(Position::new(19, 10)), None);
+        assert_eq!(drag(0, 5).drop_target(Position::new(19, 4)), None);
+    }
+
+    #[test]
+    fn overshooting_the_tabs_drops_at_the_ends() {
+        assert_eq!(drag(1, 14).drop_target(Position::new(0, 5)), Some(0));
+        assert_eq!(drag(1, 14).drop_target(Position::new(70, 7)), Some(2));
+        assert_eq!(drag(2, 23).drop_target(Position::new(70, 5)), None);
+    }
+
+    #[test]
+    fn moved_tab_lands_in_place() {
+        assert_eq!(moved_index(1, 1, 3), 3);
+        assert_eq!(moved_index(3, 3, 0), 0);
+    }
+
+    #[test]
+    fn tabs_between_shift_toward_the_gap() {
+        // 0 1 2 3 with 1 moved to 3: 0 2 3 1.
+        assert_eq!([0, 2, 3].map(|i| moved_index(i, 1, 3)), [0, 1, 2]);
+        // 0 1 2 3 with 3 moved to 1: 0 3 1 2.
+        assert_eq!([0, 1, 2].map(|i| moved_index(i, 3, 1)), [0, 2, 3]);
+    }
 
     #[test]
     fn run_starts_at_first_tab_with_right_marker() {

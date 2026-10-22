@@ -13,6 +13,7 @@ pub mod input;
 pub mod keys;
 pub mod layout;
 pub mod modes;
+pub mod order;
 pub mod palette;
 pub mod park;
 pub mod persist;
@@ -132,8 +133,31 @@ struct Client {
     yank: Option<TabId>,
     /// The OSC 22 pointer shape last written, so hover only writes changes.
     pointer: &'static str,
+    list_drag: Option<ListDrag>,
     /// What the terminal has answered to the color queries sent at attach.
     colors: palette::TermColors,
+}
+
+/// A press on a session list row, which becomes a drag once it leaves it.
+struct ListDrag {
+    item: order::Item,
+    row: usize,
+    /// The rows as the drag began, so the preview's moving rows don't move
+    /// the drop position.
+    slots: Vec<order::Slot>,
+    moved: bool,
+    /// The row the pointer is over, once moved.
+    over: Option<usize>,
+}
+
+impl ListDrag {
+    /// The order a drop now would leave, or `None` for no change.
+    fn preview(&self, order: &order::ListOrder) -> Option<order::ListOrder> {
+        let mut preview = order.clone();
+        preview
+            .drop(&self.slots, self.item, self.over?)
+            .then_some(preview)
+    }
 }
 
 struct HostChoice {
@@ -233,6 +257,7 @@ pub fn run(resume: Option<(RawFd, RawFd)>) -> i32 {
         tx,
         hosts: BTreeMap::new(),
         next_host_id: 0,
+        list_order: order::ListOrder::default(),
         pending_attaches: HashMap::new(),
         hub: None,
         pending_hubs: Vec::new(),
@@ -419,6 +444,7 @@ struct Server {
     /// Hosts whose sessions this server adopted.
     hosts: BTreeMap<HostId, Host>,
     next_host_id: HostId,
+    list_order: order::ListOrder,
     /// CLI attaches to a remote session, held until its host answers.
     pending_attaches: HashMap<ConnId, host::PendingAttach>,
     /// The hub that adopted this host's sessions, or one mid-handshake.
@@ -542,15 +568,17 @@ impl Server {
     }
 
     fn save_sessions(&mut self) {
-        // Adopted sessions belong to their hosts.
-        let snapshot = persist::StateSnapshot {
-            sessions: self
-                .sessions
-                .values_mut()
-                .filter(|s| !s.is_remote())
-                .map(Session::snapshot)
-                .collect(),
-        };
+        // Adopted sessions belong to their hosts. Saved in list order,
+        // which restoring keeps.
+        let mut sessions = Vec::new();
+        for sid in switcher_order(&self.sessions, &self.list_order) {
+            if let Some(session) = self.sessions.get_mut(&sid)
+                && !session.is_remote()
+            {
+                sessions.push(session.snapshot());
+            }
+        }
+        let snapshot = persist::StateSnapshot { sessions };
         let Ok(json) = serde_json::to_string_pretty(&snapshot) else {
             return;
         };
@@ -827,6 +855,7 @@ impl Server {
                 finder: None,
                 yank: None,
                 pointer: "default",
+                list_drag: None,
                 colors: palette::TermColors::default(),
             },
         );
@@ -1060,6 +1089,21 @@ impl Server {
                 client.colors.set(slot, rgb);
                 continue;
             }
+            // A list drag follows the pointer wherever it goes. A press
+            // means its release went missing.
+            if let DecodedInput::Mouse(mouse) = &event
+                && client.list_drag.is_some()
+            {
+                if !matches!(mouse.kind, CtMouseKind::Down(_)) {
+                    self.list_drag_mouse(conn, mouse);
+                    continue;
+                }
+                client.list_drag = None;
+                self.redraw_lists();
+            }
+            let Some(client) = self.clients.get_mut(&conn) else {
+                return;
+            };
             if client.finder.is_some() {
                 self.finder_input(conn, &event);
                 continue;
@@ -1197,23 +1241,14 @@ impl Server {
         if mouse.column >= sidebar_width(&self.config, term::fd_size(&client.raw_out)) {
             return false;
         }
-        let entry = self.switcher_entry_at(conn, mouse.column, mouse.row);
         match mouse.kind {
             CtMouseKind::Drag(_) | CtMouseKind::Up(_) => return false,
             CtMouseKind::Moved => {
-                self.set_pointer(
-                    conn,
-                    if entry.is_some() {
-                        "pointer"
-                    } else {
-                        "default"
-                    },
-                );
+                let shape = self.list_pointer(conn, mouse.column, mouse.row);
+                self.set_pointer(conn, shape);
             }
             CtMouseKind::Down(CtMouseButton::Left) => {
-                if let Some(index) = entry {
-                    self.switcher_select(conn, index);
-                }
+                self.press_list(conn, mouse.column, mouse.row);
             }
             _ => {}
         }
@@ -1245,21 +1280,17 @@ impl Server {
             DecodedInput::Key(key) => key,
             DecodedInput::Mouse(mouse) => {
                 if mouse.kind == CtMouseKind::Moved {
-                    let clickable = self.switcher_icon_at(conn, mouse.column, mouse.row)
-                        || self
-                            .switcher_entry_at(conn, mouse.column, mouse.row)
-                            .is_some();
-                    self.set_pointer(conn, if clickable { "pointer" } else { "default" });
+                    let shape = if self.switcher_icon_at(conn, mouse.column, mouse.row) {
+                        "pointer"
+                    } else {
+                        self.list_pointer(conn, mouse.column, mouse.row)
+                    };
+                    self.set_pointer(conn, shape);
                 } else if matches!(mouse.kind, CtMouseKind::Down(CtMouseButton::Left)) {
                     if self.switcher_icon_at(conn, mouse.column, mouse.row) {
                         self.switcher_cancel(conn);
-                    } else if let Some(index) =
-                        self.switcher_entry_at(conn, mouse.column, mouse.row)
-                    {
-                        if let Some(client) = self.clients.get_mut(&conn) {
-                            client.switcher = Some(index);
-                        }
-                        self.switcher_attach(conn, index);
+                    } else {
+                        self.press_list(conn, mouse.column, mouse.row);
                     }
                 }
                 return;
@@ -1499,7 +1530,7 @@ impl Server {
             return;
         };
         client.auto = None;
-        let Some(&target) = switcher_order(&self.sessions).get(highlight) else {
+        let Some(&target) = switcher_order(&self.sessions, &self.list_order).get(highlight) else {
             return;
         };
         let current = client.attached;
@@ -1524,14 +1555,136 @@ impl Server {
         }
     }
 
-    fn switcher_entry_at(&self, conn: ConnId, column: u16, row: u16) -> Option<usize> {
+    fn switcher_rows(&self) -> Vec<SwitcherRow> {
+        switcher_rows(&self.sessions, &self.hosts, &self.list_order)
+    }
+
+    /// An index into `switcher_rows`, headings included.
+    fn list_row_at(&self, conn: ConnId, column: u16, row: u16) -> Option<usize> {
         let client = self.clients.get(&conn)?;
         let size = term::fd_size(&client.raw_out);
         if column >= SWITCHER_LIST_WIDTH.min(size.width) || row < 1 {
             return None;
         }
-        let rows = switcher_rows(&self.sessions, &self.hosts);
-        session_at_row(&rows, (row - 1) as usize)
+        let row = (row - 1) as usize;
+        (row < self.switcher_rows().len()).then_some(row)
+    }
+
+    /// Hover shape over the session list: headings drag, sessions click.
+    fn list_pointer(&self, conn: ConnId, column: u16, row: u16) -> &'static str {
+        let rows = self.switcher_rows();
+        match self.list_row_at(conn, column, row).map(|r| &rows[r]) {
+            Some(SwitcherRow::Heading { .. }) => "grab",
+            Some(SwitcherRow::Session(_)) => "pointer",
+            None => "default",
+        }
+    }
+
+    /// A press on a list row, resolved as a click or a drop on release.
+    fn press_list(&mut self, conn: ConnId, column: u16, row: u16) {
+        let Some(row) = self.list_row_at(conn, column, row) else {
+            return;
+        };
+        let rows = self.switcher_rows();
+        let item = match &rows[row] {
+            SwitcherRow::Heading { host, .. } => order::Item::Host(*host),
+            SwitcherRow::Session(entry) => order::Item::Session(entry.sid),
+        };
+        if let Some(client) = self.clients.get_mut(&conn) {
+            client.list_drag = Some(ListDrag {
+                item,
+                row,
+                slots: list_slots(&rows),
+                moved: false,
+                over: None,
+            });
+        }
+    }
+
+    fn list_drag_mouse(&mut self, conn: ConnId, mouse: &ratatui::crossterm::event::MouseEvent) {
+        let over = self.list_row_at(conn, mouse.column, mouse.row);
+        let Some(drag) = self
+            .clients
+            .get_mut(&conn)
+            .and_then(|c| c.list_drag.as_mut())
+        else {
+            return;
+        };
+        match mouse.kind {
+            CtMouseKind::Drag(CtMouseButton::Left) => {
+                drag.moved |= over != Some(drag.row);
+                if !drag.moved {
+                    return;
+                }
+                drag.over = over;
+                self.set_pointer(conn, "grabbing");
+                self.redraw_lists();
+            }
+            CtMouseKind::Up(CtMouseButton::Left) => {
+                let Some(drag) = self.clients.get_mut(&conn).and_then(|c| c.list_drag.take())
+                else {
+                    return;
+                };
+                if !drag.moved {
+                    self.click_list(conn, drag.item);
+                } else if let Some(row) = over {
+                    self.drop_on_list(&drag.slots, drag.item, row);
+                }
+                let shape = self.list_pointer(conn, mouse.column, mouse.row);
+                self.set_pointer(conn, shape);
+                self.redraw_lists();
+            }
+            _ => {}
+        }
+    }
+
+    /// In switcher mode a click attaches and stays; on an unfocused
+    /// sidebar it selects.
+    fn click_list(&mut self, conn: ConnId, item: order::Item) {
+        let order::Item::Session(sid) = item else {
+            return;
+        };
+        let Some(index) = switcher_order(&self.sessions, &self.list_order)
+            .iter()
+            .position(|&s| s == sid)
+        else {
+            return;
+        };
+        let Some(client) = self.clients.get_mut(&conn) else {
+            return;
+        };
+        if client.switcher.is_some() {
+            client.switcher = Some(index);
+            self.switcher_attach(conn, index);
+        } else {
+            self.switcher_select(conn, index);
+        }
+    }
+
+    /// Switcher highlights follow their sessions to their new places.
+    fn drop_on_list(&mut self, slots: &[order::Slot], item: order::Item, row: usize) {
+        let before = switcher_order(&self.sessions, &self.list_order);
+        if !self.list_order.drop(slots, item, row) {
+            return;
+        }
+        let after = switcher_order(&self.sessions, &self.list_order);
+        for client in self.clients.values_mut() {
+            if let Some(highlight) = client.switcher.as_mut()
+                && let Some(sid) = before.get(*highlight)
+                && let Some(i) = after.iter().position(|s| s == sid)
+            {
+                *highlight = i;
+            }
+        }
+    }
+
+    /// Every client's list shows the shared order.
+    fn redraw_lists(&mut self) {
+        for client in self.clients.values() {
+            if let Some(session) = self.sessions.get_mut(&client.attached) {
+                session.request_redraw();
+            }
+        }
     }
 
     fn finder_input(&mut self, conn: ConnId, event: &DecodedInput) {
@@ -1887,7 +2040,7 @@ impl Server {
             return;
         };
         let sid = client.attached;
-        let highlight = switcher_order(&self.sessions)
+        let highlight = switcher_order(&self.sessions, &self.list_order)
             .iter()
             .position(|&id| id == sid)
             .unwrap_or(0);
@@ -2257,6 +2410,7 @@ impl Server {
             clients,
             config,
             hosts,
+            list_order,
             ..
         } = self;
         for client in clients.values_mut() {
@@ -2268,14 +2422,14 @@ impl Server {
             } else if let Some(highlight) = client.switcher
                 && sidebar == 0
             {
-                render_switcher(client, sessions, hosts, highlight, config);
+                render_switcher(client, sessions, hosts, list_order, highlight, config);
             } else if client.switcher.is_none()
                 && client.auto.is_some_and(|a| a.presented.is_none())
             {
                 render_auto_blank(client, sessions, &config.palette);
             } else if sidebar > 0 {
                 // Any session's change can show in the sidebar.
-                render_with_sidebar(client, sessions, hosts, config, sidebar);
+                render_with_sidebar(client, sessions, hosts, list_order, config, sidebar);
             } else if let Some(session) = sessions.get_mut(&client.attached)
                 && session.needs_redraw()
             {
@@ -2348,15 +2502,23 @@ const SWITCHER_LIST_WIDTH: u16 = 28;
 
 /// A switcher row: a connected host's heading, or one of its sessions.
 enum SwitcherRow {
-    Heading { alias: String, offline: bool },
+    Heading {
+        host: HostId,
+        alias: String,
+        offline: bool,
+        dragged: bool,
+    },
     Session(SwitcherEntry),
 }
 
 /// A session's text, its urgency, and whether its host is unreachable.
 struct SwitcherEntry {
+    sid: SessionId,
+    host: Option<HostId>,
     text: String,
     urgency: Option<agent::Urgency>,
     offline: bool,
+    dragged: bool,
 }
 
 /// The list plus its divider.
@@ -2382,54 +2544,65 @@ fn session_area(config: &Config, size: ratatui::layout::Size) -> Rect {
 
 /// The switcher's sessions: this host's, then each connected host's,
 /// grouped. The switcher's highlight indexes this order.
-fn switcher_order(sessions: &BTreeMap<SessionId, Session>) -> Vec<SessionId> {
-    let mut order: Vec<(Option<HostId>, SessionId)> = sessions
-        .iter()
-        .map(|(&sid, s)| (s.host.as_ref().map(|h| h.id), sid))
-        .collect();
-    order.sort();
-    order.into_iter().map(|(_, sid)| sid).collect()
+fn switcher_order(
+    sessions: &BTreeMap<SessionId, Session>,
+    order: &order::ListOrder,
+) -> Vec<SessionId> {
+    order.sort(
+        sessions
+            .iter()
+            .map(|(&sid, s)| (s.host.as_ref().map(|h| h.id), sid))
+            .collect(),
+    )
 }
 
 /// `switcher_order` with a heading ahead of each host's group.
 fn switcher_rows(
     sessions: &BTreeMap<SessionId, Session>,
     hosts: &BTreeMap<HostId, Host>,
+    order: &order::ListOrder,
 ) -> Vec<SwitcherRow> {
     let mut rows = Vec::with_capacity(sessions.len());
     let mut group = None;
-    for sid in switcher_order(sessions) {
+    for sid in switcher_order(sessions, order) {
         let s = &sessions[&sid];
         let host = s.host.as_ref().map(|h| h.id);
         if let Some(id) = host
             && group != host
         {
             rows.push(SwitcherRow::Heading {
+                host: id,
                 alias: hosts.get(&id).map_or("?".into(), |h| h.alias.clone()),
                 offline: s.is_offline(),
+                dragged: false,
             });
         }
         group = host;
         rows.push(SwitcherRow::Session(SwitcherEntry {
+            sid,
+            host,
             text: format!("{} ({} windows)", s.name, s.window_count()),
             urgency: s.urgency().filter(|_| !s.is_offline()),
             offline: s.is_offline(),
+            dragged: false,
         }));
     }
     rows
 }
 
-/// The session at a row, by its place in `switcher_order`.
-fn session_at_row(rows: &[SwitcherRow], row: usize) -> Option<usize> {
-    match rows.get(row)? {
-        SwitcherRow::Heading { .. } => None,
-        SwitcherRow::Session(_) => Some(
-            rows[..row]
-                .iter()
-                .filter(|r| matches!(r, SwitcherRow::Session(_)))
-                .count(),
-        ),
-    }
+fn list_slots(rows: &[SwitcherRow]) -> Vec<order::Slot> {
+    rows.iter()
+        .map(|row| match row {
+            SwitcherRow::Heading { host, .. } => order::Slot {
+                group: Some(*host),
+                session: None,
+            },
+            SwitcherRow::Session(entry) => order::Slot {
+                group: entry.host,
+                session: Some(entry.sid),
+            },
+        })
+        .collect()
 }
 
 /// One row each below a blank top row, with a divider on the right when
@@ -2453,6 +2626,8 @@ fn render_session_list(
     } else {
         Modifier::BOLD
     };
+    // The row a drag carries.
+    let carried = Style::default().fg(default_bg).bg(palette.accent);
     let list_w = SWITCHER_LIST_WIDTH.min(area.width);
     let mut next = 0;
     for (row, entry) in rows.iter().enumerate() {
@@ -2461,9 +2636,19 @@ fn render_session_list(
             break;
         }
         let entry = match entry {
-            SwitcherRow::Heading { alias, offline } => {
+            SwitcherRow::Heading {
+                alias,
+                offline,
+                dragged,
+                ..
+            } => {
                 let color = if *offline { palette.dim } else { palette.muted };
-                let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+                let style = if *dragged {
+                    carried
+                } else {
+                    Style::default().fg(color)
+                }
+                .add_modifier(Modifier::BOLD);
                 for (j, ch) in format!(" {alias}").chars().enumerate() {
                     let x = area.x + j as u16;
                     if x >= area.x + list_w {
@@ -2505,7 +2690,9 @@ fn render_session_list(
             };
             // Explicit colors, since some terminals reverse a default
             // background into the default foreground.
-            let style = if focused && i == highlight && urgency.is_some() {
+            let style = if entry.dragged {
+                carried
+            } else if focused && i == highlight && urgency.is_some() {
                 Style::default().fg(default_bg).bg(fg)
             } else {
                 Style::default().fg(fg).add_modifier(modifier)
@@ -2526,26 +2713,67 @@ fn render_session_list(
     }
 }
 
+/// Underlines the row above the gap a dragged row would drop into; the
+/// blank top row stands above the first.
+/// The rows as the client's drag would leave them, the dragged one marked,
+/// and `highlight` carried to its session's place in them.
+fn list_view(
+    sessions: &BTreeMap<SessionId, Session>,
+    hosts: &BTreeMap<HostId, Host>,
+    order: &order::ListOrder,
+    drag: Option<&ListDrag>,
+    highlight: usize,
+) -> (Vec<SwitcherRow>, usize) {
+    let drag = drag.filter(|d| d.moved);
+    let Some(drag) = drag else {
+        return (switcher_rows(sessions, hosts, order), highlight);
+    };
+    let preview = drag.preview(order);
+    let shown = preview.as_ref().unwrap_or(order);
+    let mut rows = switcher_rows(sessions, hosts, shown);
+    for row in &mut rows {
+        match (row, drag.item) {
+            (SwitcherRow::Heading { host, dragged, .. }, order::Item::Host(h)) if *host == h => {
+                *dragged = true;
+            }
+            (SwitcherRow::Session(entry), order::Item::Session(sid)) if entry.sid == sid => {
+                entry.dragged = true;
+            }
+            _ => {}
+        }
+    }
+    let highlight = switcher_order(sessions, order)
+        .get(highlight)
+        .and_then(|sid| {
+            switcher_order(sessions, shown)
+                .iter()
+                .position(|s| s == sid)
+        })
+        .unwrap_or(highlight);
+    (rows, highlight)
+}
+
 /// The session list beside the attached session, focused while the client
 /// is in switcher mode.
 fn render_with_sidebar(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
     hosts: &BTreeMap<HostId, Host>,
+    order: &order::ListOrder,
     config: &Config,
     width: u16,
 ) {
-    let rows = switcher_rows(sessions, hosts);
     let focused = client.switcher.is_some();
     let highlight = client
         .switcher
         .or_else(|| {
-            switcher_order(sessions)
+            switcher_order(sessions, order)
                 .iter()
                 .position(|&sid| sid == client.attached)
         })
         .unwrap_or(0)
         .min(sessions.len().saturating_sub(1));
+    let (rows, highlight) = list_view(sessions, hosts, order, client.list_drag.as_ref(), highlight);
     let Client {
         terminal,
         new_session,
@@ -2574,13 +2802,14 @@ fn render_switcher(
     client: &mut Client,
     sessions: &mut BTreeMap<SessionId, Session>,
     hosts: &BTreeMap<HostId, Host>,
+    order: &order::ListOrder,
     highlight: usize,
     config: &Config,
 ) {
     let palette = &config.palette;
-    let rows = switcher_rows(sessions, hosts);
     let highlight = highlight.min(sessions.len().saturating_sub(1));
-    let highlighted_sid = switcher_order(sessions).get(highlight).copied();
+    let highlighted_sid = switcher_order(sessions, order).get(highlight).copied();
+    let (rows, highlight) = list_view(sessions, hosts, order, client.list_drag.as_ref(), highlight);
     let Client {
         terminal,
         new_session,
@@ -2781,25 +3010,59 @@ fn osc52_copy(out: &mut File, text: &str) {
 mod tests {
     use super::*;
 
-    fn session() -> SwitcherRow {
+    fn session(sid: SessionId, host: Option<HostId>) -> SwitcherRow {
         SwitcherRow::Session(SwitcherEntry {
+            sid,
+            host,
             text: String::new(),
             urgency: None,
             offline: false,
+            dragged: false,
         })
     }
 
-    fn heading() -> SwitcherRow {
+    fn heading(host: HostId) -> SwitcherRow {
         SwitcherRow::Heading {
+            host,
             alias: "dev".into(),
             offline: false,
+            dragged: false,
         }
     }
 
     #[test]
-    fn heading_rows_map_to_no_session() {
-        let rows = [session(), heading(), session(), session()];
-        let mapped: Vec<Option<usize>> = (0..5).map(|r| session_at_row(&rows, r)).collect();
-        assert_eq!(mapped, [Some(0), None, Some(1), Some(2), None]);
+    fn preview_reorders_a_copy() {
+        let order = order::ListOrder::default();
+        let rows = [session(0, None), session(1, None), session(2, None)];
+        let drag = ListDrag {
+            item: order::Item::Session(0),
+            row: 0,
+            slots: list_slots(&rows),
+            moved: true,
+            over: Some(2),
+        };
+        let preview = drag.preview(&order).expect("a move");
+        let ids = || vec![(None, 0), (None, 1), (None, 2)];
+        assert_eq!(preview.sort(ids()), [1, 2, 0]);
+        assert_eq!(order.sort(ids()), [0, 1, 2]);
+        let still = ListDrag {
+            over: Some(0),
+            ..drag
+        };
+        assert!(still.preview(&order).is_none());
+    }
+
+    #[test]
+    fn heading_rows_are_slots_without_a_session() {
+        let rows = [session(0, None), heading(3), session(1, Some(3))];
+        let slot = |group, session| order::Slot { group, session };
+        assert_eq!(
+            list_slots(&rows),
+            [
+                slot(None, Some(0)),
+                slot(Some(3), None),
+                slot(Some(3), Some(1))
+            ]
+        );
     }
 }
