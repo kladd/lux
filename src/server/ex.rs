@@ -2,6 +2,8 @@
 
 use std::path::PathBuf;
 
+use crate::server::config;
+
 pub const COMMANDS: &[&str] = &[
     "config-open",
     "config-reload",
@@ -89,16 +91,37 @@ fn arg<'a>(text: &'a str, verb: &str) -> Option<&'a str> {
     (!rest.is_empty()).then_some(rest)
 }
 
-pub fn suggestions(text: &str) -> Vec<&'static str> {
-    COMMANDS
-        .iter()
-        .copied()
-        .filter(|c| c.starts_with(text))
-        .collect()
+/// The partial key after `config-set`, before any value is typed.
+/// The word being typed, the names it may complete to, and whether a
+/// unique completion takes a trailing space.
+fn last_word(text: &str) -> (&str, &'static [&'static str], bool) {
+    let Some(args) = text.strip_prefix("config-set ") else {
+        return (text, COMMANDS, false);
+    };
+    let args = args.trim_start();
+    let Some((key, value)) = args.split_once(char::is_whitespace) else {
+        return (args, config::KEYS, true);
+    };
+    let value = value.trim_start();
+    if value.contains(char::is_whitespace) {
+        return (value, &[], false);
+    }
+    (value, config::values(key), false)
 }
 
-/// The longest prefix shared by every suggestion, or `None` when nothing
-/// matches.
+pub fn suggestions(text: &str) -> Vec<&'static str> {
+    let (partial, names, _) = last_word(text);
+    let mut matches: Vec<_> = names
+        .iter()
+        .copied()
+        .filter(|name| name.starts_with(partial))
+        .collect();
+    matches.sort_unstable();
+    matches
+}
+
+/// The text with its last word extended to the longest prefix shared by
+/// every suggestion, or `None` when nothing matches.
 pub fn complete(text: &str) -> Option<String> {
     let matches = suggestions(text);
     let (first, rest) = matches.split_first()?;
@@ -109,7 +132,12 @@ pub fn complete(text: &str) -> Option<String> {
             .take_while(|(a, b)| a == b)
             .count()
     });
-    Some(first[..len].to_string())
+    let (partial, _, space) = last_word(text);
+    let mut out = format!("{}{}", &text[..text.len() - partial.len()], &first[..len]);
+    if space && rest.is_empty() {
+        out.push(' ');
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -225,6 +253,42 @@ mod tests {
         assert_eq!(complete("config-r").as_deref(), Some("config-reload"));
         assert_eq!(complete("ne").as_deref(), Some("new"));
         assert_eq!(complete("").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn config_set_suggests_and_completes_keys() {
+        assert_eq!(suggestions("config-set s"), vec!["shadows", "sidebar"]);
+        assert!(suggestions("config-set ").contains(&"prefix"));
+        assert_eq!(complete("config-set s").as_deref(), Some("config-set s"));
+        assert_eq!(
+            complete("config-set gr").as_deref(),
+            Some("config-set grid-mouse ")
+        );
+        assert_eq!(
+            complete("config-set  at").as_deref(),
+            Some("config-set  attach-style ")
+        );
+        assert_eq!(complete("config-set x"), None);
+    }
+
+    #[test]
+    fn config_set_suggests_and_completes_fixed_values() {
+        assert_eq!(
+            suggestions("config-set attach-style c"),
+            vec!["coalesce", "crt"]
+        );
+        assert_eq!(suggestions("config-set sidebar "), vec!["false", "true"]);
+        assert_eq!(suggestions("config-set prefix "), Vec::<&str>::new());
+        assert_eq!(suggestions("config-set sidebar true x"), Vec::<&str>::new());
+        assert_eq!(
+            complete("config-set attach-style g").as_deref(),
+            Some("config-set attach-style glitch")
+        );
+        assert_eq!(
+            complete("config-set osc-titles a").as_deref(),
+            Some("config-set osc-titles a")
+        );
+        assert_eq!(complete("config-set rule-style x"), None);
     }
 
     #[test]

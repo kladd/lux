@@ -173,6 +173,7 @@ pub fn render(
     sessions: &mut BTreeMap<SessionId, Session>,
     state: &mut GridState,
     palette: &Palette,
+    bg: Color,
 ) {
     let items = items(sessions);
     state.highlight = state.highlight.min(items.len().saturating_sub(1));
@@ -189,6 +190,7 @@ pub fn render(
         state.scroll,
         state.capture,
         palette,
+        bg,
     );
 }
 
@@ -202,6 +204,7 @@ fn draw(
     scroll: usize,
     capture: Option<TabId>,
     palette: &Palette,
+    bg: Color,
 ) {
     clear_region(buf, area);
     if items.is_empty() {
@@ -248,6 +251,7 @@ fn draw(
             captured,
             elapsed,
             palette,
+            bg,
         );
     }
 }
@@ -315,6 +319,7 @@ fn draw_tile(
     captured: bool,
     elapsed: Duration,
     palette: &Palette,
+    bg: Color,
 ) {
     if rect.width < 2 || rect.height < 2 {
         return;
@@ -327,7 +332,7 @@ fn draw_tile(
             let visual = tracker.visual(now);
             (palette.status(visual.status), visual.anim)
         });
-    draw_border(buf, rect, highlighted, color, border_anim, elapsed);
+    draw_border(buf, rect, highlighted, color, bg, border_anim, elapsed);
     // A tile is its tab's size, so a scrolled view fits it whole.
     if tab.scroll_mode() {
         render_rows(buf, tile_content(rect), tab, tab.view_range());
@@ -354,7 +359,7 @@ fn draw_tile(
         for (j, ch) in visual.text.chars().enumerate() {
             let color = match visual.anim {
                 Anim::None => status_color,
-                Anim::Shimmer => anim::shimmer(status_color, j, len, elapsed),
+                Anim::Shimmer => anim::shimmer(status_color, bg, j, len, elapsed),
                 Anim::Breathe => anim::breathe(status_color, elapsed),
             };
             if !put(&mut x, ch, base.fg(color)) {
@@ -399,6 +404,7 @@ fn draw_border(
     rect: Rect,
     double: bool,
     color: Color,
+    bg: Color,
     border_anim: Anim,
     elapsed: Duration,
 ) {
@@ -429,7 +435,7 @@ fn draw_border(
     for (i, (x, y, ch)) in cells.into_iter().enumerate() {
         let color = match border_anim {
             Anim::None => color,
-            Anim::Shimmer => anim::shimmer(color, i, len, elapsed),
+            Anim::Shimmer => anim::shimmer(color, bg, i, len, elapsed),
             Anim::Breathe => anim::breathe(color, elapsed),
         };
         if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
@@ -528,6 +534,7 @@ mod tests {
                 rect,
                 double,
                 Color::Red,
+                Color::Black,
                 Anim::None,
                 Duration::ZERO,
             );

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 
 use crate::server::anim::{self, Anim};
 use crate::server::grid;
@@ -36,6 +36,7 @@ pub fn render_blank(
     area: Rect,
     sessions: &BTreeMap<SessionId, Session>,
     palette: &Palette,
+    bg: Color,
 ) {
     clear_region(buf, area);
     if area.width == 0 || area.height == 0 {
@@ -56,7 +57,7 @@ pub fn render_blank(
     }
     let width = area.width.min(LIST_WIDTH);
     let x0 = area.x + (area.width - width) / 2;
-    let mut entries = busy_entries(sessions, palette);
+    let mut entries = busy_entries(sessions, palette, bg);
     if entries.is_empty() {
         entries = vec![
             ALL_IDLE
@@ -82,7 +83,7 @@ pub fn render_blank(
 
 /// Working and waiting agent tabs in grid order, formatted like the grid's
 /// tile headers but with the status uncolored.
-fn busy_entries(sessions: &BTreeMap<SessionId, Session>, palette: &Palette) -> Vec<Run> {
+fn busy_entries(sessions: &BTreeMap<SessionId, Session>, palette: &Palette, bg: Color) -> Vec<Run> {
     let now = std::time::Instant::now();
     let elapsed = anim::elapsed();
     grid::items(sessions)
@@ -97,7 +98,7 @@ fn busy_entries(sessions: &BTreeMap<SessionId, Session>, palette: &Palette) -> V
             for (j, ch) in visual.text.chars().enumerate() {
                 let color = match visual.anim {
                     Anim::None => palette.text,
-                    Anim::Shimmer => anim::shimmer(palette.text, j, len, elapsed),
+                    Anim::Shimmer => anim::shimmer(palette.text, bg, j, len, elapsed),
                     Anim::Breathe => anim::breathe(palette.text, elapsed),
                 };
                 run.push((ch, Style::default().fg(color)));

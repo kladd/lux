@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Widget};
+use ratatui::widgets::{Block, BorderType, Widget};
 use ratatui_textarea::TextArea;
 
 use crate::server::config::Config;
@@ -168,6 +168,7 @@ pub fn render(
     let palette = &config.palette;
     clear_region(buf, window);
     Block::bordered()
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(palette.dim))
         .render(window, buf);
     let items = items(sessions, hosts);
@@ -213,9 +214,15 @@ fn render_panes(
         if inner.width <= list_w {
             return;
         }
-        for y in inner.top()..inner.bottom() {
+        // Tees at the ends join the window's border.
+        for y in inner.top() - 1..=inner.bottom() {
+            let ch = match y {
+                y if y < inner.top() => "┬",
+                y if y == inner.bottom() => "┴",
+                _ => "│",
+            };
             if let Some(dst) = buf.cell_mut(Position::new(inner.x + list_w, y)) {
-                dst.set_symbol("│");
+                dst.set_symbol(ch);
                 dst.set_style(dim);
             }
         }
@@ -242,9 +249,14 @@ fn render_panes(
         if inner.height <= list_h + 1 {
             return;
         }
-        for x in inner.left()..inner.right() {
+        for x in inner.left() - 1..=inner.right() {
+            let ch = match x {
+                x if x < inner.left() => "├",
+                x if x == inner.right() => "┤",
+                _ => "─",
+            };
             if let Some(dst) = buf.cell_mut(Position::new(x, inner.y + list_h)) {
-                dst.set_symbol("─");
+                dst.set_symbol(ch);
                 dst.set_style(dim);
             }
         }

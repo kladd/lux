@@ -1,6 +1,7 @@
 //! One-shot effects drawn over the rendered frame and dropped when they
 //! finish.
 
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::{Buffer, Cell};
@@ -36,6 +37,36 @@ const RAIN_FLICKER: f32 = 0.02;
 /// katakana.
 const RAIN_SYMBOLS: &[u8] = b"0123456789:.=*+-<>|\"";
 const KATAKANA: (u32, u32) = (0xFF66, 56);
+const CRT: (u32, Interpolation) = (700, Interpolation::Linear);
+/// The share of the CRT's run the line takes to open to the edges.
+const CRT_OPEN: f32 = 0.4;
+/// How far toward white the frame blooms at its brightest.
+const CRT_BLOOM: f32 = 0.6;
+const TYPEWRITER: (u32, Interpolation) = (1500, Interpolation::Linear);
+/// The quickest and slowest a cell types, relative to the mean.
+const TYPEWRITER_PACE: (f32, f32) = (0.3, 1.7);
+const DECRYPT: (u32, Interpolation) = (1200, Interpolation::Linear);
+/// The earliest and latest shares of the run a cell locks.
+const DECRYPT_LOCK: (f32, f32) = (0.1, 0.95);
+const GLITCH: (u32, Interpolation) = (700, Interpolation::Linear);
+const GLITCH_BURST_MS: f32 = 70.0;
+/// The share of the run after which every row stays in place.
+const GLITCH_CALM: f32 = 0.75;
+/// The chance a row shifts in the first burst, tapering to none.
+const GLITCH_ROWS: f32 = 0.3;
+const GLITCH_SHIFT: f32 = 8.0;
+const GLITCH_MAGENTA: Color = Color::Rgb(255, 60, 220);
+const GLITCH_CYAN: Color = Color::Rgb(40, 230, 255);
+const BURN: (u32, Interpolation) = (1200, Interpolation::Linear);
+/// The share of the run the fire front takes to climb the screen.
+const BURN_RISE: f32 = 0.6;
+/// How unevenly the front climbs, as a share of the run.
+const BURN_RAGGED: f32 = 0.15;
+/// The share of the run a cell takes to cool.
+const BURN_COOL: f32 = 0.25;
+const EMBER: (u8, u8, u8) = (255, 110, 20);
+const EMBER_HOT: (u8, u8, u8) = (255, 236, 170);
+const WHITE: (u8, u8, u8) = (255, 255, 255);
 
 /// A buffer a transition draws a window from: live for a window growing,
 /// a snapshot for one shrinking.
@@ -195,11 +226,19 @@ impl Transitions {
     }
 
     pub fn materialize(&mut self, style: AttachStyle, palette: Palette, colors: TermColors) {
-        self.start();
-        self.materialize = Some(match style {
+        let shades = Shades::new(&palette, &colors);
+        let effect = match style {
+            AttachStyle::None => return,
             AttachStyle::Coalesce => fx::coalesce_from(Style::reset(), timer(MATERIALIZE)),
             AttachStyle::Rain => rain(palette, colors),
-        });
+            AttachStyle::Crt => crt(shades, colors),
+            AttachStyle::Typewriter => typewriter(shades),
+            AttachStyle::Decrypt => decrypt(shades),
+            AttachStyle::Glitch => glitch(seed()),
+            AttachStyle::Burn => burn(shades, colors),
+        };
+        self.start();
+        self.materialize = Some(effect);
     }
 
     pub fn materializing(&self) -> bool {
@@ -213,6 +252,11 @@ impl Transitions {
             effect.process(Duration::ZERO, buf, area);
         }
     }
+}
+
+/// Different on every call.
+fn seed() -> u32 {
+    RandomState::new().build_hasher().finish() as u32
 }
 
 fn timer((ms, interpolation): (u32, Interpolation)) -> EffectTimer {
@@ -307,6 +351,230 @@ fn rain(palette: Palette, colors: TermColors) -> Effect {
     })
 }
 
+/// The colors a cell drawn in the terminal's defaults actually shows.
+#[derive(Clone, Copy)]
+struct Shades {
+    fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
+    accent: (u8, u8, u8),
+}
+
+impl Shades {
+    fn new(palette: &Palette, colors: &TermColors) -> Self {
+        Shades {
+            fg: colors
+                .fg
+                .or_else(|| colors.rgb(palette.fg))
+                .unwrap_or((229, 229, 229)),
+            bg: colors
+                .bg
+                .or_else(|| colors.rgb(palette.bg))
+                .unwrap_or((0, 0, 0)),
+            accent: colors.rgb(palette.accent).unwrap_or((0, 205, 0)),
+        }
+    }
+}
+
+/// Moves a cell's foreground `fg_t` and background `bg_t` of the way to
+/// `to`; a zero share leaves that color untouched.
+fn tint(
+    cell: &mut Cell,
+    colors: &TermColors,
+    shades: &Shades,
+    to: (u8, u8, u8),
+    fg_t: f32,
+    bg_t: f32,
+) {
+    if fg_t > 0.0 {
+        cell.fg = mix(colors.rgb(cell.fg).unwrap_or(shades.fg), to, fg_t);
+    }
+    if bg_t > 0.0 {
+        cell.bg = mix(colors.rgb(cell.bg).unwrap_or(shades.bg), to, bg_t);
+    }
+}
+
+/// A bright line across the middle opens to the top and bottom, the frame
+/// blooming as it reaches them and fading back to its own colors.
+fn crt(shades: Shades, colors: TermColors) -> Effect {
+    fx::effect_fn_buf((), timer(CRT), move |_, ctx, buf| {
+        let area = ctx.area;
+        if area.is_empty() {
+            return;
+        }
+        let alpha = ctx.alpha();
+        let open = (alpha / CRT_OPEN).min(1.0);
+        let bloom = if alpha < CRT_OPEN {
+            open
+        } else {
+            1.0 - (alpha - CRT_OPEN) / (1.0 - CRT_OPEN)
+        };
+        let mid = f32::from(area.height - 1) / 2.0;
+        let reach = 0.5 + mid * open;
+        for pos in area.positions() {
+            let off = (f32::from(pos.y - area.top()) - mid).abs();
+            let cell = &mut buf[pos];
+            if off > reach {
+                cell.reset();
+            } else if open < 1.0 && reach - off < 1.0 {
+                tint(cell, &colors, &shades, WHITE, 0.4, 0.4);
+            } else {
+                let t = CRT_BLOOM * bloom;
+                tint(cell, &colors, &shades, WHITE, t, t * 0.3);
+            }
+        }
+    })
+}
+
+/// Blank cells take no time, so the cursor skips line ends and
+/// indentation.
+fn type_time(cell: &Cell, pos: Position) -> f32 {
+    if cell.symbol() == " " && cell.bg == Color::Reset {
+        return 0.0;
+    }
+    let (quickest, slowest) = TYPEWRITER_PACE;
+    quickest + (slowest - quickest) * noise(pos.x, pos.y, 30)
+}
+
+/// Types the frame out row by row behind a cursor block.
+fn typewriter(shades: Shades) -> Effect {
+    let (r, g, b) = shades.accent;
+    fx::effect_fn_buf((), timer(TYPEWRITER), move |_, ctx, buf| {
+        let area = ctx.area;
+        let total: f32 = area.positions().map(|p| type_time(&buf[p], p)).sum();
+        let typed = ctx.alpha() * total;
+        let mut elapsed = 0.0;
+        let mut cursor = false;
+        for pos in area.positions() {
+            let time = type_time(&buf[pos], pos);
+            elapsed += time;
+            if elapsed <= typed {
+                continue;
+            }
+            let cell = &mut buf[pos];
+            cell.reset();
+            if !cursor && time > 0.0 {
+                cell.bg = Color::Rgb(r, g, b);
+                cursor = true;
+            }
+        }
+    })
+}
+
+/// Every character churns through glyphs until it locks; blank cells stay
+/// blank.
+fn decrypt(shades: Shades) -> Effect {
+    let (ms, _) = DECRYPT;
+    let color = mix(shades.accent, shades.bg, 0.4);
+    fx::effect_fn_buf((), timer(DECRYPT), move |_, ctx, buf| {
+        let alpha = ctx.alpha();
+        let elapsed = alpha * ms as f32;
+        let (earliest, latest) = DECRYPT_LOCK;
+        let source = buf.clone();
+        for pos in ctx.area.positions() {
+            if source[pos].symbol() == " "
+                || alpha >= earliest + (latest - earliest) * noise(pos.x, pos.y, 40)
+            {
+                continue;
+            }
+            if scrambles(&source, pos) {
+                draw_glyph(&mut buf[pos], cipher(pos.x, pos.y, elapsed), color, false);
+            } else {
+                buf[pos].reset();
+            }
+        }
+    })
+}
+
+/// Random rows jump sideways in bursts, trailed by magenta and cyan
+/// copies, until the frame settles in place. `seed` picks the rows.
+fn glitch(seed: u32) -> Effect {
+    let (ms, _) = GLITCH;
+    let salt = move |n: u32| seed.wrapping_add(n);
+    fx::effect_fn_buf((), timer(GLITCH), move |_, ctx, buf| {
+        let alpha = ctx.alpha();
+        if alpha >= GLITCH_CALM {
+            return;
+        }
+        let burst = (alpha * ms as f32 / GLITCH_BURST_MS) as u32;
+        let chance = GLITCH_ROWS * (1.0 - alpha / GLITCH_CALM);
+        let source = buf.clone();
+        for y in ctx.area.top()..ctx.area.bottom() {
+            if noise(y, 0, salt(600 + burst)) >= chance {
+                continue;
+            }
+            let dx = 1 + (noise(y, 0, salt(700 + burst)) * GLITCH_SHIFT) as i32;
+            let dx = if noise(y, 1, salt(700 + burst)) < 0.5 {
+                -dx
+            } else {
+                dx
+            };
+            shift_row(&source, buf, y, dx);
+        }
+    })
+}
+
+/// Row `y` of `source` drawn `dx` cells over, with a magenta copy one
+/// cell further right and a cyan one cell further left showing in its
+/// gaps.
+fn shift_row(source: &Buffer, buf: &mut Buffer, y: u16, dx: i32) {
+    let area = source.area;
+    let at = |x: i32| {
+        u16::try_from(x)
+            .ok()
+            .map(|x| Position::new(x, y))
+            .filter(|&p| area.contains(p))
+    };
+    for x in area.left()..area.right() {
+        let last = x + 1 >= area.right();
+        buf[Position::new(x, y)] = match at(i32::from(x) - dx) {
+            Some(from) if !(last && width(&source[from]) > 1) => source[from].clone(),
+            _ => Cell::EMPTY,
+        };
+    }
+    for x in area.left()..area.right() {
+        let pos = Position::new(x, y);
+        if buf[pos].symbol() != " " || !scrambles(buf, pos) {
+            continue;
+        }
+        let fringe = [(-1, GLITCH_MAGENTA), (1, GLITCH_CYAN)]
+            .into_iter()
+            .filter_map(|(off, color)| Some((at(i32::from(x) - dx + off)?, color)))
+            .find(|&(from, _)| source[from].symbol() != " " && scrambles(source, from));
+        if let Some((from, color)) = fringe {
+            let cell = &mut buf[pos];
+            cell.set_symbol(source[from].symbol()).set_fg(color);
+        }
+    }
+}
+
+fn width(cell: &Cell) -> usize {
+    Span::raw(cell.symbol()).width()
+}
+
+/// A fire front climbs from the bottom, each cell igniting as a bright
+/// ember that cools to its own colors.
+fn burn(shades: Shades, colors: TermColors) -> Effect {
+    fx::effect_fn_buf((), timer(BURN), move |_, ctx, buf| {
+        let area = ctx.area;
+        let alpha = ctx.alpha();
+        let span = f32::from(area.height.saturating_sub(1).max(1));
+        for pos in area.positions() {
+            let climb = f32::from(area.bottom() - 1 - pos.y) / span;
+            let ignite = BURN_RISE * climb + BURN_RAGGED * noise(pos.x, pos.y, 50);
+            let cell = &mut buf[pos];
+            if alpha < ignite {
+                cell.reset();
+                continue;
+            }
+            let heat = 1.0 - (alpha - ignite) / BURN_COOL;
+            if heat > 0.0 {
+                let ember = blend(EMBER, EMBER_HOT, heat);
+                tint(cell, &colors, &shades, ember, heat, heat * 0.5);
+            }
+        }
+    })
+}
+
 /// Wide characters, and the cells they cover, keep their place in the
 /// grid.
 fn scrambles(buf: &Buffer, pos: Position) -> bool {
@@ -325,12 +593,23 @@ fn draw_glyph(cell: &mut Cell, ch: char, color: Color, bold: bool) {
 /// The glyph at a cell `elapsed` ms into the run; each cell changes on its
 /// own interval, most holding a while and a few churning.
 fn glyph(x: u16, y: u16, elapsed: f32) -> char {
+    let count = KATAKANA.1 as usize + RAIN_SYMBOLS.len();
+    nth_glyph((churn(x, y, elapsed) * count as f32) as usize % count)
+}
+
+/// A printable ASCII glyph, changing on the same intervals as `glyph`.
+fn cipher(x: u16, y: u16, elapsed: f32) -> char {
+    let count = b'~' - b'!' + 1;
+    char::from(b'!' + (churn(x, y, elapsed) * f32::from(count)) as u8 % count)
+}
+
+/// In `0..1`, changing on the cell's own interval.
+fn churn(x: u16, y: u16, elapsed: f32) -> f32 {
     let (shortest, longest) = RAIN_GLYPH_MS;
     let slow = 1.0 - (1.0 - noise(x, y, 5)).powi(2);
     let interval = shortest + (longest - shortest) * slow;
     let step = (elapsed / interval + noise(x, y, 3)) as u32;
-    let count = KATAKANA.1 as usize + RAIN_SYMBOLS.len();
-    nth_glyph((noise(x, y, 1000 + step) * count as f32) as usize % count)
+    noise(x, y, 1000 + step)
 }
 
 fn nth_glyph(i: usize) -> char {
@@ -341,9 +620,14 @@ fn nth_glyph(i: usize) -> char {
     }
 }
 
-fn mix((r, g, b): (u8, u8, u8), (r2, g2, b2): (u8, u8, u8), t: f32) -> Color {
+fn mix(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> Color {
+    let (r, g, b) = blend(from, to, t);
+    Color::Rgb(r, g, b)
+}
+
+fn blend((r, g, b): (u8, u8, u8), (r2, g2, b2): (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     let m = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
-    Color::Rgb(m(r, r2), m(g, g2), m(b, b2))
+    (m(r, r2), m(g, g2), m(b, b2))
 }
 
 /// A default background stays as it is, matching the blank cells below.
@@ -710,6 +994,207 @@ mod tests {
         }
         assert_eq!(glyphs[..2], [0, 0], "glyphs over the wide cell");
         assert!(glyphs[2] > 0, "glyphs beside it");
+    }
+
+    /// Steps `style` through its run, returning each frame it draws over
+    /// `frame`.
+    fn frames(style: AttachStyle, frame: &Buffer, ms: u64) -> Vec<Buffer> {
+        let mut t = Transitions::default();
+        materialize(&mut t, style);
+        let reveal = |t: &mut Transitions| {
+            let mut buf = frame.clone();
+            t.reveal(&mut buf);
+            buf
+        };
+        let mut out = vec![reveal(&mut t)];
+        while t.running() {
+            advance(&mut t, ms);
+            out.push(reveal(&mut t));
+            t.prune();
+        }
+        out
+    }
+
+    fn painted(area: Rect) -> Buffer {
+        let mut buf = lettered(area);
+        for pos in area.positions() {
+            buf[pos].fg = Color::Rgb(100, 100, 100);
+        }
+        buf
+    }
+
+    fn blank_rows(buf: &Buffer) -> Vec<bool> {
+        (buf.area.top()..buf.area.bottom())
+            .map(|y| row(buf, y).trim().is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn the_none_style_draws_the_frame_at_once() {
+        let mut t = Transitions::default();
+        materialize(&mut t, AttachStyle::None);
+        assert!(!t.running());
+    }
+
+    #[test]
+    fn crt_opens_from_the_middle_row_and_blooms() {
+        let frame = painted(Rect::new(0, 0, 6, 11));
+        let frames = frames(AttachStyle::Crt, &frame, 16);
+        let first = blank_rows(&frames[0]);
+        assert_eq!(first.iter().filter(|b| !**b).count(), 1);
+        assert!(!first[5], "middle row lit: {first:?}");
+        let mut open = 1;
+        for buf in &frames {
+            let shown = blank_rows(buf);
+            let lit: Vec<usize> = (0..11).filter(|&y| !shown[y]).collect();
+            assert_eq!(lit.len() % 2, 1, "symmetric: {lit:?}");
+            assert_eq!(lit[lit.len() / 2], 5, "centered: {lit:?}");
+            assert!(lit.len() >= open, "never closes: {lit:?}");
+            open = lit.len();
+        }
+        let bloomed = frames.iter().any(|buf| {
+            buf.area
+                .positions()
+                .all(|p| buf[p].symbol() == frame[p].symbol())
+                && buf[Position::new(0, 0)].fg != frame[Position::new(0, 0)].fg
+        });
+        assert!(bloomed, "brightens once open");
+        assert_eq!(frames.last().unwrap(), &frame);
+    }
+
+    #[test]
+    fn typewriter_types_rows_in_order_behind_a_cursor() {
+        let area = Rect::new(0, 0, 30, 4);
+        let mut frame = painted(area);
+        frame.set_string(20, 1, "          ", Style::default());
+        let frames = frames(AttachStyle::Typewriter, &frame, 1);
+        let text: Vec<Position> = area
+            .positions()
+            .filter(|&p| frame[p].symbol() != " ")
+            .collect();
+        let mut shown_at = vec![None; text.len()];
+        for (i, buf) in frames.iter().enumerate() {
+            let cursors: Vec<Position> = area
+                .positions()
+                .filter(|&p| buf[p].bg != Color::Reset)
+                .collect();
+            assert!(cursors.len() <= 1, "one cursor: {cursors:?}");
+            let typed: Vec<bool> = text.iter().map(|&p| buf[p] == frame[p]).collect();
+            let end = typed.iter().position(|&t| !t).unwrap_or(text.len());
+            assert!(typed[end..].iter().all(|&t| !t), "typed in order");
+            assert!(
+                cursors.iter().all(|&p| p == text[end]),
+                "cursor at the edge"
+            );
+            for (at, &shown) in shown_at.iter_mut().zip(&typed) {
+                if shown && at.is_none() {
+                    *at = Some(i);
+                }
+            }
+        }
+        let times: Vec<usize> = shown_at.into_iter().flatten().collect();
+        let gaps: Vec<usize> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        let (least, most) = (gaps.iter().min().unwrap(), gaps.iter().max().unwrap());
+        assert!(*most >= 3 * (*least).max(1), "even pace: {gaps:?}");
+        assert_eq!(frames.last().unwrap(), &frame);
+    }
+
+    #[test]
+    fn decrypt_churns_each_character_until_it_locks() {
+        let area = Rect::new(0, 0, 10, 6);
+        let mut frame = filled(area, 'é');
+        frame.set_string(0, 0, "日", Style::default());
+        frame.set_string(2, 3, "    ", Style::default());
+        let blank = |p: &Position| p.y == 3 && (2..6).contains(&p.x);
+        let frames = frames(AttachStyle::Decrypt, &frame, 16);
+        let ascii = |c: &Cell| c.symbol().chars().all(|c| c.is_ascii_graphic());
+        assert!(
+            area.positions()
+                .filter(|p| p.y > 0 && !blank(p))
+                .all(|p| ascii(&frames[0][p])),
+            "starts fully scrambled"
+        );
+        assert!(
+            frames
+                .iter()
+                .all(|b| area.positions().filter(blank).all(|p| b[p].symbol() == " ")),
+            "blanks stay blank"
+        );
+        let mid = &frames[frames.len() / 2];
+        let locked = area.positions().filter(|&p| mid[p].symbol() == "é").count();
+        assert!(locked > 0 && locked < 55, "part locked: {locked}");
+        assert!(
+            frames
+                .iter()
+                .all(|b| !ascii(&b[Position::new(0, 0)]) && !ascii(&b[Position::new(1, 0)]))
+        );
+        assert!(
+            frames.windows(2).any(|w| {
+                let p = Position::new(5, 5);
+                ascii(&w[0][p]) && ascii(&w[1][p]) && w[0][p].symbol() != w[1][p].symbol()
+            }),
+            "glyphs change"
+        );
+        assert_eq!(frames.last().unwrap(), &frame);
+    }
+
+    #[test]
+    fn glitch_shifts_rows_with_color_fringes() {
+        let area = Rect::new(0, 0, 20, 30);
+        let mut frame = Buffer::empty(area);
+        for y in 0..30 {
+            frame.set_string(5, y, "ab日cd", Style::default());
+        }
+        let frames = frames(AttachStyle::Glitch, &frame, 16);
+        let shifted = frames
+            .iter()
+            .flat_map(|b| (0..30).map(move |y| (b, y)))
+            .filter(|&(b, y)| row(b, y) != row(&frame, y))
+            .count();
+        assert!(shifted > 0, "rows shift");
+        let fringes = |color| {
+            frames
+                .iter()
+                .flat_map(|b| b.content.iter())
+                .any(|c| c.fg == color)
+        };
+        assert!(fringes(GLITCH_MAGENTA) && fringes(GLITCH_CYAN));
+        for buf in &frames {
+            for pos in area.positions() {
+                if buf[pos].symbol() == "日" {
+                    assert!(pos.x + 1 < area.right());
+                    assert_eq!(buf[Position::new(pos.x + 1, pos.y)].symbol(), " ");
+                }
+            }
+        }
+        assert_eq!(frames.last().unwrap(), &frame);
+    }
+
+    #[test]
+    fn each_glitch_shifts_its_own_rows() {
+        let frame = painted(Rect::new(0, 0, 20, 30));
+        assert_ne!(
+            frames(AttachStyle::Glitch, &frame, 16),
+            frames(AttachStyle::Glitch, &frame, 16)
+        );
+    }
+
+    #[test]
+    fn burn_climbs_from_the_bottom_in_embers() {
+        let frame = painted(Rect::new(0, 0, 10, 20));
+        let frames = frames(AttachStyle::Burn, &frame, 16);
+        let climbing = frames.iter().any(|b| {
+            let blank = blank_rows(b);
+            blank[0] && !blank[19]
+        });
+        assert!(climbing, "bottom lit before top");
+        let hot = frames.iter().any(|b| {
+            b.content
+                .iter()
+                .any(|c| matches!(c.fg, Color::Rgb(r, _, b) if r > 200 && r > b + 50))
+        });
+        assert!(hot, "embers glow");
+        assert_eq!(frames.last().unwrap(), &frame);
     }
 
     #[test]

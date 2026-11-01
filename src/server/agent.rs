@@ -65,6 +65,7 @@ pub enum Status {
 enum Source {
     Screen,
     FromPromptLine,
+    FromPromptBox,
     LastLineAbovePrompt,
     OscTitle,
     OscProgress,
@@ -163,11 +164,12 @@ static CLAUDE_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         },
         // A ❯-selected numbered option, the only chrome freeform prompts
         // share. The companion evidence rules out typed input after the
-        // input box's own ❯.
+        // input box's own ❯, and the selector hides the input box, so an
+        // echoed prompt above the box doesn't count.
         Rule {
             state: AgentState::Blocked,
             priority: 890,
-            source: Source::Screen,
+            source: Source::FromPromptBox,
             gate: Gate {
                 regex: vec![Regex::new("(?m)^\\s*❯\\s*\\d+\\.").expect("valid rule regex")],
                 any: vec![
@@ -432,6 +434,17 @@ fn from_prompt_line(screen: &str) -> &str {
     &screen[start..]
 }
 
+/// The screen from the input box's top border down, or all of it when no
+/// box is drawn.
+fn from_prompt_box(screen: &str) -> &str {
+    let lines: Vec<&str> = screen.lines().collect();
+    let Some((top, _)) = prompt_box(&lines) else {
+        return screen;
+    };
+    let start: usize = lines[..top].iter().map(|line| line.len() + 1).sum();
+    &screen[start..]
+}
+
 fn last_line_above_prompt(screen: &str) -> &str {
     let lines: Vec<&str> = screen.lines().collect();
     let top = prompt_box(&lines).map_or(lines.len(), |(top, _)| top);
@@ -479,6 +492,7 @@ pub fn evaluate(kind: AgentKind, snapshot: &Snapshot) -> AgentState {
         let text = match rule.source {
             Source::Screen => screen.as_ref(),
             Source::FromPromptLine => from_prompt_line(&screen),
+            Source::FromPromptBox => from_prompt_box(&screen),
             Source::LastLineAbovePrompt => last_line_above_prompt(&screen),
             Source::OscTitle => snapshot.title.as_str(),
             Source::OscProgress => snapshot.progress.as_str(),
@@ -889,6 +903,24 @@ mod tests {
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
         let s = snap("❯ 1. Yes\n(esc to cancel)\n", "claude", "none");
         assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Blocked);
+    }
+
+    #[test]
+    fn echoed_numbered_prompt_above_input_box_is_not_blocked() {
+        let s = snap(
+            "❯ 1. fix the parser\n  2. add a test\n\n✻ Crunched for 3s\n\n\
+             ────────────\n❯\n────────────\n  ~/src/lux ⎇ main\n",
+            "✳ Claude Code",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Idle);
+        let s = snap(
+            "❯ 1. fix the parser\n\n✻ Thinking…\n\n────────────\n❯\n────────────\n\
+             \x20 esc to interrupt\n",
+            "",
+            "none",
+        );
+        assert_eq!(evaluate(AgentKind::Claude, &s), AgentState::Working);
     }
 
     #[test]

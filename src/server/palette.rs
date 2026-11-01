@@ -196,6 +196,14 @@ fn xterm(index: u8) -> (u8, u8, u8) {
     }
 }
 
+/// The terminal's default background as it reported it, else the
+/// palette's stand-in.
+pub fn default_bg(palette: &Palette, colors: &TermColors) -> Color {
+    colors
+        .bg
+        .map_or(palette.bg, |(r, g, b)| Color::Rgb(r, g, b))
+}
+
 /// `color` at `factor` of its brightness, with the terminal default read
 /// as `default`.
 pub fn darken(color: Color, default: Color, colors: &TermColors, factor: f32) -> Color {
@@ -205,6 +213,30 @@ pub fn darken(color: Color, default: Color, colors: &TermColors, factor: f32) ->
         .unwrap_or((170, 170, 170));
     let scale = |c: u8| (c as f32 * factor) as u8;
     Color::Rgb(scale(r), scale(g), scale(b))
+}
+
+/// The status bar's background: a little of the way from the terminal's
+/// background toward its foreground, else the chrome stand-in.
+pub fn status_bg(palette: &Palette, colors: &TermColors) -> Color {
+    match (colors.bg, colors.fg) {
+        (Some(bg), Some(fg)) => {
+            let mix = |b: u8, f: u8| (b as f32 + (f as f32 - b as f32) * 0.09).round() as u8;
+            Color::Rgb(mix(bg.0, fg.0), mix(bg.1, fg.1), mix(bg.2, fg.2))
+        }
+        _ => palette.chrome_bg,
+    }
+}
+
+/// An unfocused window's tab bar rule color, darkened as dimming darkens
+/// that window.
+pub fn unfocused_rule(palette: &Palette, colors: &TermColors, dimming: bool) -> Color {
+    if !dimming {
+        return palette.dim;
+    }
+    let fg = colors
+        .fg
+        .map_or(palette.fg, |(r, g, b)| Color::Rgb(r, g, b));
+    darken(palette.dim, fg, colors, DIM)
 }
 
 /// Darkens every cell in `rect`.
@@ -250,11 +282,12 @@ fn shade_cell(
     let fg = colors
         .fg
         .map_or(palette.fg, |(r, g, b)| Color::Rgb(r, g, b));
-    let bg = colors
-        .bg
-        .map_or(palette.bg, |(r, g, b)| Color::Rgb(r, g, b));
+    let bg = default_bg(palette, colors);
     cell.fg = darken(cell.fg, fg, colors, factor);
-    cell.bg = darken(cell.bg, bg, colors, factor);
+    // Darkening a guessed background would paint over the real one.
+    if cell.bg != Color::Reset || colors.bg.is_some() {
+        cell.bg = darken(cell.bg, bg, colors, factor);
+    }
     // Reset means "same as the foreground", which is already darkened.
     if cell.underline_color != Color::Reset {
         cell.underline_color = darken(cell.underline_color, fg, colors, factor);
@@ -340,13 +373,49 @@ mod tests {
             darken(p.fg, p.fg, &none, 0.5)
         );
         assert_eq!(
-            buf.cell(Position::new(0, 0)).unwrap().bg,
-            darken(p.bg, p.bg, &none, 0.5)
-        );
-        assert_eq!(
             buf.cell(Position::new(1, 0)).unwrap().fg,
             Color::Rgb(50, 50, 50)
         );
+    }
+
+    #[test]
+    fn shade_leaves_an_unreported_default_background_alone() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buf = Buffer::empty(area);
+        buf.cell_mut(Position::new(1, 0)).unwrap().bg = Color::Rgb(100, 100, 100);
+        shade(
+            &mut buf,
+            area,
+            &Palette::DEFAULT,
+            &TermColors::default(),
+            0.5,
+        );
+        assert_eq!(buf.cell(Position::new(0, 0)).unwrap().bg, Color::Reset);
+        assert_eq!(
+            buf.cell(Position::new(1, 0)).unwrap().bg,
+            Color::Rgb(50, 50, 50)
+        );
+    }
+
+    #[test]
+    fn the_unfocused_rule_color_darkens_only_while_dimming() {
+        let p = Palette::DEFAULT;
+        let none = TermColors::default();
+        assert_eq!(unfocused_rule(&p, &none, false), p.dim);
+        assert_eq!(
+            unfocused_rule(&p, &none, true),
+            darken(p.dim, p.fg, &none, DIM)
+        );
+    }
+
+    #[test]
+    fn the_status_bar_blends_the_reported_defaults() {
+        let p = Palette::DEFAULT;
+        let mut colors = TermColors::default();
+        colors.set(ColorSlot::Background, (0, 0, 0));
+        assert_eq!(status_bg(&p, &colors), p.chrome_bg);
+        colors.set(ColorSlot::Foreground, (200, 100, 0));
+        assert_eq!(status_bg(&p, &colors), Color::Rgb(18, 9, 0));
     }
 
     #[test]

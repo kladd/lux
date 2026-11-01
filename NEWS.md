@@ -1,5 +1,15 @@
 # News
 
+## 2026-10-31
+
+- Tweaked text animations for more natural gradients.
+- Added an global agent status indicator to the status line, e.g. `⋯ 1  ! 0  ✓ 0  ◇ 1 `
+- The status line and switcher menu icons are gone.
+- New attach styles: `crt`, `typewriter`, `decrypt`, `glitch`, `burn`, and
+  `none`; `glitch` is the default and `attach-transition` is gone.
+- Tab completes `:config-set` keys and their values.
+- Claude Code's echoed numbered prompts no longer mark a tab blocked.
+
 ## 2026-10-19
 
 - Drag sessions, hosts' session groups, and tabs with the mouse to

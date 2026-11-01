@@ -315,10 +315,15 @@ struct StatusChrome {
     row: Rect,
     name: String,
     minimized: Vec<MinimizedTitle>,
+    /// Where `›` marks titles that don't fit.
+    more_titles: Option<u16>,
     host: String,
     clock: String,
-    /// Replaces the hostname when it fits alongside the clock.
+    /// Left of the summary, when it fits.
     indicator: Option<(String, std::ops::Range<u16>)>,
+    /// Per-state agent counts and the column they start at, left of the
+    /// hostname.
+    summary: Option<(Vec<(agent::Status, usize)>, u16)>,
 }
 
 enum PromptKind {
@@ -406,6 +411,9 @@ pub struct Session {
     tab_drag: Option<TabDrag>,
     /// Set by the server each render pass.
     indicator: Option<Indicator>,
+    /// Agent tab counts across every session, set by the server each
+    /// render pass.
+    summary: Vec<(agent::Status, usize)>,
     /// Tabs held as pending yanks, set by the server each render pass.
     yanked: Vec<TabId>,
     /// What the attached client's terminal answered about its colors, set
@@ -413,6 +421,8 @@ pub struct Session {
     term_colors: palette::TermColors,
     view: View,
     area: Rect,
+    /// While rendering a preview, which keeps the bottom row to `area`.
+    previewing: bool,
     /// The clock text as of the last computed view.
     clock: String,
     next_window_id: WindowId,
@@ -492,10 +502,12 @@ impl Session {
             border_drag: None,
             tab_drag: None,
             indicator: None,
+            summary: Vec::new(),
             yanked: Vec::new(),
             term_colors: palette::TermColors::default(),
             view: View::default(),
             area,
+            previewing: false,
             clock: String::new(),
             next_window_id,
             force_redraw: true,
@@ -987,13 +999,11 @@ impl Session {
     }
 
     pub fn materialize(&mut self) {
-        if self.config.attach_transition {
-            self.transitions.materialize(
-                self.config.attach_style,
-                self.config.palette,
-                self.term_colors,
-            );
-        }
+        self.transitions.materialize(
+            self.config.attach_style,
+            self.config.palette,
+            self.term_colors,
+        );
     }
 
     pub fn set_config(&mut self, config: Arc<Config>) {
@@ -1074,6 +1084,21 @@ impl Session {
             self.indicator = indicator;
             self.force_redraw = true;
         }
+    }
+
+    pub fn set_summary(&mut self, summary: Vec<(agent::Status, usize)>) {
+        if self.summary != summary {
+            self.summary = summary;
+            self.force_redraw = true;
+        }
+    }
+
+    /// Each agent tab's status, idle ones included.
+    pub fn agent_statuses(&self, now: Instant) -> impl Iterator<Item = agent::Status> + '_ {
+        self.windows
+            .values()
+            .flat_map(|win| &win.tabs)
+            .filter_map(move |tab| tab.agent.as_ref().map(|a| a.visual(now).status))
     }
 
     pub fn set_yanked(&mut self, yanked: Vec<TabId>) {
@@ -1341,9 +1366,6 @@ impl Session {
                 {
                     return Some(Effect::GotoIndicator(indicator));
                 }
-                if button == CtMouseButton::Left && self.menu_icon_at(pos) {
-                    return Some(Effect::OpenSwitcher);
-                }
                 // Badges win over a tab bar's drag boundary.
                 if button == CtMouseButton::Left
                     && let Some(id) = self.window_at(pos)
@@ -1593,10 +1615,7 @@ impl Session {
         }) {
             return "pointer";
         }
-        if self.menu_icon_at(pos)
-            || self.minimized_title_at(pos).is_some()
-            || self.indicator_at(pos).is_some()
-        {
+        if self.minimized_title_at(pos).is_some() || self.indicator_at(pos).is_some() {
             return "pointer";
         }
         if self.maximized.is_some() {
@@ -2045,13 +2064,6 @@ impl Session {
             .map(|t| t.id)
     }
 
-    fn menu_icon_at(&self, pos: Position) -> bool {
-        self.view
-            .status
-            .as_ref()
-            .is_some_and(|s| pos.y == s.row.y && pos.x == s.row.x)
-    }
-
     fn indicator_at(&self, pos: Position) -> Option<Indicator> {
         let status = self.view.status.as_ref()?;
         let (_, span) = status.indicator.as_ref()?;
@@ -2061,25 +2073,29 @@ impl Session {
         self.indicator.clone()
     }
 
-    fn minimized_titles(&self, row: Rect, mut x: u16) -> Vec<MinimizedTitle> {
-        let mut titles = Vec::new();
-        for &id in &self.minimized {
-            let Some(win) = self.windows.get(&id) else {
-                continue;
-            };
-            let name = win.active_tab().name.clone();
-            let start = x.saturating_add(2).min(row.right());
-            let end = start
-                .saturating_add(name.chars().count() as u16)
-                .min(row.right());
-            x = end;
-            titles.push(MinimizedTitle {
+    /// Titles two cells apart between `x` and `limit`, shrunk like tab
+    /// names, and where a `›` goes when some don't fit.
+    fn minimized_titles(&self, mut x: u16, limit: u16) -> (Vec<MinimizedTitle>, Option<u16>) {
+        let titles: Vec<(WindowId, &str)> = self
+            .minimized
+            .iter()
+            .filter_map(|id| Some((*id, self.windows.get(id)?.active_tab().name.as_str())))
+            .collect();
+        let lens: Vec<usize> = titles.iter().map(|(_, n)| n.chars().count()).collect();
+        let avail = limit.saturating_sub(x) as usize;
+        let (widths, shown) = title_widths(&lens, avail);
+        let mut out = Vec::with_capacity(shown);
+        for (&(id, name), &w) in titles.iter().zip(&widths).take(shown) {
+            let start = x + 2;
+            x = start + w as u16;
+            out.push(MinimizedTitle {
                 id,
-                name,
-                span: start..end,
+                name: truncate_name(name, w),
+                span: start..x,
             });
         }
-        titles
+        let more = (shown < titles.len() && avail >= 2).then_some(x + 1);
+        (out, more)
     }
 
     fn click_control(&mut self, id: WindowId, control: Control) {
@@ -2218,6 +2234,7 @@ impl Session {
                 chrome,
                 self.focus,
                 &self.config,
+                &self.term_colors,
                 &mut buf,
                 self.view.elapsed,
             );
@@ -2446,10 +2463,14 @@ impl Session {
     }
 
     /// The indicator always shimmers and the connecting spinner always
-    /// turns, so each counts on its own.
+    /// turns, so each counts on its own, as do summary groups for agents
+    /// in other sessions.
     pub fn has_animation(&self) -> bool {
         self.indicator.is_some()
             || self.connecting.is_some()
+            || self.summary.iter().any(|&(state, count)| {
+                count > 0 && matches!(state, agent::Status::Working | agent::Status::Blocked)
+            })
             || self.transitions.running()
             || self.windows.values().any(|w| {
                 !self.minimized.contains(&w.id)
@@ -2480,16 +2501,24 @@ impl Session {
         Ok(())
     }
 
-    /// Unlike `draw_frame`, leaves the seqno bookkeeping alone.
-    pub fn render_preview(&mut self, buf: &mut Buffer, area: Rect) {
-        self.compute_view();
+    /// Unlike `draw_frame`, leaves the seqno bookkeeping alone. Without
+    /// `with_status`, leaves out the bottom row.
+    pub fn render_preview(&mut self, buf: &mut Buffer, area: Rect, with_status: bool) {
         let full = self.area;
         if full.width == 0 || full.height == 0 {
             return;
         }
+        self.previewing = true;
+        self.compute_view();
         let mut tmp = Buffer::empty(full);
         self.render_to_buffer(&mut tmp);
-        for y in 0..area.height.min(full.height) {
+        self.previewing = false;
+        let rows = if with_status {
+            full.height
+        } else {
+            full.height - 1
+        };
+        for y in 0..area.height.min(rows) {
             for x in 0..area.width.min(full.width) {
                 if let (Some(dst), Some(src)) = (
                     buf.cell_mut(Position::new(area.x + x, area.y + y)),
@@ -2499,6 +2528,12 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Only the status line or message, where `draw_frame` puts it.
+    pub fn render_bottom_row(&mut self, buf: &mut Buffer) {
+        self.compute_view();
+        render_bottom(&self.view, &self.config.palette, &self.term_colors, buf);
     }
 
     fn compute_view(&mut self) {
@@ -2672,44 +2707,60 @@ impl Session {
         // A prompt outranks a message, which outranks the status line.
         let message = (prompt.is_none() && self.area.height > 0 && self.area.width > 0)
             .then(|| {
-                self.message.as_ref().map(|text| {
-                    let row = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
-                    (row, text.clone())
-                })
+                self.message
+                    .as_ref()
+                    .map(|text| (self.bottom_row(), text.clone()))
             })
             .flatten();
         let status =
             (prompt.is_none() && message.is_none() && self.area.height > 0 && self.area.width > 0)
                 .then(|| {
-                    let row = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
+                    let row = self.bottom_row();
                     let name_end = row
                         .x
-                        .saturating_add(2 + self.name.chars().count() as u16)
+                        .saturating_add(1 + self.name.chars().count() as u16)
                         .min(row.right());
+                    let host = match &self.connecting {
+                        Some(alias) => format!("{} {alias}", spinner_frame()),
+                        None => HOSTNAME.clone(),
+                    };
+                    let width = |s: &str| s.chars().count() as u16;
+                    // Right to left, two spaces apart: the hostname and
+                    // clock, the summary, then the indicator. Each places
+                    // only if it clears the session name.
+                    let floor = name_end.saturating_add(2);
+                    let place =
+                        |end: u16, len: u16| end.checked_sub(len).filter(|&start| start >= floor);
+                    let right_len = width(&host) + 2 + width(&self.clock) + 1;
+                    let mut end = row.right().saturating_sub(right_len + 2);
+                    let summary = place(end, width(&summary_text(&self.summary)))
+                        .filter(|_| !self.summary.is_empty())
+                        .map(|start| {
+                            end = start.saturating_sub(2);
+                            (self.summary.clone(), start)
+                        });
                     // A connect in progress outranks the indicator.
                     let indicator = self
                         .indicator
                         .as_ref()
                         .filter(|_| self.connecting.is_none())
                         .and_then(|ind| {
-                            let ind_len = ind.text.chars().count() as u16;
-                            let len = ind_len + 2 + self.clock.chars().count() as u16 + 1;
-                            (row.width >= len).then(|| {
-                                let start = row.right() - len;
-                                (ind.text.clone(), start..start + ind_len)
-                            })
+                            let start = place(end, width(&ind.text))?;
+                            Some((ind.text.clone(), start..start + width(&ind.text)))
                         });
-                    let host = match &self.connecting {
-                        Some(alias) => format!("{} {alias}", spinner_frame()),
-                        None => HOSTNAME.clone(),
-                    };
+                    if let Some((_, span)) = &indicator {
+                        end = span.start.saturating_sub(2);
+                    }
+                    let (minimized, more_titles) = self.minimized_titles(name_end, end);
                     StatusChrome {
                         row,
                         name: self.name.clone(),
-                        minimized: self.minimized_titles(row, name_end),
+                        minimized,
+                        more_titles,
                         host,
                         clock: self.clock.clone(),
                         indicator,
+                        summary,
                     }
                 });
         self.view = View {
@@ -2749,6 +2800,18 @@ impl Session {
         })
     }
 
+    /// The status line's row: from the screen's left edge, under any
+    /// sidebar, except in a preview, which keeps it to the session's area.
+    fn bottom_row(&self) -> Rect {
+        let x = if self.previewing { self.area.x } else { 0 };
+        Rect::new(
+            x,
+            self.area.bottom() - 1,
+            self.area.right().saturating_sub(x),
+            1,
+        )
+    }
+
     fn compute_prompt_chrome(&self) -> Option<PromptChrome> {
         let prompt = self.prompt.as_ref()?;
         let label = prompt.label();
@@ -2756,7 +2819,7 @@ impl Session {
         if self.area.height == 0 || self.area.width <= label_len {
             return None;
         }
-        let line = Rect::new(self.area.x, self.area.bottom() - 1, self.area.width, 1);
+        let line = self.bottom_row();
         let input = Rect {
             x: line.x + label_len,
             width: line.width - label_len,
@@ -2766,8 +2829,9 @@ impl Session {
             PromptKind::Ex => ex::suggestions(&prompt.text()),
             PromptKind::Rename | PromptKind::Search => Vec::new(),
         };
+        // Above the line, within the layout's columns.
         let suggestion_row = (!suggestions.is_empty() && self.area.height >= 2)
-            .then(|| Rect::new(line.x, line.y - 1, line.width, 1));
+            .then(|| Rect::new(self.area.x, line.y - 1, self.area.width, 1));
         Some(PromptChrome {
             line,
             label,
@@ -2810,7 +2874,7 @@ impl Session {
             let unfocused = config.dim_unfocused && chrome.window != self.focus;
             let frame = transitions.live(chrome.window);
             let mut paint = |buf: &mut Buffer| {
-                render_tab_bar(chrome, self.focus, config, buf, self.view.elapsed);
+                render_tab_bar(chrome, self.focus, config, colors, buf, self.view.elapsed);
                 if unfocused {
                     match transitions.dim_mut(chrome.window) {
                         Some(fade) => {
@@ -2832,19 +2896,18 @@ impl Session {
             render_selection(sel, win.content_rect(), palette, buf);
         }
         for sep in &self.view.separators {
-            render_separator(sep, palette, buf);
+            render_separator(
+                sep,
+                palette::unfocused_rule(palette, colors, config.dim_unfocused),
+                buf,
+            );
         }
         // What an unreachable host last showed stays, dimmed.
         if self.offline {
             palette::shade(buf, tree_area(self.area), palette, colors, palette::DIM);
         }
         transitions.overlay(buf);
-        if let Some(status) = &self.view.status {
-            render_status(status, palette, self.view.elapsed, buf);
-        }
-        if let Some((row, text)) = &self.view.message {
-            render_message(*row, text, palette, buf);
-        }
+        render_bottom(&self.view, palette, colors, buf);
         if let Some(chrome) = &self.view.prompt {
             render_prompt_chrome(chrome, palette, buf);
             if let Some(prompt) = &self.prompt {
@@ -2957,6 +3020,26 @@ fn allocate_name_widths(lens: &[usize], budget: usize) -> Vec<usize> {
         }
     }
     alloc
+}
+
+/// Widths for titles of `lens`, each after a two-cell gap, within `avail`,
+/// and how many show. Past their floors, only the leftmost whole titles
+/// show, leaving room for a two-cell `›` marker.
+fn title_widths(lens: &[usize], avail: usize) -> (Vec<usize>, usize) {
+    let floors: Vec<usize> = lens.iter().map(|&l| l.min(MIN_NAME_WIDTH)).collect();
+    let gaps = 2 * lens.len();
+    if gaps + floors.iter().sum::<usize>() <= avail {
+        return (allocate_name_widths(lens, avail - gaps), lens.len());
+    }
+    let mut used = 2;
+    let shown = floors
+        .iter()
+        .take_while(|&&f| {
+            used += 2 + f;
+            used <= avail
+        })
+        .count();
+    (floors, shown)
 }
 
 /// The place a tab dragged from `from` and moved `shift` columns takes: the
@@ -3081,6 +3164,7 @@ fn render_tab_bar(
     chrome: &Chrome,
     focus: WindowId,
     config: &Config,
+    colors: &palette::TermColors,
     buf: &mut Buffer,
     elapsed: Duration,
 ) {
@@ -3089,6 +3173,7 @@ fn render_tab_bar(
         return;
     }
     let palette = &config.palette;
+    let bg = palette::default_bg(palette, colors);
     let glyph = config.rule_style.glyph();
     let focused = chrome.window == focus;
     // With dimming on, the shade marks focus, so an unfocused rule keeps
@@ -3125,9 +3210,10 @@ fn render_tab_bar(
                     (glyph, plain)
                 }
             }
-            Rule::Shimmer { phase, color } => {
-                (glyph, anim::shimmer_at(color, i, bar.width as usize, phase))
-            }
+            Rule::Shimmer { phase, color } => (
+                glyph,
+                anim::shimmer_at(color, bg, i, bar.width as usize, phase),
+            ),
             Rule::Breathe { color } => (glyph, anim::breathe(color, elapsed)),
         };
         (ch, Style::default().fg(color))
@@ -3178,7 +3264,7 @@ fn render_tab_bar(
                 for (j, ch) in visual.text.chars().enumerate() {
                     let color = match visual.anim {
                         Anim::None => status_color,
-                        Anim::Shimmer => anim::shimmer(status_color, j, len, elapsed),
+                        Anim::Shimmer => anim::shimmer(status_color, bg, j, len, elapsed),
                         Anim::Breathe => anim::breathe(status_color, elapsed),
                     };
                     if !put(&mut x, ch, style.fg(color)) {
@@ -3382,18 +3468,32 @@ fn render_scrollbar(
         .render(content, buf, &mut state);
 }
 
-fn render_message(row: Rect, text: &str, palette: &Palette, buf: &mut Buffer) {
-    if row.height == 0 || row.width == 0 {
-        return;
+fn render_bottom(view: &View, palette: &Palette, colors: &palette::TermColors, buf: &mut Buffer) {
+    let bar = palette::status_bg(palette, colors);
+    if let Some(status) = &view.status {
+        render_status(status, palette, bar, view.elapsed, buf);
     }
-    let fill = Style::default().bg(palette.chrome_bg);
+    if let Some((row, text)) = &view.message {
+        render_message(*row, text, palette, bar, buf);
+    }
+}
+
+fn render_bar(row: Rect, bar: Color, buf: &mut Buffer) {
+    let fill = Style::default().bg(bar);
     for x in row.x..row.right() {
         if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
             dst.set_char(' ');
             dst.set_style(fill);
         }
     }
-    let style = fill.fg(palette.muted);
+}
+
+fn render_message(row: Rect, text: &str, palette: &Palette, bar: Color, buf: &mut Buffer) {
+    if row.height == 0 || row.width == 0 {
+        return;
+    }
+    render_bar(row, bar, buf);
+    let style = Style::default().bg(bar).fg(palette.muted);
     for (i, ch) in text.chars().enumerate() {
         let x = row.x + 1 + i as u16;
         if x >= row.right() {
@@ -3406,26 +3506,22 @@ fn render_message(row: Rect, text: &str, palette: &Palette, buf: &mut Buffer) {
     }
 }
 
-fn render_status(status: &StatusChrome, palette: &Palette, elapsed: Duration, buf: &mut Buffer) {
-    let row = status.row;
-    if row.height == 0 || row.width == 0 {
+fn render_status(
+    status: &StatusChrome,
+    palette: &Palette,
+    bar: Color,
+    elapsed: Duration,
+    buf: &mut Buffer,
+) {
+    if status.row.height == 0 || status.row.width == 0 {
         return;
     }
-    let fill = Style::default().bg(palette.chrome_bg);
-    for x in row.x..row.right() {
-        if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
-            dst.set_char(' ');
-            dst.set_style(fill);
-        }
-    }
-    // The menu icon.
-    if let Some(dst) = buf.cell_mut(Position::new(row.x, row.y)) {
-        dst.set_char('☢');
-        dst.set_style(fill.fg(palette.muted));
-    }
+    let row = status.row;
+    render_bar(row, bar, buf);
+    let fill = Style::default().bg(bar);
     let name_style = fill.fg(palette.accent);
     for (i, ch) in format!(" {}", status.name).chars().enumerate() {
-        let x = row.x + 1 + i as u16;
+        let x = row.x + i as u16;
         if x >= row.right() {
             break;
         }
@@ -3447,25 +3543,77 @@ fn render_status(status: &StatusChrome, palette: &Palette, elapsed: Duration, bu
             }
         }
     }
+    if let Some(x) = status.more_titles
+        && let Some(dst) = buf.cell_mut(Position::new(x, row.y))
+    {
+        dst.set_char('›');
+        dst.set_style(title_style);
+    }
+    if let Some((counts, start)) = &status.summary {
+        let mut x = *start;
+        for (i, &(state, count)) in counts.iter().enumerate() {
+            if i > 0 {
+                x += 2;
+            }
+            let group = summary_group(state, count);
+            let len = group.chars().count();
+            let color = palette.status(state);
+            for (j, ch) in group.chars().enumerate() {
+                let fg = match (count, state) {
+                    (0, _) => palette.dim,
+                    (_, agent::Status::Working) => anim::shimmer(color, bar, j, len, elapsed),
+                    (_, agent::Status::Blocked) => anim::breathe(color, elapsed),
+                    _ => color,
+                };
+                if let Some(dst) = buf.cell_mut(Position::new(x, row.y)) {
+                    dst.set_char(ch);
+                    dst.set_style(fill.fg(fg));
+                }
+                x += 1;
+            }
+        }
+    }
     let clock_style = fill.fg(palette.muted);
-    let (text, ind_len) = match &status.indicator {
-        Some((ind, _)) => (format!("{}  {} ", ind, status.clock), ind.chars().count()),
-        None => (format!("{}  {} ", status.host, status.clock), 0),
-    };
+    if let Some((ind, span)) = &status.indicator {
+        let len = span.len();
+        for (i, ch) in ind.chars().enumerate() {
+            if let Some(dst) = buf.cell_mut(Position::new(span.start + i as u16, row.y)) {
+                dst.set_char(ch);
+                dst.set_style(clock_style.fg(anim::shimmer(palette.muted, bar, i, len, elapsed)));
+            }
+        }
+    }
+    let text = format!("{}  {} ", status.host, status.clock);
     let len = text.chars().count() as u16;
     if row.width >= len {
         let start = row.right() - len;
         for (i, ch) in text.chars().enumerate() {
             if let Some(dst) = buf.cell_mut(Position::new(start + i as u16, row.y)) {
                 dst.set_char(ch);
-                dst.set_style(if i < ind_len {
-                    clock_style.fg(anim::shimmer(palette.muted, i, ind_len, elapsed))
-                } else {
-                    clock_style
-                });
+                dst.set_style(clock_style);
             }
         }
     }
+}
+
+/// One summary group, e.g. `! 1`; waiting counts as in progress.
+fn summary_group(state: agent::Status, count: usize) -> String {
+    let glyph = match state {
+        agent::Status::Working | agent::Status::Waiting => '⋯',
+        agent::Status::Blocked => '!',
+        agent::Status::Done => '✓',
+        agent::Status::Idle => '◇',
+    };
+    format!("{glyph} {count}")
+}
+
+/// The agent summary as drawn, e.g. `⋯ 2  ! 0`.
+fn summary_text(counts: &[(agent::Status, usize)]) -> String {
+    counts
+        .iter()
+        .map(|&(state, count)| summary_group(state, count))
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
 fn render_hints(chrome: &HintChrome, palette: &Palette, buf: &mut Buffer) {
@@ -3485,10 +3633,10 @@ fn render_hints(chrome: &HintChrome, palette: &Palette, buf: &mut Buffer) {
             let on_left = x == rect.left();
             let on_right = x == rect.right() - 1;
             let ch = match (on_top, on_bottom, on_left, on_right) {
-                (true, _, true, _) => '┌',
-                (true, _, _, true) => '┐',
-                (_, true, true, _) => '└',
-                (_, true, _, true) => '┘',
+                (true, _, true, _) => '╭',
+                (true, _, _, true) => '╮',
+                (_, true, true, _) => '╰',
+                (_, true, _, true) => '╯',
                 (true, ..) | (_, true, ..) => '─',
                 (_, _, true, _) | (_, _, _, true) => '│',
                 _ => ' ',
@@ -3568,9 +3716,10 @@ fn render_prompt_chrome(chrome: &PromptChrome, palette: &Palette, buf: &mut Buff
     }
 }
 
-/// Always dim, since the tab bar's rule marks focus.
-fn render_separator(sep: &Separator, palette: &Palette, buf: &mut Buffer) {
-    let style = Style::default().fg(palette.dim);
+/// An unfocused rule's color whatever the focus, since the tab bar's rule
+/// marks focus.
+fn render_separator(sep: &Separator, color: Color, buf: &mut Buffer) {
+    let style = Style::default().fg(color);
     for y in sep.rect.top()..sep.rect.bottom() {
         for x in sep.rect.left()..sep.rect.right() {
             if let Some(dst) = buf.cell_mut(Position::new(x, y)) {
@@ -3684,8 +3833,39 @@ mod tests {
     use ratatui::layout::Position;
 
     use super::{
-        TabDrag, allocate_name_widths, drop_target, moved_index, truncate_name, visible_run,
+        TabDrag, allocate_name_widths, drop_target, moved_index, summary_text, title_widths,
+        truncate_name, visible_run,
     };
+    use crate::server::agent::Status;
+
+    #[test]
+    fn titles_that_fit_keep_their_full_names() {
+        assert_eq!(title_widths(&[4, 6], 14), (vec![4, 6], 2));
+    }
+
+    #[test]
+    fn crowded_titles_share_the_room_like_tab_names() {
+        // Four cells of gaps leave 16 for names of 4 and 30.
+        assert_eq!(title_widths(&[4, 30], 20), (vec![4, 12], 2));
+    }
+
+    #[test]
+    fn titles_past_their_floors_drop_whole_from_the_right() {
+        // Each costs 10 at its floor, and the marker takes 2.
+        assert_eq!(title_widths(&[20, 20, 20], 25), (vec![8, 8, 8], 2));
+        assert_eq!(title_widths(&[20, 20, 20], 21), (vec![8, 8, 8], 1));
+    }
+
+    #[test]
+    fn the_agent_summary_pairs_each_glyph_with_its_count() {
+        let counts = [
+            (Status::Working, 2),
+            (Status::Blocked, 0),
+            (Status::Done, 3),
+            (Status::Idle, 4),
+        ];
+        assert_eq!(summary_text(&counts), "⋯ 2  ! 0  ✓ 3  ◇ 4");
+    }
 
     /// Widths 6, 12, 6.
     fn spans() -> Vec<(usize, std::ops::Range<u16>)> {

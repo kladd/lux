@@ -185,8 +185,7 @@ palette = "default"      # the interface color set
 dim-unfocused = false    # leave unfocused windows at full brightness
 shadows = true           # popovers cast a shadow on the content beneath
 layout-transitions = false  # snap maximize into place
-attach-transition = false   # draw the first frame after attaching at once
-attach-style = "coalesce"   # how the first frame after attaching appears
+attach-style = "none"       # draw the first frame after attaching at once
 sidebar = true              # keep the session list visible at the left
 grid-mouse = true           # clicks and the wheel work in the CLAUDECOM grid
 ```
@@ -219,5 +218,6 @@ the palette's stand-ins (light grey on black) instead.
 between its place in the layout and the full area. Set it to `false` to
 snap instead.
 
-`attach-transition` is "rain" by default. Set it to `false`
-to turn it off..
+`attach-style` picks how the first frame after attaching appears:
+`glitch` (the default), `rain`, `coalesce`, `crt`, `typewriter`,
+`decrypt`, `burn`, or `none` to draw it at once.

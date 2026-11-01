@@ -35,9 +35,31 @@ impl RuleStyle {
 /// How the first frame after attaching is revealed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum AttachStyle {
+    None,
     Coalesce,
-    #[default]
     Rain,
+    Crt,
+    Typewriter,
+    Decrypt,
+    #[default]
+    Glitch,
+    Burn,
+}
+
+impl AttachStyle {
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" => Self::None,
+            "coalesce" => Self::Coalesce,
+            "rain" => Self::Rain,
+            "crt" => Self::Crt,
+            "typewriter" => Self::Typewriter,
+            "decrypt" => Self::Decrypt,
+            "glitch" => Self::Glitch,
+            "burn" => Self::Burn,
+            _ => return None,
+        })
+    }
 }
 
 pub struct Config {
@@ -59,8 +81,6 @@ pub struct Config {
     pub shadows: bool,
     /// Animate maximize.
     pub layout_transitions: bool,
-    /// Reveal the first frame gradually after a client attaches.
-    pub attach_transition: bool,
     pub attach_style: AttachStyle,
     /// Keep the session list visible beside the layout.
     pub sidebar: bool,
@@ -82,7 +102,6 @@ impl Default for Config {
             dim_unfocused: true,
             shadows: false,
             layout_transitions: true,
-            attach_transition: true,
             attach_style: AttachStyle::default(),
             sidebar: false,
             grid_mouse: false,
@@ -193,7 +212,7 @@ fn with_key(text: &str, key: &str, value: &toml::Value) -> String {
 }
 
 /// Every top-level key the file may set.
-const KEYS: &[&str] = &[
+pub const KEYS: &[&str] = &[
     "prefix",
     "restore",
     "notify",
@@ -205,11 +224,32 @@ const KEYS: &[&str] = &[
     "dim-unfocused",
     "shadows",
     "layout-transitions",
-    "attach-transition",
     "attach-style",
     "sidebar",
     "grid-mouse",
 ];
+
+/// The values a key accepts, or none when they aren't a fixed set.
+pub fn values(key: &str) -> &'static [&'static str] {
+    match key {
+        "restore" | "notify" | "automode" | "copy-on-select" | "dim-unfocused" | "shadows"
+        | "layout-transitions" | "sidebar" | "grid-mouse" => &["true", "false"],
+        "osc-titles" => &["none", "agents", "all"],
+        "rule-style" => &["rule", "dots"],
+        "palette" => &["default"],
+        "attach-style" => &[
+            "none",
+            "coalesce",
+            "rain",
+            "crt",
+            "typewriter",
+            "decrypt",
+            "glitch",
+            "burn",
+        ],
+        _ => &[],
+    }
+}
 
 /// A key whose value was skipped, and why.
 type Invalid = (&'static str, String);
@@ -244,7 +284,6 @@ fn apply(config: &mut Config, key: &str, value: &toml::Value) -> bool {
         ("dim-unfocused", _) => return flag(&mut config.dim_unfocused),
         ("shadows", _) => return flag(&mut config.shadows),
         ("layout-transitions", _) => return flag(&mut config.layout_transitions),
-        ("attach-transition", _) => return flag(&mut config.attach_transition),
         ("sidebar", _) => return flag(&mut config.sidebar),
         ("grid-mouse", _) => return flag(&mut config.grid_mouse),
         ("osc-titles", Some("none")) => config.osc_titles = OscTitles::None,
@@ -256,8 +295,10 @@ fn apply(config: &mut Config, key: &str, value: &toml::Value) -> bool {
             Some(palette) => config.palette = palette,
             None => return false,
         },
-        ("attach-style", Some("coalesce")) => config.attach_style = AttachStyle::Coalesce,
-        ("attach-style", Some("rain")) => config.attach_style = AttachStyle::Rain,
+        ("attach-style", name) => match name.and_then(AttachStyle::named) {
+            Some(style) => config.attach_style = style,
+            None => return false,
+        },
         _ => return false,
     }
     true
@@ -393,21 +434,36 @@ mod tests {
     }
 
     #[test]
-    fn attach_transition_option_parses_and_defaults_on() {
-        assert!(from_toml("", "test").attach_transition);
-        assert!(from_toml("attach-transition = true", "test").attach_transition);
-        assert!(!from_toml("attach-transition = false", "test").attach_transition);
-        assert!(from_toml("attach-transition = \"no\"", "test").attach_transition);
+    fn every_listed_value_is_accepted() {
+        for &key in KEYS {
+            for &value in values(key) {
+                let value = match value {
+                    "true" => toml::Value::Boolean(true),
+                    "false" => toml::Value::Boolean(false),
+                    name => toml::Value::String(name.into()),
+                };
+                assert!(apply(&mut Config::default(), key, &value), "{key} {value}");
+            }
+        }
     }
 
     #[test]
-    fn attach_style_option_parses_and_defaults_to_rain() {
+    fn attach_style_option_parses_and_defaults_to_glitch() {
         let parse = |text: &str| from_toml(text, "test").attach_style;
-        assert_eq!(parse(""), AttachStyle::Rain);
+        assert_eq!(parse(""), AttachStyle::Glitch);
         assert_eq!(parse("attach-style = \"rain\""), AttachStyle::Rain);
         assert_eq!(parse("attach-style = \"coalesce\""), AttachStyle::Coalesce);
-        assert_eq!(parse("attach-style = \"snow\""), AttachStyle::Rain);
-        assert_eq!(parse("attach-style = true"), AttachStyle::Rain);
+        assert_eq!(parse("attach-style = \"none\""), AttachStyle::None);
+        assert_eq!(parse("attach-style = \"crt\""), AttachStyle::Crt);
+        assert_eq!(
+            parse("attach-style = \"typewriter\""),
+            AttachStyle::Typewriter
+        );
+        assert_eq!(parse("attach-style = \"decrypt\""), AttachStyle::Decrypt);
+        assert_eq!(parse("attach-style = \"glitch\""), AttachStyle::Glitch);
+        assert_eq!(parse("attach-style = \"burn\""), AttachStyle::Burn);
+        assert_eq!(parse("attach-style = \"snow\""), AttachStyle::Glitch);
+        assert_eq!(parse("attach-style = true"), AttachStyle::Glitch);
     }
 
     #[test]
