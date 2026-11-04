@@ -153,7 +153,7 @@ impl Transitions {
         self.undim(window);
         let effect = fx::effect_fn_buf((), timer(DIM_FADE), move |_, ctx, buf| {
             let factor = 1.0 - (1.0 - palette::DIM) * ctx.alpha();
-            palette::shade(buf, ctx.area, &palette, &colors, factor);
+            palette::fade(buf, ctx.area, &palette, &colors, factor);
         });
         self.dims.push((window, effect));
     }
@@ -807,7 +807,7 @@ mod tests {
             .process(Duration::ZERO, &mut buf, rect);
         let mut steady = Buffer::empty(rect);
         steady[Position::new(0, 0)].fg = Color::Rgb(100, 100, 100);
-        palette::shade(&mut steady, rect, &Palette::DEFAULT, &colors, palette::DIM);
+        palette::fade(&mut steady, rect, &Palette::DEFAULT, &colors, palette::DIM);
         assert_eq!(buf, steady);
         t.undim(1);
         assert!(!t.running());

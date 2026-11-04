@@ -207,12 +207,29 @@ pub fn default_bg(palette: &Palette, colors: &TermColors) -> Color {
 /// `color` at `factor` of its brightness, with the terminal default read
 /// as `default`.
 pub fn darken(color: Color, default: Color, colors: &TermColors, factor: f32) -> Color {
+    toward(color, default, (0, 0, 0), colors, factor)
+}
+
+/// `color` kept at `factor` of its distance from `target`, with the
+/// terminal default read as `default`.
+fn toward(
+    color: Color,
+    default: Color,
+    target: (u8, u8, u8),
+    colors: &TermColors,
+    factor: f32,
+) -> Color {
     let (r, g, b) = colors
         .rgb(color)
         .or_else(|| colors.rgb(default))
         .unwrap_or((170, 170, 170));
-    let scale = |c: u8| (c as f32 * factor) as u8;
-    Color::Rgb(scale(r), scale(g), scale(b))
+    let mix = |c: u8, t: u8| (t as f32 + (c as f32 - t as f32) * factor) as u8;
+    Color::Rgb(mix(r, target.0), mix(g, target.1), mix(b, target.2))
+}
+
+/// The terminal's default background as channels, else the stand-in's.
+fn bg_rgb(palette: &Palette, colors: &TermColors) -> (u8, u8, u8) {
+    colors.bg.or_else(|| rgb(palette.bg)).unwrap_or((0, 0, 0))
 }
 
 /// The status bar's background: a little of the way from the terminal's
@@ -227,8 +244,8 @@ pub fn status_bg(palette: &Palette, colors: &TermColors) -> Color {
     }
 }
 
-/// An unfocused window's tab bar rule color, darkened as dimming darkens
-/// that window.
+/// An unfocused window's tab bar rule color, faded as dimming fades that
+/// window.
 pub fn unfocused_rule(palette: &Palette, colors: &TermColors, dimming: bool) -> Color {
     if !dimming {
         return palette.dim;
@@ -236,7 +253,30 @@ pub fn unfocused_rule(palette: &Palette, colors: &TermColors, dimming: bool) -> 
     let fg = colors
         .fg
         .map_or(palette.fg, |(r, g, b)| Color::Rgb(r, g, b));
-    darken(palette.dim, fg, colors, DIM)
+    toward(palette.dim, fg, bg_rgb(palette, colors), colors, DIM)
+}
+
+/// Fades every cell in `rect` toward the terminal's background, leaving
+/// default backgrounds as they are.
+pub fn fade(buf: &mut Buffer, rect: Rect, palette: &Palette, colors: &TermColors, factor: f32) {
+    let fg = colors
+        .fg
+        .map_or(palette.fg, |(r, g, b)| Color::Rgb(r, g, b));
+    let target = bg_rgb(palette, colors);
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            let Some(cell) = buf.cell_mut(Position::new(x, y)) else {
+                continue;
+            };
+            cell.fg = toward(cell.fg, fg, target, colors, factor);
+            if cell.bg != Color::Reset {
+                cell.bg = toward(cell.bg, Color::Reset, target, colors, factor);
+            }
+            if cell.underline_color != Color::Reset {
+                cell.underline_color = toward(cell.underline_color, fg, target, colors, factor);
+            }
+        }
+    }
 }
 
 /// Darkens every cell in `rect`.
@@ -398,13 +438,33 @@ mod tests {
     }
 
     #[test]
-    fn the_unfocused_rule_color_darkens_only_while_dimming() {
+    fn the_unfocused_rule_color_fades_only_while_dimming() {
         let p = Palette::DEFAULT;
-        let none = TermColors::default();
-        assert_eq!(unfocused_rule(&p, &none, false), p.dim);
+        let mut colors = TermColors::default();
+        assert_eq!(unfocused_rule(&p, &colors, false), p.dim);
         assert_eq!(
-            unfocused_rule(&p, &none, true),
-            darken(p.dim, p.fg, &none, DIM)
+            unfocused_rule(&p, &colors, true),
+            darken(p.dim, p.fg, &colors, DIM)
+        );
+        colors.set(ColorSlot::Background, (255, 255, 255));
+        assert_eq!(unfocused_rule(&p, &colors, true), Color::Rgb(178, 178, 178));
+    }
+
+    #[test]
+    fn fade_moves_toward_the_reported_background_and_keeps_the_default() {
+        let area = Rect::new(0, 0, 2, 1);
+        let mut buf = Buffer::empty(area);
+        buf.cell_mut(Position::new(1, 0)).unwrap().bg = Color::Rgb(100, 100, 100);
+        let mut colors = TermColors::default();
+        colors.set(ColorSlot::Foreground, (0, 0, 0));
+        colors.set(ColorSlot::Background, (200, 200, 240));
+        fade(&mut buf, area, &Palette::DEFAULT, &colors, 0.5);
+        let cell = buf.cell(Position::new(0, 0)).unwrap();
+        assert_eq!(cell.fg, Color::Rgb(100, 100, 120));
+        assert_eq!(cell.bg, Color::Reset);
+        assert_eq!(
+            buf.cell(Position::new(1, 0)).unwrap().bg,
+            Color::Rgb(150, 150, 170)
         );
     }
 

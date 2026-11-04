@@ -2240,7 +2240,7 @@ impl Session {
             );
         }
         if self.config.dim_unfocused && id != self.focus {
-            palette::shade(
+            palette::fade(
                 &mut buf,
                 win.rect,
                 &self.config.palette,
@@ -2880,7 +2880,7 @@ impl Session {
                         Some(fade) => {
                             fade.process(Duration::ZERO, buf, win.rect);
                         }
-                        None => palette::shade(buf, win.rect, palette, colors, palette::DIM),
+                        None => palette::fade(buf, win.rect, palette, colors, palette::DIM),
                     }
                 }
             };
@@ -2904,7 +2904,7 @@ impl Session {
         }
         // What an unreachable host last showed stays, dimmed.
         if self.offline {
-            palette::shade(buf, tree_area(self.area), palette, colors, palette::DIM);
+            palette::fade(buf, tree_area(self.area), palette, colors, palette::DIM);
         }
         transitions.overlay(buf);
         render_bottom(&self.view, palette, colors, buf);

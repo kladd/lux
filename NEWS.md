@@ -1,5 +1,9 @@
 # News
 
+## 2026-11-03
+
+- Unfocused windows now fade toward the terminal's background instead of black.
+
 ## 2026-10-31
 
 - Tweaked text animations for more natural gradients.
