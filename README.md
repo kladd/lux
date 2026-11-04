@@ -188,6 +188,7 @@ layout-transitions = false  # snap maximize into place
 attach-style = "none"       # draw the first frame after attaching at once
 sidebar = true              # keep the session list visible at the left
 grid-mouse = true           # clicks and the wheel work in the CLAUDECOM grid
+pet = false                 # hide the pet
 ```
 
 The prefix key spec is a single character, optionally prefixed with `C-`
@@ -213,6 +214,13 @@ to it. `shadows` is off by default. Both darken cells. Lux
 asks your terminal for its default and ANSI colors when you attach, so a
 dimmed cell keeps its hue; a terminal that doesn't answer is darkened from
 the palette's stand-ins (light grey on black) instead.
+
+`pet` is on by default: a small pet sits in the bottom-right
+corner above the status line, drawn as a sixel image, and its expression
+follows the most urgent agent across all sessions: blocked, done,
+working, waiting, or idle. It shows only on terminals that report sixel
+support, only while an agent is open, and steps aside during transitions
+and popovers. Set it to `false` to hide it.
 
 `layout-transitions` is on by default: maximizing animates the window
 between its place in the layout and the full area. Set it to `false` to

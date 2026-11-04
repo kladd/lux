@@ -111,6 +111,13 @@ pub fn fd_size(fd: &impl std::os::fd::AsFd) -> Size {
     }
 }
 
+/// One cell's size in pixels, where the terminal gives its pixel size.
+pub fn fd_cell_pixels(fd: &impl std::os::fd::AsFd) -> Option<(u16, u16)> {
+    let ws = rustix::termios::tcgetwinsize(fd).ok()?;
+    (ws.ws_col > 0 && ws.ws_row > 0 && ws.ws_xpixel >= ws.ws_col && ws.ws_ypixel >= ws.ws_row)
+        .then(|| (ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

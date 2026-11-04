@@ -17,6 +17,15 @@ pub enum DecodedInput {
     Paste(String),
     /// The terminal's answer to a color query.
     Color(ColorSlot, (u8, u8, u8)),
+    Report(Report),
+}
+
+/// The terminal's answer to a query about itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Report {
+    Sixel(bool),
+    /// Width and height of one cell in pixels.
+    CellSize(u16, u16),
 }
 
 /// Pasted text up to the first control character, since a pasted newline
@@ -165,7 +174,13 @@ impl InputDecoder {
             }
         }
         plain.extend_from_slice(rest);
-        self.plain_keys(&plain, out);
+        let (mut keys, cut) = reports(&plain, out);
+        if may_continue && cut.len() < OSC_LIMIT {
+            self.held.splice(0..0, cut.iter().copied());
+        } else {
+            keys.extend_from_slice(cut);
+        }
+        self.plain_keys(&keys, out);
     }
 
     /// termwiz turns LF into Enter, so LF is split out here to keep Ctrl-J
@@ -278,6 +293,53 @@ fn osc_end(osc: &[u8]) -> Osc {
         }
     }
     Osc::Incomplete
+}
+
+/// Lifts out the device attributes and cell size answers, whose CSI forms
+/// no key encoding uses. Returns the rest, and separately a CSI cut off
+/// by the end of `bytes`.
+fn reports<'a>(bytes: &'a [u8], out: &mut Vec<DecodedInput>) -> (Vec<u8>, &'a [u8]) {
+    let mut plain = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"\x1b[") {
+            let params_start = i + 2;
+            let params_end = bytes[params_start..]
+                .iter()
+                .position(|b| !matches!(b, b'0'..=b'9' | b';' | b'?'))
+                .map(|n| params_start + n);
+            let Some(end) = params_end else {
+                return (plain, &bytes[i..]);
+            };
+            if let Some(report) = report(&bytes[params_start..end], bytes[end]) {
+                out.push(DecodedInput::Report(report));
+                i = end + 1;
+                continue;
+            }
+        }
+        plain.push(bytes[i]);
+        i += 1;
+    }
+    (plain, &[])
+}
+
+/// `?…;4;…c` lists sixel among the device attributes; `6;h;wt` is the
+/// cell size.
+fn report(params: &[u8], fin: u8) -> Option<Report> {
+    let params = std::str::from_utf8(params).ok()?;
+    match (params.strip_prefix('?'), fin) {
+        (Some(attrs), b'c') => Some(Report::Sixel(attrs.split(';').any(|a| a == "4"))),
+        (None, b't') => {
+            let mut fields = params.split(';');
+            if fields.next()? != "6" {
+                return None;
+            }
+            let h = fields.next()?.parse().ok()?;
+            let w = fields.next()?.parse().ok()?;
+            Some(Report::CellSize(w, h))
+        }
+        _ => None,
+    }
 }
 
 /// The colors in one answer: `10;spec`, `11;spec`, or `4;n;spec` pairs.
@@ -601,6 +663,50 @@ mod tests {
             ]
         );
         assert_eq!(evs.len(), 2);
+    }
+
+    #[test]
+    fn terminal_reports_decode_and_never_reach_the_key_parser() {
+        let mut d = InputDecoder::default();
+        let evs = d.decode(b"a\x1b[6;18;9t\x1b[?62;4;22cb\x1b[?1;2c\x1b[A");
+        let reports: Vec<_> = evs
+            .iter()
+            .filter_map(|d| match d {
+                DecodedInput::Report(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports,
+            vec![
+                Report::CellSize(9, 18),
+                Report::Sixel(true),
+                Report::Sixel(false)
+            ]
+        );
+        let keys: Vec<_> = evs
+            .iter()
+            .filter_map(|d| match d {
+                DecodedInput::Key(k) => Some(k.code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![CtKeyCode::Char('a'), CtKeyCode::Char('b'), CtKeyCode::Up]
+        );
+    }
+
+    #[test]
+    fn a_report_split_across_reads_still_decodes() {
+        let mut d = InputDecoder::default();
+        let first = d.decode(b"\x1b[?61;4;6;7;14");
+        assert!(first.is_empty());
+        let evs = d.decode(b";21;22;23;24;28;32;42;52c");
+        assert!(matches!(
+            evs.as_slice(),
+            [DecodedInput::Report(Report::Sixel(true))]
+        ));
     }
 
     #[test]

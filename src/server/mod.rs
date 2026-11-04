@@ -17,6 +17,7 @@ pub mod order;
 pub mod palette;
 pub mod park;
 pub mod persist;
+pub mod pet;
 pub mod search;
 pub mod serve;
 pub mod session;
@@ -136,6 +137,13 @@ struct Client {
     list_drag: Option<ListDrag>,
     /// What the terminal has answered to the color queries sent at attach.
     colors: palette::TermColors,
+    /// Whether the terminal listed sixel among its device attributes.
+    sixel: bool,
+    /// The cell size in pixels the terminal reported.
+    cell_px: Option<(u16, u16)>,
+    /// Where the pet's image was last written and a hash of it, so an
+    /// unchanged frame isn't sent again.
+    pet: Option<(Rect, u64)>,
 }
 
 /// A press on a session list row, which becomes a drag once it leaves it.
@@ -701,6 +709,8 @@ impl Server {
                 let _ = ratatui::crossterm::execute!(client.raw_out, EnableMouseCapture);
                 let size = term::fd_size(&client.raw_out);
                 client.terminal.backend_mut().set_size(size);
+                // The resize clears the screen, image included.
+                client.pet = None;
                 if let Some(session) = self.sessions.get_mut(&client.attached) {
                     session.set_area(session_area(&self.config, size));
                 }
@@ -827,7 +837,7 @@ impl Server {
             Err(_) => return,
         };
         let _ = terminal.clear();
-        query_colors(&mut raw_out);
+        query_terminal(&mut raw_out);
 
         let stdin = Arc::new(stdin);
         let stdin_stop = Arc::new(AtomicBool::new(false));
@@ -857,6 +867,9 @@ impl Server {
                 pointer: "default",
                 list_drag: None,
                 colors: palette::TermColors::default(),
+                sixel: false,
+                cell_px: None,
+                pet: None,
             },
         );
     }
@@ -1085,9 +1098,20 @@ impl Server {
             };
             // The terminal's color answers apply whatever mode the client
             // is in.
-            if let DecodedInput::Color(slot, rgb) = event {
-                client.colors.set(slot, rgb);
-                continue;
+            match event {
+                DecodedInput::Color(slot, rgb) => {
+                    client.colors.set(slot, rgb);
+                    continue;
+                }
+                DecodedInput::Report(input::Report::Sixel(sixel)) => {
+                    client.sixel = sixel;
+                    continue;
+                }
+                DecodedInput::Report(input::Report::CellSize(w, h)) => {
+                    client.cell_px = Some((w, h));
+                    continue;
+                }
+                _ => {}
             }
             // A list drag follows the pointer wherever it goes. A press
             // means its release went missing.
@@ -1140,7 +1164,7 @@ impl Server {
                     session.paste_text(&text);
                     None
                 }
-                DecodedInput::Color(..) => None,
+                DecodedInput::Color(..) | DecodedInput::Report(_) => None,
             };
             if let Some(effect) = effect {
                 self.apply_effect(conn, sid, effect);
@@ -1302,7 +1326,7 @@ impl Server {
                 }
                 return;
             }
-            DecodedInput::Color(..) => return,
+            DecodedInput::Color(..) | DecodedInput::Report(_) => return,
         };
         if key.kind == KeyEventKind::Release {
             return;
@@ -1725,7 +1749,7 @@ impl Server {
                 }
                 return;
             }
-            DecodedInput::Color(..) => return,
+            DecodedInput::Color(..) | DecodedInput::Report(_) => return,
         };
         if key.kind == KeyEventKind::Release {
             return;
@@ -2265,7 +2289,7 @@ impl Server {
                 session.key_to_tab(item.window, item.tab, *key);
             }
             DecodedInput::Paste(text) => session.paste_to_tab(item.window, item.tab, text),
-            DecodedInput::Mouse(_) | DecodedInput::Color(..) => {}
+            DecodedInput::Mouse(_) | DecodedInput::Color(..) | DecodedInput::Report(_) => {}
         }
         None
     }
@@ -2450,6 +2474,20 @@ impl Server {
                 session.set_terminal_colors(client.colors);
             }
         }
+        let now = std::time::Instant::now();
+        let mood = pet::mood(self.sessions.values().flat_map(|s| s.agent_statuses(now)));
+        let pet_sids: Vec<SessionId> = self
+            .clients
+            .values()
+            .filter(|c| {
+                let sidebar = sidebar_width(&self.config, term::fd_size(&c.raw_out));
+                self.config.pet && mood.is_some() && c.sixel && pet_view(c, sidebar)
+            })
+            .map(|c| c.attached)
+            .collect();
+        for (sid, session) in self.sessions.iter_mut() {
+            session.set_pet(pet_sids.contains(sid));
+        }
         let Server {
             sessions,
             clients,
@@ -2480,8 +2518,64 @@ impl Server {
             {
                 let _ = session.draw_frame(&mut client.terminal, true, |_| {});
             }
+            // The frame just drawn may have left the pet's cells to it.
+            let pet = sessions
+                .get(&client.attached)
+                .filter(|_| pet_sids.contains(&client.attached))
+                .and_then(|s| Some((s.pet_cells()?, s.pet_fade(now))));
+            match (pet, mood) {
+                (Some((rect, fade)), Some(mood)) => draw_pet(client, config, rect, mood, fade),
+                _ => client.pet = None,
+            }
         }
     }
+}
+
+/// Whether the client shows its session's layout with nothing over it:
+/// not a full-screen mode, nor the switcher's new-session prompts.
+fn pet_view(client: &Client, sidebar: u16) -> bool {
+    client.finder.is_none()
+        && client.grid.is_none()
+        && !(client.switcher.is_some() && sidebar == 0)
+        && !(client.switcher.is_none() && client.auto.is_some_and(|a| a.presented.is_none()))
+        && client.new_session.is_none()
+        && client.host_choice.is_none()
+}
+
+/// Writes the pet's image over `rect` unless it's what's already there.
+fn draw_pet(client: &mut Client, config: &Config, rect: Rect, mood: pet::Mood, fade: f32) {
+    use std::hash::{Hash, Hasher};
+    let Some((cw, ch)) = client
+        .cell_px
+        .or_else(|| term::fd_cell_pixels(&client.raw_out))
+    else {
+        client.pet = None;
+        return;
+    };
+    let bg = palette::bg_rgb(&config.palette, &client.colors);
+    let mut sprite = pet::sprite(mood, pet::clock());
+    pet::fade(&mut sprite, bg, fade);
+    let image = pet::sixel(
+        &sprite,
+        bg,
+        usize::from(rect.width * cw),
+        usize::from(rect.height * ch),
+    );
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    image.hash(&mut hasher);
+    let drawn = Some((rect, hasher.finish()));
+    if client.pet == drawn {
+        return;
+    }
+    // Saving and restoring the cursor keeps the image from moving it.
+    let _ = write!(
+        client.raw_out,
+        "\x1b[?2026h\x1b7\x1b[{};{}H{image}\x1b8\x1b[?2026l",
+        rect.y + 1,
+        rect.x + 1
+    );
+    let _ = client.raw_out.flush();
+    client.pet = drawn;
 }
 
 fn render_finder(
@@ -3045,13 +3139,14 @@ fn plain_char(key: &KeyEvent, ch: char) -> bool {
         }
 }
 
-/// Asks the terminal for its default and ANSI colors. The answers arrive
-/// as input.
-fn query_colors(out: &mut File) {
+/// Asks the terminal for its default and ANSI colors, its cell size, and
+/// its device attributes. The answers arrive as input.
+fn query_terminal(out: &mut File) {
     let mut seq = String::from("\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
     for i in 0..16 {
         seq.push_str(&format!("\x1b]4;{i};?\x1b\\"));
     }
+    seq.push_str("\x1b[16t\x1b[c");
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
 }

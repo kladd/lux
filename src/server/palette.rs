@@ -228,7 +228,7 @@ fn toward(
 }
 
 /// The terminal's default background as channels, else the stand-in's.
-fn bg_rgb(palette: &Palette, colors: &TermColors) -> (u8, u8, u8) {
+pub fn bg_rgb(palette: &Palette, colors: &TermColors) -> (u8, u8, u8) {
     colors.bg.or_else(|| rgb(palette.bg)).unwrap_or((0, 0, 0))
 }
 

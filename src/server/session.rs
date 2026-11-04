@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::Terminal;
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::crossterm::event::{
     KeyCode as CtKeyCode, KeyEvent, KeyEventKind, KeyModifiers as CtMods,
     MouseButton as CtMouseButton, MouseEvent as CtMouseEvent, MouseEventKind as CtMouseKind,
@@ -32,6 +32,7 @@ use crate::server::keys::{Command, KeyMatch, KeyTrie};
 use crate::server::layout::{self, Dir, Node, Separator, Side, SplitKind, WindowId};
 use crate::server::palette::{self, Palette};
 use crate::server::persist;
+use crate::server::pet;
 use crate::server::term::FdBackend;
 use crate::server::transition::{Transitions, Zoom};
 use crate::server::upgrade;
@@ -427,6 +428,14 @@ pub struct Session {
     clock: String,
     next_window_id: WindowId,
     force_redraw: bool,
+    /// Whether the server wants the pet drawn over this session.
+    pet: bool,
+    /// The cells left to the pet's image in the last frame drawn.
+    pet_cells: Option<Rect>,
+    /// Whether the last frame hid the pet for a transition or popover.
+    pet_covered: bool,
+    /// When the pet came back from being covered.
+    pet_returned: Option<Instant>,
     transitions: Transitions,
     tx: Sender<ServerEvent>,
     /// Where the session runs when it isn't on this server.
@@ -511,6 +520,10 @@ impl Session {
             clock: String::new(),
             next_window_id,
             force_redraw: true,
+            pet: false,
+            pet_cells: None,
+            pet_covered: false,
+            pet_returned: None,
             transitions: Transitions::default(),
             tx,
             host: None,
@@ -1084,6 +1097,25 @@ impl Session {
             self.indicator = indicator;
             self.force_redraw = true;
         }
+    }
+
+    pub fn set_pet(&mut self, pet: bool) {
+        if self.pet != pet {
+            self.pet = pet;
+            self.force_redraw = true;
+        }
+    }
+
+    /// Where the last frame drawn left room for the pet's image.
+    pub fn pet_cells(&self) -> Option<Rect> {
+        self.pet_cells
+    }
+
+    /// How far the pet has faded in since returning, from 0 to 1.
+    pub fn pet_fade(&self, now: Instant) -> f32 {
+        self.pet_returned.map_or(1.0, |at| {
+            (now.duration_since(at).as_secs_f32() / pet::FADE.as_secs_f32()).min(1.0)
+        })
     }
 
     pub fn set_summary(&mut self, summary: Vec<(agent::Status, usize)>) {
@@ -2459,7 +2491,7 @@ impl Session {
     }
 
     pub fn has_transition(&self) -> bool {
-        self.transitions.running()
+        self.transitions.running() || self.pet_fade(Instant::now()) < 1.0
     }
 
     /// The indicator always shimmers and the connecting spinner always
@@ -2468,6 +2500,7 @@ impl Session {
     pub fn has_animation(&self) -> bool {
         self.indicator.is_some()
             || self.connecting.is_some()
+            || self.pet
             || self.summary.iter().any(|&(state, count)| {
                 count > 0 && matches!(state, agent::Status::Working | agent::Status::Blocked)
             })
@@ -2492,6 +2525,24 @@ impl Session {
         tui.draw(|frame| {
             self.render(frame, cursor);
             overlay(frame.buffer_mut());
+            // The image can't take part in a transition or sit under a
+            // popover, so it steps aside for both.
+            let covered = self.transitions.running()
+                || self.view.prompt.is_some()
+                || self.view.hints.is_some();
+            self.pet_cells = pet::rect(self.area).filter(|_| self.pet && !covered);
+            if self.pet_cells.is_some() && self.pet_covered {
+                self.pet_returned = Some(Instant::now());
+            }
+            self.pet_covered = self.pet && covered;
+            if let Some(rect) = self.pet_cells {
+                let buf = frame.buffer_mut();
+                for pos in rect.positions() {
+                    if let Some(cell) = buf.cell_mut(pos) {
+                        cell.set_diff_option(CellDiffOption::Skip);
+                    }
+                }
+            }
         })?;
         self.force_redraw = false;
         for win in self.windows.values_mut() {

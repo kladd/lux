@@ -86,6 +86,8 @@ pub struct Config {
     pub sidebar: bool,
     /// Clicks and the wheel work in the CLAUDECOM grid.
     pub grid_mouse: bool,
+    /// Show the pet on terminals that draw sixel.
+    pub pet: bool,
 }
 
 impl Default for Config {
@@ -105,6 +107,7 @@ impl Default for Config {
             attach_style: AttachStyle::default(),
             sidebar: false,
             grid_mouse: false,
+            pet: true,
         }
     }
 }
@@ -227,13 +230,14 @@ pub const KEYS: &[&str] = &[
     "attach-style",
     "sidebar",
     "grid-mouse",
+    "pet",
 ];
 
 /// The values a key accepts, or none when they aren't a fixed set.
 pub fn values(key: &str) -> &'static [&'static str] {
     match key {
         "restore" | "notify" | "automode" | "copy-on-select" | "dim-unfocused" | "shadows"
-        | "layout-transitions" | "sidebar" | "grid-mouse" => &["true", "false"],
+        | "layout-transitions" | "sidebar" | "grid-mouse" | "pet" => &["true", "false"],
         "osc-titles" => &["none", "agents", "all"],
         "rule-style" => &["rule", "dots"],
         "palette" => &["default"],
@@ -286,6 +290,7 @@ fn apply(config: &mut Config, key: &str, value: &toml::Value) -> bool {
         ("layout-transitions", _) => return flag(&mut config.layout_transitions),
         ("sidebar", _) => return flag(&mut config.sidebar),
         ("grid-mouse", _) => return flag(&mut config.grid_mouse),
+        ("pet", _) => return flag(&mut config.pet),
         ("osc-titles", Some("none")) => config.osc_titles = OscTitles::None,
         ("osc-titles", Some("agents")) => config.osc_titles = OscTitles::Agents,
         ("osc-titles", Some("all")) => config.osc_titles = OscTitles::All,
@@ -552,6 +557,13 @@ mod tests {
         assert!(from_toml("shadows = true", "test").shadows);
         assert!(!from_toml("shadows = false", "test").shadows);
         assert!(!from_toml("shadows = 1", "test").shadows);
+    }
+
+    #[test]
+    fn pet_option_parses_and_defaults_on() {
+        assert!(from_toml("", "test").pet);
+        assert!(!from_toml("pet = false", "test").pet);
+        assert!(from_toml("pet = \"no\"", "test").pet);
     }
 
     #[test]

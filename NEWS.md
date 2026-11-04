@@ -3,6 +3,7 @@
 ## 2026-11-03
 
 - Unfocused windows now fade toward the terminal's background instead of black.
+- A sixel pet's expression follows your agents; `pet = false` hides it.
 
 ## 2026-10-31
 
