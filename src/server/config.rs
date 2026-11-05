@@ -86,7 +86,7 @@ pub struct Config {
     pub sidebar: bool,
     /// Clicks and the wheel work in the CLAUDECOM grid.
     pub grid_mouse: bool,
-    /// Show the pet on terminals that draw sixel.
+    /// Show the pet on terminals that draw sixel or kitty graphics.
     pub pet: bool,
 }
 

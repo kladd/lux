@@ -139,6 +139,8 @@ struct Client {
     colors: palette::TermColors,
     /// Whether the terminal listed sixel among its device attributes.
     sixel: bool,
+    /// Whether the terminal accepted the kitty graphics query.
+    kitty: bool,
     /// The cell size in pixels the terminal reported.
     cell_px: Option<(u16, u16)>,
     /// Where the pet's image was last written and a hash of it, so an
@@ -709,8 +711,10 @@ impl Server {
                 let _ = ratatui::crossterm::execute!(client.raw_out, EnableMouseCapture);
                 let size = term::fd_size(&client.raw_out);
                 client.terminal.backend_mut().set_size(size);
-                // The resize clears the screen, image included.
-                client.pet = None;
+                // The terminal may have reflowed the screen even if it ended
+                // at the same size, so the next frame repaints every cell.
+                let _ = client.terminal.clear();
+                hide_pet(client);
                 if let Some(session) = self.sessions.get_mut(&client.attached) {
                     session.set_area(session_area(&self.config, size));
                 }
@@ -868,6 +872,7 @@ impl Server {
                 list_drag: None,
                 colors: palette::TermColors::default(),
                 sixel: false,
+                kitty: false,
                 cell_px: None,
                 pet: None,
             },
@@ -1105,6 +1110,10 @@ impl Server {
                 }
                 DecodedInput::Report(input::Report::Sixel(sixel)) => {
                     client.sixel = sixel;
+                    continue;
+                }
+                DecodedInput::Report(input::Report::Kitty) => {
+                    client.kitty = true;
                     continue;
                 }
                 DecodedInput::Report(input::Report::CellSize(w, h)) => {
@@ -2481,7 +2490,7 @@ impl Server {
             .values()
             .filter(|c| {
                 let sidebar = sidebar_width(&self.config, term::fd_size(&c.raw_out));
-                self.config.pet && mood.is_some() && c.sixel && pet_view(c, sidebar)
+                self.config.pet && mood.is_some() && (c.sixel || c.kitty) && pet_view(c, sidebar)
             })
             .map(|c| c.attached)
             .collect();
@@ -2525,7 +2534,7 @@ impl Server {
                 .and_then(|s| Some((s.pet_cells()?, s.pet_fade(now))));
             match (pet, mood) {
                 (Some((rect, fade)), Some(mood)) => draw_pet(client, config, rect, mood, fade),
-                _ => client.pet = None,
+                _ => hide_pet(client),
             }
         }
     }
@@ -2549,18 +2558,18 @@ fn draw_pet(client: &mut Client, config: &Config, rect: Rect, mood: pet::Mood, f
         .cell_px
         .or_else(|| term::fd_cell_pixels(&client.raw_out))
     else {
-        client.pet = None;
+        hide_pet(client);
         return;
     };
     let bg = palette::bg_rgb(&config.palette, &client.colors);
     let mut sprite = pet::sprite(mood, pet::clock());
     pet::fade(&mut sprite, bg, fade);
-    let image = pet::sixel(
-        &sprite,
-        bg,
-        usize::from(rect.width * cw),
-        usize::from(rect.height * ch),
-    );
+    let (width, height) = (usize::from(rect.width * cw), usize::from(rect.height * ch));
+    let image = if client.kitty {
+        pet::kitty(&sprite, bg, width, height, rect.width, rect.height)
+    } else {
+        pet::sixel(&sprite, bg, width, height)
+    };
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     image.hash(&mut hasher);
     let drawn = Some((rect, hasher.finish()));
@@ -2576,6 +2585,15 @@ fn draw_pet(client: &mut Client, config: &Config, rect: Rect, mood: pet::Mood, f
     );
     let _ = client.raw_out.flush();
     client.pet = drawn;
+}
+
+/// Forgets the pet's image, deleting it first where the terminal keeps it
+/// over the text drawn since.
+fn hide_pet(client: &mut Client) {
+    if client.pet.take().is_some() && client.kitty {
+        let _ = client.raw_out.write_all(pet::kitty_delete().as_bytes());
+        let _ = client.raw_out.flush();
+    }
 }
 
 fn render_finder(
@@ -3139,14 +3157,17 @@ fn plain_char(key: &KeyEvent, ch: char) -> bool {
         }
 }
 
-/// Asks the terminal for its default and ANSI colors, its cell size, and
-/// its device attributes. The answers arrive as input.
+/// Asks the terminal for its default and ANSI colors, its cell size,
+/// kitty graphics support, and its device attributes. The answers arrive
+/// as input.
 fn query_terminal(out: &mut File) {
     let mut seq = String::from("\x1b]10;?\x1b\\\x1b]11;?\x1b\\");
     for i in 0..16 {
         seq.push_str(&format!("\x1b]4;{i};?\x1b\\"));
     }
-    seq.push_str("\x1b[16t\x1b[c");
+    seq.push_str("\x1b[16t");
+    seq.push_str(input::KITTY_QUERY);
+    seq.push_str("\x1b[c");
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
 }

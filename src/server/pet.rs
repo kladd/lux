@@ -1,4 +1,4 @@
-//! The pet: a sixel sprite whose mood follows the agents.
+//! The pet: a sixel or kitty graphics sprite whose mood follows the agents.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -309,34 +309,85 @@ pub fn fade(px: &mut [Option<Rgb>], bg: Rgb, t: f32) {
     }
 }
 
-/// The sprite scaled to `width`×`height` pixels on `bg`, as a sixel image.
-/// An integer scale keeps the pixel art even when the cells allow one.
-pub fn sixel(px: &[Option<Rgb>], bg: Rgb, width: usize, height: usize) -> String {
+/// The sprite scaled to `width`×`height` pixels on `bg`, row by row. An
+/// integer scale keeps the pixel art even when the cells allow one.
+fn scaled(px: &[Option<Rgb>], bg: Rgb, width: usize, height: usize) -> Vec<Rgb> {
     let fit = (width as f64 / WIDTH as f64).min(height as f64 / HEIGHT as f64);
     let scale = if fit >= 1.0 { fit.floor() } else { fit };
     let (sw, sh) = (WIDTH as f64 * scale, HEIGHT as f64 * scale);
     let (ox, oy) = ((width as f64 - sw) / 2.0, (height as f64 - sh) / 2.0);
-
-    let mut colors: Vec<Rgb> = vec![bg];
-    let mut image = vec![0usize; width * height];
+    let mut out = Vec::with_capacity(width * height);
     for y in 0..height {
         for x in 0..width {
             let (sx, sy) = ((x as f64 - ox) / scale, (y as f64 - oy) / scale);
-            let color = if sx >= 0.0 && sy >= 0.0 && (sx as usize) < WIDTH && (sy as usize) < HEIGHT
-            {
+            let inside = sx >= 0.0 && sy >= 0.0 && (sx as usize) < WIDTH && (sy as usize) < HEIGHT;
+            out.push(if inside {
                 px[sy as usize * WIDTH + sx as usize].unwrap_or(bg)
             } else {
                 bg
-            };
-            image[y * width + x] = match colors.iter().position(|&c| c == color) {
-                Some(i) => i,
-                None => {
-                    colors.push(color);
-                    colors.len() - 1
-                }
-            };
+            });
         }
     }
+    out
+}
+
+/// The image id the pet's kitty image is transmitted, placed, and
+/// deleted under.
+const KITTY_ID: u32 = 7_573_620;
+
+/// The sprite scaled to `width`×`height` pixels on `bg`, as a kitty
+/// graphics image placed over `cols`×`rows` cells at the cursor, which
+/// stays put.
+pub fn kitty(
+    px: &[Option<Rgb>],
+    bg: Rgb,
+    width: usize,
+    height: usize,
+    cols: u16,
+    rows: u16,
+) -> String {
+    use base64::Engine as _;
+    let rgb: Vec<u8> = scaled(px, bg, width, height)
+        .into_iter()
+        .flat_map(|(r, g, b)| [r, g, b])
+        .collect();
+    let data = base64::engine::general_purpose::STANDARD.encode(rgb);
+    // Payloads go in chunks of at most 4096 bytes.
+    let chunks: Vec<&[u8]> = data.as_bytes().chunks(4096).collect();
+    let mut out = String::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let more = u8::from(i + 1 < chunks.len());
+        let chunk = std::str::from_utf8(chunk).unwrap_or_default();
+        if i == 0 {
+            let _ = write!(
+                out,
+                "\x1b_Ga=T,f=24,s={width},v={height},i={KITTY_ID},p=1,c={cols},r={rows},C=1,q=2,m={more};{chunk}\x1b\\"
+            );
+        } else {
+            let _ = write!(out, "\x1b_Gm={more};{chunk}\x1b\\");
+        }
+    }
+    out
+}
+
+/// Deletes the pet's kitty image, placement and data both.
+pub fn kitty_delete() -> String {
+    format!("\x1b_Ga=d,d=I,i={KITTY_ID},q=2\x1b\\")
+}
+
+/// The sprite scaled to `width`×`height` pixels on `bg`, as a sixel image.
+pub fn sixel(px: &[Option<Rgb>], bg: Rgb, width: usize, height: usize) -> String {
+    let mut colors: Vec<Rgb> = vec![bg];
+    let image: Vec<usize> = scaled(px, bg, width, height)
+        .into_iter()
+        .map(|color| match colors.iter().position(|&c| c == color) {
+            Some(i) => i,
+            None => {
+                colors.push(color);
+                colors.len() - 1
+            }
+        })
+        .collect();
 
     let mut out = format!("\x1bP9;1q\"1;1;{width};{height}");
     let pct = |v: u8| u32::from(v) * 100 / 255;
@@ -444,5 +495,18 @@ mod tests {
         // bits in the first band.
         assert!(out.contains("#1BB$"));
         assert_eq!(out.matches('-').count(), 12);
+    }
+
+    #[test]
+    fn kitty_sends_rgb_in_chunks_placed_over_the_cells() {
+        let px = vec![None; WIDTH * HEIGHT];
+        let out = kitty(&px, (0, 0, 0), WIDTH, HEIGHT, COLS, ROWS);
+        let first = out.split("\x1b\\").next().unwrap();
+        assert!(first.starts_with("\x1b_Ga=T,f=24,s=72,v=36,"));
+        assert!(first.contains(",c=8,r=2,C=1,q=2,m=1;"));
+        // 72×36×3 bytes is 10368 base64 characters: three chunks.
+        assert_eq!(out.matches("\x1b_G").count(), 3);
+        assert_eq!(out.matches("m=1;").count(), 2);
+        assert!(out.contains("\x1b_Gm=0;"));
     }
 }

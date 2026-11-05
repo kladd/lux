@@ -24,6 +24,8 @@ pub enum DecodedInput {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Report {
     Sixel(bool),
+    /// The terminal accepted the kitty graphics query.
+    Kitty,
     /// Width and height of one cell in pixels.
     CellSize(u16, u16),
 }
@@ -51,6 +53,10 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// Longer than any color answer, so a stray OSC prefix is not held for
 /// long.
 const OSC_LIMIT: usize = 512;
+/// Asks whether the terminal takes kitty graphics, with a one-pixel image
+/// it checks but doesn't keep, and the answer accepting it.
+pub const KITTY_QUERY: &str = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+const KITTY_OK: &[u8] = b"Gi=31;OK";
 
 enum Marker {
     Full(usize),
@@ -144,19 +150,24 @@ impl InputDecoder {
         out
     }
 
-    /// The terminal answers color queries with OSC, which no key encoding
-    /// uses, so answers are lifted out before the key parser runs. With
-    /// `may_continue`, an answer cut off by the end of the read is held
-    /// for the next one.
+    /// The terminal answers color queries with OSC and graphics queries
+    /// with APC, which no key encoding uses, so answers are lifted out
+    /// before the key parser runs. With `may_continue`, an answer cut off
+    /// by the end of the read is held for the next one.
     fn keys(&mut self, bytes: &[u8], out: &mut Vec<DecodedInput>, may_continue: bool) {
         let mut plain = Vec::with_capacity(bytes.len());
         let mut rest = bytes;
-        while let Some(start) = rest.windows(2).position(|w| w == b"\x1b]") {
+        while let Some(start) = rest.windows(2).position(|w| w == b"\x1b]" || w == b"\x1b_") {
             plain.extend_from_slice(&rest[..start]);
             let osc = &rest[start..];
             match osc_end(osc) {
                 Osc::Complete(body_end, len) => {
-                    color_answers(&osc[2..body_end], out);
+                    let body = &osc[2..body_end];
+                    if osc[1] == b']' {
+                        color_answers(body, out);
+                    } else if body == KITTY_OK {
+                        out.push(DecodedInput::Report(Report::Kitty));
+                    }
                     rest = &osc[len..];
                 }
                 Osc::Incomplete if may_continue && osc.len() < OSC_LIMIT => {
@@ -695,6 +706,22 @@ mod tests {
             keys,
             vec![CtKeyCode::Char('a'), CtKeyCode::Char('b'), CtKeyCode::Up]
         );
+    }
+
+    #[test]
+    fn a_kitty_graphics_answer_decodes_only_when_accepted() {
+        let mut d = InputDecoder::default();
+        let evs = d.decode(b"\x1b_Gi=31;OK\x1b\\a\x1b_Gi=31;ENOTSUPPORTED\x1b\\");
+        assert!(matches!(
+            evs.as_slice(),
+            [
+                DecodedInput::Report(Report::Kitty),
+                DecodedInput::Key(KeyEvent {
+                    code: CtKeyCode::Char('a'),
+                    ..
+                })
+            ]
+        ));
     }
 
     #[test]

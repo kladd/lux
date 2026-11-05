@@ -1,5 +1,11 @@
 # News
 
+## 2026-11-05
+
+- The pet also draws with kitty graphics.
+- Every resize repaints the whole screen, fixing a garbled screen after
+  switching tabs in macOS Terminal.
+
 ## 2026-11-03
 
 - Unfocused windows now fade toward the terminal's background instead of black.
